@@ -1,0 +1,12 @@
+[package]
+name = "lh-io"
+description = "Audio device management, duplex streaming, and latency measurement for Lion-Heart"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cpal.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true

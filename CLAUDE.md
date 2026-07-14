@@ -14,9 +14,32 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-Design/docs only — no code yet. The next milestone is **M0** (cpal duplex passthrough + round-trip latency measurement). **When the cargo workspace is created, update this file** with real build/run/test commands and the actual layout.
+**M0 (audio I/O foundation) — code landed.** `crates/lh-io` (device enumeration/selection,
+duplex passthrough with lock-free ring + xrun stats, loopback RTL measurement) and
+`app/lion-heart` (CLI: `devices` / `run` / `latency`) exist; the other crates land with
+later milestones. Remaining M0 exit criterion: run the latency tool on real hardware
+(macOS + interface) and record the numbers in `docs/latency.md`.
 
-## Planned workspace layout
+Note for sandboxed/Linux dev environments: everything compiles and unit-tests without
+audio hardware; the ALSA "null" device (usually index 0) exercises the stream pipeline
+but has no real clock, so its xrun counts are meaningless. Real verification happens on
+macOS/CoreAudio.
+
+### Commands
+
+```sh
+cargo build                                    # debug build
+cargo fmt --check                              # formatting gate
+cargo clippy --all-targets -- -D warnings      # lint gate
+cargo test                                     # unit tests (no audio device needed)
+cargo run -p lion-heart -- devices             # list devices
+cargo run -p lion-heart --release -- run       # passthrough (Ctrl-C to stop)
+cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable)
+```
+
+CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu.
+
+## Workspace layout (planned = not yet created)
 
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |

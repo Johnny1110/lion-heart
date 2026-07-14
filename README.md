@@ -4,8 +4,10 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: design phase (pre-alpha).** No code yet. The complete technical plan lives in the
-> [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
+> **Status: M0 — audio I/O foundation (pre-alpha).** The CLI can list devices, run duplex
+> passthrough with xrun accounting, and measure round-trip latency over a loopback cable.
+> The complete technical plan lives in the [white paper](docs/white-paper.md)
+> (Traditional Chinese / 繁體中文).
 
 ## Why
 
@@ -94,9 +96,26 @@ docs/
 - [CLAUDE.md](CLAUDE.md) — engineering conventions, including the non-negotiable real-time audio rules
 - `docs/adr/` — architecture decision records (created as decisions happen)
 
-## Building
+## Building & running (M0)
 
-Nothing to build yet — M0 is the next step. This section will gain real commands when the workspace lands.
+Requires stable Rust (macOS; Linux also builds, given `libasound2-dev` + `pkg-config`).
+
+```sh
+cargo build --release
+
+# list audio devices and their capabilities
+cargo run -p lion-heart -- devices
+
+# duplex passthrough: guitar in → guitar out (Ctrl-C to stop)
+cargo run -p lion-heart --release -- run --buffer 64
+
+# measure round-trip latency (needs a loopback cable: interface out → in)
+cargo run -p lion-heart --release -- latency --buffer 64 --markdown
+```
+
+Pick devices with `--input/--output` (index or name substring), e.g.
+`--input scarlett --output scarlett`. Measured RTL numbers are logged in
+[docs/latency.md](docs/latency.md).
 
 ## License
 

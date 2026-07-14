@@ -1,0 +1,13 @@
+[package]
+name = "lion-heart"
+description = "Lion-Heart — open-source guitar amp & multi-effects processor (M0: audio I/O foundation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lh-io.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+ctrlc.workspace = true
