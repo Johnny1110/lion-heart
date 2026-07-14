@@ -117,6 +117,15 @@ Pick devices with `--input/--output` (index or name substring), e.g.
 `--input scarlett --output scarlett`. Measured RTL numbers are logged in
 [docs/latency.md](docs/latency.md).
 
+### Troubleshooting
+
+- **"does not support 48000 Hz"** — the *system default* device is probably not your
+  interface: Bluetooth/continuity microphones only run at 16–24 kHz, HDMI outputs are
+  often 44.1 kHz-only. Run `lion-heart devices`, then select your interface for **both**
+  sides: `--input <name> --output <name>`. `--sample-rate 0` follows the device default.
+- **Periodic clicks when input and output are different hardware** — two devices means
+  two clocks, and they drift. Use the same interface for both sides (the normal rig).
+
 ## License
 
 Application code: **MIT OR Apache-2.0** (dual). Future VST3-bundled builds will be distributed under **GPLv3** as required by the VST3 SDK licensing; the CLAP build and the standalone app are unaffected.

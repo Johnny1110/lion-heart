@@ -38,7 +38,7 @@ struct IoArgs {
     /// Output device: index or name substring (default: system output)
     #[arg(long)]
     output: Option<String>,
-    /// Sample rate in Hz
+    /// Sample rate in Hz (0 = follow the input device's default rate)
     #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
     sample_rate: u32,
     /// Requested buffer size in frames (0 = device default)

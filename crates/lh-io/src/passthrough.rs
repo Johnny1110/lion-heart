@@ -68,7 +68,8 @@ impl Passthrough {
             in_channel: opts.in_channel,
         })?;
 
-        let sr = opts.sample_rate;
+        // Effective rate: resolve() may have substituted the device default.
+        let sr = setup.in_config.sample_rate;
         let block = opts.buffer.filter(|&n| n > 0).unwrap_or(256) as usize;
         let grace_frames = (sr as f64 * GRACE_SECONDS) as u64;
 

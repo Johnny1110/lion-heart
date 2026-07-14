@@ -119,7 +119,8 @@ pub fn measure(
         in_channel: opts.in_channel,
     })?;
 
-    let sr = opts.sample_rate;
+    // Effective rate: resolve() may have substituted the device default.
+    let sr = setup.in_config.sample_rate;
     let sr_f = sr as f64;
     let trials = opts.trials.max(1);
     // Keep emissions far enough apart that the detector's refractory period

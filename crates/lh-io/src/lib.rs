@@ -35,6 +35,21 @@ pub enum IoError {
     UnsupportedFormat(String),
 
     #[error(
+        "{direction} device {device:?} does not support {requested} Hz (supported: {supported}).\n\
+         The system default device is often not your audio interface (Bluetooth mics and\n\
+         iPhone/continuity mics only run at low rates). Fixes:\n\
+           - run `lion-heart devices` and pick your interface: --input <name> --output <name>\n\
+           - pass --sample-rate 0 to follow the input device's default rate\n\
+           - or pass a --sample-rate the device supports"
+    )]
+    SampleRateUnsupported {
+        device: String,
+        direction: &'static str,
+        requested: u32,
+        supported: String,
+    },
+
+    #[error(
         "no loopback signal detected (noise floor {noise:.4}, threshold {threshold:.4}).\n\
          Connect the interface output back into the measured input with a cable\n\
          (or enable the interface's loopback mode) and check input gain."

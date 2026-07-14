@@ -84,6 +84,32 @@ pub fn resolve(spec: &DuplexSpec) -> Result<DuplexSetup, IoError> {
         });
     }
 
+    // 0 = follow the input device's current default rate.
+    let sample_rate = if spec.sample_rate == 0 {
+        in_default.sample_rate()
+    } else {
+        spec.sample_rate
+    };
+
+    // Preflight the rate against what each device reports, so the user gets an
+    // actionable message instead of the backend's terse build error. (On
+    // CoreAudio the backend switches the device's nominal rate itself when the
+    // hardware supports it — a failure means the device truly can't do it.)
+    for (direction, name, device, dir) in [
+        ("input", &in_name, &in_device, Direction::Input),
+        ("output", &out_name, &out_device, Direction::Output),
+    ] {
+        let ranges = f32_rate_ranges(device, dir);
+        if !rate_supported(&ranges, sample_rate) {
+            return Err(IoError::SampleRateUnsupported {
+                device: name.clone(),
+                direction,
+                requested: sample_rate,
+                supported: format_ranges(&ranges),
+            });
+        }
+    }
+
     let (buffer_size, buffer_note) = choose_buffer_size(
         spec.buffer,
         buffer_range(in_default.buffer_size()),
@@ -92,12 +118,12 @@ pub fn resolve(spec: &DuplexSpec) -> Result<DuplexSetup, IoError> {
 
     let in_config = cpal::StreamConfig {
         channels: in_channels,
-        sample_rate: spec.sample_rate,
+        sample_rate,
         buffer_size,
     };
     let out_config = cpal::StreamConfig {
         channels: out_default.channels(),
-        sample_rate: spec.sample_rate,
+        sample_rate,
         buffer_size,
     };
 
@@ -158,6 +184,59 @@ fn buffer_range(size: &cpal::SupportedBufferSize) -> Option<(u32, u32)> {
     }
 }
 
+/// Sample-rate ranges the device reports for f32 streams (all formats as a
+/// fallback, since some backends convert). Empty = backend can't say.
+fn f32_rate_ranges(device: &cpal::Device, dir: Direction) -> Vec<(u32, u32)> {
+    let ranges: Vec<cpal::SupportedStreamConfigRange> = match dir {
+        Direction::Input => device
+            .supported_input_configs()
+            .map(|it| it.collect())
+            .unwrap_or_default(),
+        Direction::Output => device
+            .supported_output_configs()
+            .map(|it| it.collect())
+            .unwrap_or_default(),
+    };
+    let collect = |only_f32: bool| -> Vec<(u32, u32)> {
+        let mut out: Vec<(u32, u32)> = ranges
+            .iter()
+            .filter(|r| !only_f32 || r.sample_format() == cpal::SampleFormat::F32)
+            .map(|r| (r.min_sample_rate(), r.max_sample_rate()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    let f32_only = collect(true);
+    if f32_only.is_empty() {
+        collect(false)
+    } else {
+        f32_only
+    }
+}
+
+/// Empty ranges mean "unknown" — let the backend be the judge in that case.
+fn rate_supported(ranges: &[(u32, u32)], rate: u32) -> bool {
+    ranges.is_empty() || ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&rate))
+}
+
+fn format_ranges(ranges: &[(u32, u32)]) -> String {
+    if ranges.is_empty() {
+        return "unknown".to_string();
+    }
+    ranges
+        .iter()
+        .map(|&(lo, hi)| {
+            if lo == hi {
+                format!("{lo}")
+            } else {
+                format!("{lo}–{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Decide between `Fixed(n)` and `Default` up front, instead of building a
 /// stream and falling back on failure (the data callbacks are consumed by a
 /// failed build attempt).
@@ -213,5 +292,24 @@ mod tests {
         // Unknown ranges → trust the request.
         let (size, _) = choose_buffer_size(Some(64), None, None);
         assert!(matches!(size, cpal::BufferSize::Fixed(64)));
+    }
+
+    #[test]
+    fn rate_support_check_and_formatting() {
+        // Discrete rates reported as degenerate ranges (typical CoreAudio).
+        let ranges = vec![(44_100, 44_100), (48_000, 48_000), (88_200, 96_000)];
+        assert!(rate_supported(&ranges, 48_000));
+        assert!(rate_supported(&ranges, 92_000));
+        assert!(!rate_supported(&ranges, 16_000));
+        assert_eq!(format_ranges(&ranges), "44100, 48000, 88200–96000");
+
+        // A Bluetooth-mic-style device that tops out below 48 kHz.
+        let bt = vec![(16_000, 16_000), (24_000, 24_000)];
+        assert!(!rate_supported(&bt, 48_000));
+        assert_eq!(format_ranges(&bt), "16000, 24000");
+
+        // Unknown → don't block, let the backend decide.
+        assert!(rate_supported(&[], 48_000));
+        assert_eq!(format_ranges(&[]), "unknown");
     }
 }
