@@ -1,8 +1,15 @@
-//! Duplex passthrough: input device → lock-free ring → output device.
+//! Duplex streaming: input device → lock-free ring → processor → output.
+//!
+//! [`DuplexRunner`] owns the stream pair and calls a caller-supplied mono
+//! processor inside the output callback — this is where the effect chain
+//! plugs in. [`Passthrough`] is the identity-processor special case used by
+//! the `run` diagnostic command.
 //!
 //! The audio path is mono: one input channel is tapped and written to every
 //! output channel. Output starts with a soft-start gain ramp so a hot signal
-//! never hits the monitors instantly (white paper §3.3).
+//! never hits the monitors instantly (white paper §3.3). In debug builds the
+//! processor runs under `assert_no_alloc`: any allocation on the audio thread
+//! aborts loudly (CLAUDE.md real-time rules).
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -19,9 +26,11 @@ use crate::{DEFAULT_SAMPLE_RATE, IoError};
 const GRACE_SECONDS: f64 = 0.25;
 /// Soft-start ramp length.
 const RAMP_SECONDS: f64 = 0.1;
+/// Mono scratch handed to the processor; larger callbacks are sub-chunked.
+const SCRATCH_FRAMES: usize = 8_192;
 
 #[derive(Debug, Clone)]
-pub struct PassthroughOpts {
+pub struct RunnerOpts {
     pub input: Option<String>,
     pub output: Option<String>,
     pub sample_rate: u32,
@@ -29,14 +38,14 @@ pub struct PassthroughOpts {
     pub buffer: Option<u32>,
     /// Input channel to tap, 1-based.
     pub in_channel: u16,
-    /// Output gain applied after the ramp, in dB.
+    /// Output gain applied after the processor and the ramp, in dB.
     pub gain_db: f32,
     /// Blocks of silence pre-filled into the ring. Each block adds one buffer
     /// period of latency but absorbs callback jitter between the two streams.
     pub prefill_blocks: u32,
 }
 
-impl Default for PassthroughOpts {
+impl Default for RunnerOpts {
     fn default() -> Self {
         Self {
             input: None,
@@ -50,16 +59,33 @@ impl Default for PassthroughOpts {
     }
 }
 
-/// A running passthrough. Dropping it stops the streams.
-pub struct Passthrough {
+/// Back-compat name: the pure-passthrough `run` command shares these options.
+pub type PassthroughOpts = RunnerOpts;
+
+/// Resolved stream facts, handed to the processor factory before the streams
+/// start — the one chance to `prepare()` DSP at the real sample rate.
+pub struct StreamInfo {
+    pub sample_rate: u32,
+    pub description: String,
+}
+
+/// A running duplex stream pair. Dropping it stops the audio.
+pub struct DuplexRunner {
     _in_stream: cpal::Stream,
     _out_stream: cpal::Stream,
     stats: Arc<Stats>,
     pub description: String,
+    pub sample_rate: u32,
 }
 
-impl Passthrough {
-    pub fn start(opts: &PassthroughOpts) -> Result<Self, IoError> {
+impl DuplexRunner {
+    /// Start streaming. `make_processor` runs once, off the audio thread,
+    /// with the resolved stream info; the closure it returns runs on the
+    /// audio thread for every mono block and must obey real-time rules.
+    pub fn start<F>(opts: &RunnerOpts, make_processor: F) -> Result<Self, IoError>
+    where
+        F: FnOnce(&StreamInfo) -> Box<dyn FnMut(&mut [f32]) + Send>,
+    {
         let setup = stream::resolve(&DuplexSpec {
             input: opts.input.clone(),
             output: opts.output.clone(),
@@ -83,6 +109,12 @@ impl Passthrough {
         }
 
         let stats = Arc::new(Stats::default());
+
+        let info = StreamInfo {
+            sample_rate: sr,
+            description: setup.describe(),
+        };
+        let mut processor = make_processor(&info);
 
         let in_channels = setup.in_channels;
         let tap = setup.tap;
@@ -113,25 +145,42 @@ impl Passthrough {
         let data_out = {
             let stats = Arc::clone(&stats);
             let mut gain = 0.0f32;
+            let mut scratch = vec![0.0f32; SCRATCH_FRAMES];
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let t0 = Instant::now();
                 stats.out_callbacks.fetch_add(1, Ordering::Relaxed);
+                let frames = data.len() / out_channels;
                 let mut missing = 0u64;
-                for frame in data.chunks_exact_mut(out_channels) {
-                    let sample = consumer.pop().unwrap_or_else(|_| {
-                        missing += 1;
-                        0.0
-                    });
-                    if gain < target_gain {
-                        gain = (gain + ramp_step).min(target_gain);
+                let mut done = 0usize;
+                while done < frames {
+                    let n = (frames - done).min(SCRATCH_FRAMES);
+                    let chunk = &mut scratch[..n];
+                    for s in chunk.iter_mut() {
+                        *s = consumer.pop().unwrap_or_else(|_| {
+                            missing += 1;
+                            0.0
+                        });
                     }
-                    let value = sample * gain;
-                    for out in frame {
-                        *out = value;
+
+                    #[cfg(debug_assertions)]
+                    assert_no_alloc::assert_no_alloc(|| processor(chunk));
+                    #[cfg(not(debug_assertions))]
+                    processor(chunk);
+
+                    let out = &mut data[done * out_channels..(done + n) * out_channels];
+                    for (frame, s) in out.chunks_exact_mut(out_channels).zip(chunk.iter()) {
+                        if gain < target_gain {
+                            gain = (gain + ramp_step).min(target_gain);
+                        }
+                        let value = s * gain;
+                        for o in frame {
+                            *o = value;
+                        }
                     }
+                    done += n;
                 }
-                let frames = (data.len() / out_channels) as u64;
-                let total = stats.out_frames.fetch_add(frames, Ordering::Relaxed) + frames;
+                let total =
+                    stats.out_frames.fetch_add(frames as u64, Ordering::Relaxed) + frames as u64;
                 if missing > 0 && total > grace_frames {
                     stats.underrun_frames.fetch_add(missing, Ordering::Relaxed);
                     stats.underrun_events.fetch_add(1, Ordering::Relaxed);
@@ -145,7 +194,7 @@ impl Passthrough {
         in_stream.play()?;
         out_stream.play()?;
 
-        let mut description = setup.describe();
+        let mut description = info.description;
         description.push_str(&format!(
             "\nring  : prefill {} block(s) = {:.2} ms added latency\nactual: {} / {} frames per callback (in/out)",
             opts.prefill_blocks,
@@ -159,11 +208,30 @@ impl Passthrough {
             _out_stream: out_stream,
             stats,
             description,
+            sample_rate: sr,
         })
     }
 
     pub fn stats(&self) -> Snapshot {
         self.stats.snapshot()
+    }
+}
+
+/// Identity-processor duplex: the `run` diagnostic command.
+pub struct Passthrough {
+    inner: DuplexRunner,
+    pub description: String,
+}
+
+impl Passthrough {
+    pub fn start(opts: &PassthroughOpts) -> Result<Self, IoError> {
+        let inner = DuplexRunner::start(opts, |_| Box::new(|_block: &mut [f32]| {}))?;
+        let description = inner.description.clone();
+        Ok(Self { inner, description })
+    }
+
+    pub fn stats(&self) -> Snapshot {
+        self.inner.stats()
     }
 }
 

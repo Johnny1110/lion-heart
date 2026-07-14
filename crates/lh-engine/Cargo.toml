@@ -1,13 +1,13 @@
 [package]
-name = "lh-io"
-description = "Audio device management, duplex streaming, and latency measurement for Lion-Heart"
+name = "lh-engine"
+description = "Real-time chain runner for Lion-Heart: node lifecycle and lock-free parameter plumbing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-cpal.workspace = true
+lh-core.workspace = true
+lh-dsp.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
-assert_no_alloc.workspace = true

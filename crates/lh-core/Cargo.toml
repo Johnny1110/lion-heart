@@ -1,0 +1,9 @@
+[package]
+name = "lh-core"
+description = "Core vocabulary of Lion-Heart: parameter identities, value mappings, effect descriptors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

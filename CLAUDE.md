@@ -14,16 +14,24 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M0 (audio I/O foundation) — code landed.** `crates/lh-io` (device enumeration/selection,
-duplex passthrough with lock-free ring + xrun stats, loopback RTL measurement) and
-`app/lion-heart` (CLI: `devices` / `run` / `latency`) exist; the other crates land with
-later milestones. Remaining M0 exit criterion: run the latency tool on real hardware
-(macOS + interface) and record the numbers in `docs/latency.md`.
+**M1 (first pedals) — code landed.** Existing crates: `lh-core` (ParamId/Range/descriptors),
+`lh-dsp` (`Effect` trait, `Smoothed`, hand-written 4× oversampler, gate/drive/delay,
+offline test harness, criterion benches), `lh-engine` (linear chain, lock-free
+param/bypass messages, telemetry), `lh-io` (generic `DuplexRunner` with injectable
+processor), `app/lion-heart` (CLI: `devices` / `run` / `latency` / `jam`).
+`lh-nam` and `lh-assets` land with M2.
+
+Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
+processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
+that as a real-time violation to fix, never a crash to paper over. It already caught an
+undersized oversampler scratch buffer that offline tests missed.
+
+Hardware verification outstanding (macOS + interface): record RTL numbers in
+`docs/latency.md`; play through `jam` sweeping params by ear to confirm no clicks.
 
 Note for sandboxed/Linux dev environments: everything compiles and unit-tests without
 audio hardware; the ALSA "null" device (usually index 0) exercises the stream pipeline
-but has no real clock, so its xrun counts are meaningless. Real verification happens on
-macOS/CoreAudio.
+(including assert_no_alloc) but has no real clock, so its xrun counts are meaningless.
 
 ### Commands
 
@@ -31,15 +39,17 @@ macOS/CoreAudio.
 cargo build                                    # debug build
 cargo fmt --check                              # formatting gate
 cargo clippy --all-targets -- -D warnings      # lint gate
-cargo test                                     # unit tests (no audio device needed)
+cargo test                                     # all tests run offline, no device needed
+cargo bench -p lh-dsp --bench effects          # per-block DSP cost (criterion)
 cargo run -p lion-heart -- devices             # list devices
 cargo run -p lion-heart --release -- run       # passthrough (Ctrl-C to stop)
+cargo run -p lion-heart --release -- jam       # pedalboard + control REPL
 cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable)
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu.
 
-## Workspace layout (planned = not yet created)
+## Workspace layout (`lh-nam`/`lh-assets` = planned, M2)
 
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |

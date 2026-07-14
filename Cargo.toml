@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/lh-io", "app/lion-heart"]
+members = [
+    "crates/lh-core",
+    "crates/lh-dsp",
+    "crates/lh-engine",
+    "crates/lh-io",
+    "app/lion-heart",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -12,13 +18,24 @@ repository = "https://github.com/Johnny1110/lion-heart"
 # audio
 cpal = "0.18"
 rtrb = "0.3"
+assert_no_alloc = "1.1"
 # cli & errors
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 ctrlc = "3.5"
+# dev/test
+criterion = "0.8"
+realfft = "3.5"
 # internal
+lh-core = { path = "crates/lh-core" }
+lh-dsp = { path = "crates/lh-dsp" }
+lh-engine = { path = "crates/lh-engine" }
 lh-io = { path = "crates/lh-io" }
 
 [profile.release]
+lto = "thin"
+
+# Benchmarks want optimized dependencies even in the bench profile.
+[profile.bench]
 lto = "thin"

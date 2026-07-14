@@ -7,7 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lh-core.workspace = true
+lh-dsp.workspace = true
+lh-engine.workspace = true
 lh-io.workspace = true
+assert_no_alloc.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 ctrlc.workspace = true

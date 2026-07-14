@@ -1,0 +1,18 @@
+[package]
+name = "lh-dsp"
+description = "Hand-written effects for Lion-Heart: offline-testable, real-time-safe DSP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lh-core.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+realfft.workspace = true
+
+[[bench]]
+name = "effects"
+harness = false

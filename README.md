@@ -4,8 +4,10 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M0 — audio I/O foundation (pre-alpha).** The CLI can list devices, run duplex
-> passthrough with xrun accounting, and measure round-trip latency over a loopback cable.
+> **Status: M1 — first pedals (pre-alpha).** A chain of hand-written DSP — noise gate →
+> drive (4× oversampled waveshaper) → delay — runs in real time under `lion-heart jam`,
+> with live click-free parameter control from a REPL and a zero-allocation audio thread
+> (enforced by `assert_no_alloc` in debug builds). M0's latency tooling included.
 > The complete technical plan lives in the [white paper](docs/white-paper.md)
 > (Traditional Chinese / 繁體中文).
 
@@ -56,9 +58,9 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 Milestones are **completion units, not dates** (this is a burst-driven side project). Each one ends with something playable.
 
 | Milestone | Name             | Exit criteria                                                              |
-| --------- | ---------------- | -------------------------------------------------------------------------- |
-| M0        | First sound      | Duplex passthrough; measured round-trip latency report; xrun counter        |
-| M1        | First pedal      | Gate + drive (oversampled) + basic delay; glitch-free param changes; offline test harness |
+| --------- | ---------------- | --------------------------------------------------------------------------- |
+| M0 ✅     | First sound      | Duplex passthrough; measured round-trip latency report; xrun counter        |
+| M1 ✅     | First pedal      | Gate + drive (oversampled) + basic delay; glitch-free param changes; offline test harness |
 | M2        | The amp          | `.nam` loading + IR cab + gain staging + safety limiter — a record-worthy tone |
 | M3        | Chain & memory   | Reorder/bypass chain; JSON presets; click-free preset switching             |
 | M4        | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
@@ -109,8 +111,17 @@ cargo run -p lion-heart -- devices
 # duplex passthrough: guitar in → guitar out (Ctrl-C to stop)
 cargo run -p lion-heart --release -- run --buffer 64
 
+# play through the pedalboard (gate → drive → delay) with a live control REPL
+cargo run -p lion-heart --release -- jam --buffer 64
+#   > set drive.drive 24        # dB, smoothed — no clicks
+#   > set delay.time 500        # ms, tape-style pitch slew
+#   > off gate / on gate        # crossfaded bypass
+
 # measure round-trip latency (needs a loopback cable: interface out → in)
 cargo run -p lion-heart --release -- latency --buffer 64 --markdown
+
+# per-block DSP cost (criterion)
+cargo bench -p lh-dsp --bench effects
 ```
 
 Pick devices with `--input/--output` (index or name substring), e.g.
