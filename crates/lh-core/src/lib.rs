@@ -1,10 +1,14 @@
-//! Core vocabulary of Lion-Heart: parameter identities, value mappings, and
-//! effect descriptors. No I/O, no threads — everything here is plain data,
-//! shared by the DSP, engine, UI, and (later) preset/MIDI layers.
+//! Core vocabulary of Lion-Heart: parameter identities, value mappings,
+//! effect descriptors, and the preset schema. No I/O, no threads — everything
+//! here is plain data, shared by the DSP, engine, UI, and MIDI layers.
 //!
 //! Convention (white paper §4.3): parameters cross module boundaries as
 //! **normalized** values in `0.0..=1.0`; real-world units live behind a
-//! [`Range`] mapping owned by the parameter's [`ParamDesc`].
+//! [`Range`] mapping owned by the parameter's [`ParamDesc`]. Presets store
+//! **real** values keyed by names, so files stay meaningful to humans and
+//! robust against parameter reordering.
+
+pub mod preset;
 
 /// Decibels → linear amplitude.
 pub fn db_to_lin(db: f32) -> f32 {

@@ -27,6 +27,18 @@ pub enum AssetError {
 
     #[error("convolver rejected the impulse response: {0}")]
     Convolver(String),
+
+    #[error("cannot hash {path}: {source}")]
+    Hash {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[error(
+        "asset not found: {path} (sha256 {sha256}).\n\
+         Move the file back, or place a file with the same name next to the preset."
+    )]
+    Missing { path: String, sha256: String },
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +135,62 @@ pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), 
         trimmed,
     };
     Ok((Box::new(IrAsset { convolver }), info))
+}
+
+/// SHA-256 of a file's contents, hex-encoded — the identity presets use to
+/// reference external assets (white paper §4.3).
+pub fn hash_file(path: &Path) -> Result<String, AssetError> {
+    use sha2::{Digest, Sha256};
+    let map_err = |source| AssetError::Hash {
+        path: path.display().to_string(),
+        source,
+    };
+    let mut file = std::fs::File::open(path).map_err(map_err)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).map_err(map_err)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Resolve a preset's [`AssetRef`] to a real file. Tries the stored path
+/// first, then a same-named file in `fallback_dir` (usually the preset's own
+/// directory). Hash mismatches load anyway but warn — the user may have
+/// legitimately updated the file.
+pub fn resolve_asset(
+    reference: &lh_core::preset::AssetRef,
+    fallback_dir: Option<&Path>,
+) -> Result<(std::path::PathBuf, Vec<String>), AssetError> {
+    let mut warnings = Vec::new();
+    let stored = Path::new(&reference.path);
+
+    let found = if stored.is_file() {
+        stored.to_path_buf()
+    } else if let Some(dir) = fallback_dir
+        && let Some(name) = stored.file_name()
+        && dir.join(name).is_file()
+    {
+        let relocated = dir.join(name);
+        warnings.push(format!(
+            "asset {} not at its stored path — using {}",
+            reference.path,
+            relocated.display()
+        ));
+        relocated
+    } else {
+        return Err(AssetError::Missing {
+            path: reference.path.clone(),
+            sha256: reference.sha256.clone(),
+        });
+    };
+
+    match hash_file(&found) {
+        Ok(hash) if hash != reference.sha256 => warnings.push(format!(
+            "{} content changed since the preset was saved (hash mismatch) — loading anyway",
+            found.display()
+        )),
+        Ok(_) => {}
+        Err(e) => warnings.push(format!("could not verify hash: {e}")),
+    }
+    Ok((found, warnings))
 }
 
 /// Offline windowed-sinc resampler (arbitrary ratio). Quality is bounded by
@@ -238,6 +306,51 @@ mod tests {
         assert!(matches!(
             load_ir(&path, 48_000),
             Err(AssetError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn hashes_and_resolves_assets() {
+        let path = temp_wav("hashme", 48_000, 1, &[0.5, 0.25, 0.1]);
+        let hash = hash_file(&path).unwrap();
+        assert_eq!(hash.len(), 64, "hex sha256");
+        assert_eq!(hash_file(&path).unwrap(), hash, "deterministic");
+
+        let reference = lh_core::preset::AssetRef {
+            path: path.display().to_string(),
+            sha256: hash.clone(),
+        };
+        // Exact path, matching hash: no warnings.
+        let (found, warnings) = resolve_asset(&reference, None).unwrap();
+        assert_eq!(found, path);
+        assert!(warnings.is_empty());
+
+        // Hash mismatch: loads with a warning.
+        let stale = lh_core::preset::AssetRef {
+            path: path.display().to_string(),
+            sha256: "0".repeat(64),
+        };
+        let (_, warnings) = resolve_asset(&stale, None).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("hash mismatch"));
+
+        // Stored path gone: relocates via the fallback dir by file name.
+        let moved = lh_core::preset::AssetRef {
+            path: format!(
+                "/nonexistent/dir/{}",
+                path.file_name().unwrap().to_string_lossy()
+            ),
+            sha256: hash,
+        };
+        let dir = path.parent().unwrap();
+        let (found, warnings) = resolve_asset(&moved, Some(dir)).unwrap();
+        assert_eq!(found, dir.join(path.file_name().unwrap()));
+        assert!(warnings.iter().any(|w| w.contains("stored path")));
+
+        // Nowhere to be found: actionable error.
+        assert!(matches!(
+            resolve_asset(&moved, None),
+            Err(AssetError::Missing { .. })
         ));
     }
 

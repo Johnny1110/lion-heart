@@ -14,16 +14,16 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M2 (the amp) — code landed.** All planned crates exist. On top of M1: `lh-dsp` gained
-`swap` (lock-free asset install/retire — the "garbage chute"), `cab` (partitioned FFT
-convolution via fft-convolver), and `limiter` (always-on output safety); `lh-nam` wraps
-nam-rs behind the `NamAsset` seam (loudness-normalized to −18 dB, rate-locked with an
-actionable mismatch error; FFI fallback to NeuralAmpModelerCore would replace the asset
-behind the same effect — ADR required); `lh-assets` loads IR WAVs (hound decode, offline
-windowed-sinc resample to engine rate, 0.5 s cap, energy normalization). `jam` chains
-gate → drive → amp → cab → delay → limiter with `load nam/ir`, `unload`, hot-swap
-mid-stream. The NAM test fixture in `crates/lh-nam/tests/fixtures/` is vendored from
-nam-rs/NAM Core (MIT — see its README).
+**M3 (chain & memory) — code landed.** On top of M2: the chain **reorders at runtime**
+(`EngineMsg::SetOrder`; the engine rides a ~4 ms master fade through silence before
+switching — the only true topology change, so params/bypass stay pure morphs);
+`lh-core::preset` is the versioned JSON schema (real values keyed by names, unknown
+keys skipped with warnings, newer schema rejected); assets are referenced by
+**path + SHA-256** with same-name relocation via the preset directory
+(`lh_assets::{hash_file, resolve_asset}`); `jam` gained `save` / `load preset` /
+`presets` / `order`, persists `~/.lion-heart/{config.json, presets/}`, and auto-loads
+the last preset on start (`--preset` overrides). The NAM test fixture in
+`crates/lh-nam/tests/fixtures/` is vendored from nam-rs/NAM Core (MIT — see its README).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat

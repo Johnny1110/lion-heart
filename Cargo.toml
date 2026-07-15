@@ -29,6 +29,10 @@ clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
 ctrlc = "3.5"
+# presets & config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 # dev/test
 criterion = "0.8"
 realfft = "3.5"

@@ -5,7 +5,7 @@ use lh_io::DEFAULT_SAMPLE_RATE;
 #[command(
     name = "lion-heart",
     version,
-    about = "Lion-Heart — guitar amp & effects processor (M2: the amp)"
+    about = "Lion-Heart — guitar amp & effects processor (M3: chain & memory)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -68,6 +68,9 @@ pub struct RunArgs {
 pub struct JamArgs {
     #[command(flatten)]
     pub io: IoArgs,
+    /// Preset to load on start (default: the last one used)
+    #[arg(long)]
+    pub preset: Option<String>,
     /// Output gain in dB (applied with a 100 ms soft-start ramp)
     #[arg(long, default_value_t = 0.0)]
     pub gain_db: f32,

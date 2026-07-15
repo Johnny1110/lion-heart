@@ -103,3 +103,170 @@ fn unknown_keys_are_rejected() {
     assert!(handle.set_param("drive", "sparkle", 0.5).is_err());
     assert!(handle.set_active("chorus", true).is_err());
 }
+
+// --- reorder & preset machinery, probed with two distinguishable effects ---
+
+use lh_core::{EffectDesc, ParamDesc};
+
+static NO_PARAMS: [ParamDesc; 0] = [];
+static ADD_DESC: EffectDesc = EffectDesc {
+    key: "add",
+    name: "Add One",
+    params: &NO_PARAMS,
+};
+static MUL_DESC: EffectDesc = EffectDesc {
+    key: "mul",
+    name: "Times Two",
+    params: &NO_PARAMS,
+};
+
+struct AddOne;
+impl Effect for AddOne {
+    fn descriptor(&self) -> &'static EffectDesc {
+        &ADD_DESC
+    }
+    fn prepare(&mut self, _: u32) {}
+    fn reset(&mut self) {}
+    fn set_param(&mut self, _: usize, _: f32) {}
+    fn process(&mut self, block: &mut [f32]) {
+        for x in block.iter_mut() {
+            *x += 1.0;
+        }
+    }
+}
+
+struct TimesTwo;
+impl Effect for TimesTwo {
+    fn descriptor(&self) -> &'static EffectDesc {
+        &MUL_DESC
+    }
+    fn prepare(&mut self, _: u32) {}
+    fn reset(&mut self) {}
+    fn set_param(&mut self, _: usize, _: f32) {}
+    fn process(&mut self, block: &mut [f32]) {
+        for x in block.iter_mut() {
+            *x *= 2.0;
+        }
+    }
+}
+
+fn probe_chain() -> (lh_engine::Chain, lh_engine::ChainHandle) {
+    let (mut chain, handle) = build_chain(vec![Box::new(AddOne), Box::new(TimesTwo)]);
+    chain.prepare(SR);
+    (chain, handle)
+}
+
+/// Feed DC 1.0 and return the settled output value.
+fn settled_value(chain: &mut lh_engine::Chain) -> f32 {
+    let mut last = 0.0;
+    for _ in 0..200 {
+        // 200 × 64 ≈ 267 ms — enough for any fade to finish
+        let mut block = [1.0f32; 64];
+        chain.process(&mut block);
+        last = block[63];
+    }
+    last
+}
+
+#[test]
+fn reorder_changes_processing_order() {
+    let (mut chain, mut handle) = probe_chain();
+    assert_eq!(handle.order_keys(), ["add", "mul"]);
+    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3, "(1+1)*2");
+
+    handle.set_order(&["mul", "add"]).unwrap();
+    assert_eq!(handle.order_keys(), ["mul", "add"]);
+    assert!((settled_value(&mut chain) - 3.0).abs() < 1e-3, "1*2+1");
+}
+
+#[test]
+fn reorder_fades_through_silence_without_clicks() {
+    let (mut chain, mut handle) = probe_chain();
+    settled_value(&mut chain); // steady 4.0
+
+    handle.set_order(&["mul", "add"]).unwrap();
+    let mut out = Vec::new();
+    for _ in 0..200 {
+        let mut block = [1.0f32; 64];
+        chain.process(&mut block);
+        out.extend_from_slice(&block);
+    }
+    let dip = out.iter().fold(f32::INFINITY, |m, v| m.min(v.abs()));
+    assert!(dip < 0.05, "must pass near silence, dip {dip}");
+    let max_step = out
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_step < 0.2, "no hard switch, step {max_step}");
+    assert!(
+        (out.last().unwrap() - 3.0).abs() < 1e-3,
+        "lands on new order"
+    );
+}
+
+#[test]
+fn bad_orders_are_rejected() {
+    let (_chain, mut handle) = probe_chain();
+    assert!(handle.set_order(&["add"]).is_err(), "missing slots");
+    assert!(handle.set_order(&["add", "add"]).is_err(), "duplicate");
+    assert!(handle.set_order(&["add", "wah"]).is_err(), "unknown");
+}
+
+#[test]
+fn preset_snapshot_applies_back_identically() {
+    let (mut chain, mut handle) = build_chain(pedalboard());
+    chain.prepare(SR);
+    handle.set_param("drive", "drive", 24.0).unwrap();
+    handle.set_param("delay", "time", 500.0).unwrap();
+    handle.set_active("gate", false).unwrap();
+    handle.set_order(&["drive", "gate", "delay"]).unwrap();
+
+    let saved = handle.snapshot_chain();
+    assert_eq!(saved[0].key, "drive");
+    assert_eq!(saved[0].params["drive"], 24.0);
+    assert!(!saved[1].active);
+
+    // A fresh chain of the same pedals, restored from the snapshot.
+    let (mut chain2, mut handle2) = build_chain(pedalboard());
+    chain2.prepare(SR);
+    let warnings = handle2.apply_preset_chain(&saved).unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(handle2.snapshot_chain(), saved);
+}
+
+#[test]
+fn preset_apply_is_forward_compatible() {
+    use lh_core::preset::SlotState;
+    use std::collections::BTreeMap;
+
+    let (mut chain, mut handle) = build_chain(pedalboard());
+    chain.prepare(SR);
+
+    // A preset from "the future": unknown slot, unknown param, and it
+    // doesn't mention the delay at all.
+    let chain_states = vec![
+        SlotState {
+            key: "drive".into(),
+            active: true,
+            params: BTreeMap::from([("drive".into(), 30.0), ("sparkle".into(), 1.0)]),
+        },
+        SlotState {
+            key: "wah".into(),
+            active: true,
+            params: BTreeMap::new(),
+        },
+        SlotState {
+            key: "gate".into(),
+            active: false,
+            params: BTreeMap::new(),
+        },
+    ];
+    let warnings = handle.apply_preset_chain(&chain_states).unwrap();
+    assert_eq!(warnings.len(), 3, "{warnings:?}"); // sparkle, wah, delay
+
+    let now = handle.snapshot_chain();
+    assert_eq!(now[0].key, "drive");
+    assert_eq!(now[0].params["drive"], 30.0);
+    assert_eq!(now[1].key, "gate");
+    assert_eq!(now[2].key, "delay", "unmentioned slot kept at the end");
+}

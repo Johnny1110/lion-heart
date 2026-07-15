@@ -1,14 +1,20 @@
-//! Real-time chain runner (M1: fixed linear chain).
+//! Real-time chain runner: a linear chain with runtime reordering.
 //!
 //! Split ownership: [`Chain`] moves onto the audio thread and is the only
 //! thing that touches effects while streams run; [`ChainHandle`] stays on the
 //! control thread. They communicate exclusively through a lock-free SPSC ring
 //! of [`EngineMsg`] and a couple of atomics — no locks, no allocation on the
 //! audio side (white paper §4.1).
+//!
+//! Click-freeness (white paper §4.2): params are smoothed inside effects,
+//! bypass crossfades per slot, and a **reorder** — the one true topology
+//! change — rides a short master fade through silence before the new order
+//! takes effect.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use lh_core::preset::SlotState;
 use lh_core::{EffectDesc, ParamId, lin_to_db};
 use lh_dsp::Effect;
 use lh_dsp::smooth::Smoothed;
@@ -17,9 +23,13 @@ use thiserror::Error;
 /// Engine-internal processing granularity. Device callbacks may hand us
 /// bigger blocks; `Chain::process` slices them down to this.
 pub const MAX_BLOCK: usize = 1024;
+/// Upper bound on chain length (fits the order message on the ring).
+pub const MAX_SLOTS: usize = 8;
 const MSG_CAPACITY: usize = 256;
 /// Bypass toggles crossfade over this window instead of hard-switching.
 const BYPASS_FADE_MS: f32 = 10.0;
+/// Master fade time constant for reorders (out through ~-60 dB, then back).
+const ORDER_FADE_MS: f32 = 4.0;
 /// Upper bound of control messages applied per process call, so a message
 /// flood can never starve the audio deadline.
 const MAX_MSGS_PER_BLOCK: usize = 64;
@@ -35,6 +45,12 @@ pub enum EngineMsg {
         slot: u8,
         active: bool,
     },
+    /// New processing order (slot indices); applied at the bottom of a
+    /// master fade so the routing switch is inaudible.
+    SetOrder {
+        order: [u8; MAX_SLOTS],
+        len: u8,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -43,6 +59,8 @@ pub enum EngineError {
     UnknownSlot(String),
     #[error("unknown param {param:?} on slot {slot:?}")]
     UnknownParam { slot: String, param: String },
+    #[error("bad chain order: {0}")]
+    BadOrder(String),
     #[error("control queue full — engine not draining?")]
     QueueFull,
 }
@@ -74,6 +92,12 @@ struct Slot {
 /// [`Chain::reset`]; [`Chain::prepare`] allocates and runs before streams start.
 pub struct Chain {
     slots: Vec<Slot>,
+    /// Processing order (indices into `slots`).
+    order: Vec<u8>,
+    /// A reorder waiting for the master fade to reach the bottom.
+    pending_order: Option<([u8; MAX_SLOTS], u8)>,
+    /// Master output fade: 1.0 in normal operation, dips to ~0 across reorders.
+    fade: Smoothed,
     rx: rtrb::Consumer<EngineMsg>,
     dry: Vec<f32>,
     telemetry: Arc<Telemetry>,
@@ -86,6 +110,8 @@ impl Chain {
             slot.wet.configure(BYPASS_FADE_MS, sample_rate);
             slot.wet.snap_to_target();
         }
+        self.fade.configure(ORDER_FADE_MS, sample_rate);
+        self.fade.snap_to_target();
         self.dry = vec![0.0; MAX_BLOCK];
     }
 
@@ -108,8 +134,23 @@ impl Chain {
                         slot.wet.set_target(if active { 1.0 } else { 0.0 });
                     }
                 }
+                Ok(EngineMsg::SetOrder { order, len }) => {
+                    self.pending_order = Some((order, len));
+                    self.fade.set_target(0.0);
+                }
                 Err(_) => break,
             }
+        }
+
+        // Apply a pending reorder once the fade is inaudible (≤ -60 dB);
+        // then ride back up. Same-order messages still dip — harmless.
+        if let Some((order, len)) = self.pending_order
+            && self.fade.current() <= 1e-3
+        {
+            self.order.clear();
+            self.order.extend_from_slice(&order[..len as usize]);
+            self.pending_order = None;
+            self.fade.set_target(1.0);
         }
 
         self.telemetry
@@ -117,7 +158,10 @@ impl Chain {
             .store(peak(block).to_bits(), Ordering::Relaxed);
 
         for chunk in block.chunks_mut(MAX_BLOCK) {
-            for slot in &mut self.slots {
+            for i in 0..self.order.len() {
+                let Some(slot) = self.slots.get_mut(self.order[i] as usize) else {
+                    continue;
+                };
                 // A fade-out below -60 dB is inaudible: snap it so the
                 // skip fast-path engages instead of blending forever.
                 if slot.wet.target() == 0.0 && slot.wet.current() <= 1e-3 {
@@ -138,6 +182,12 @@ impl Chain {
                     let w = slot.wet.tick();
                     *s = d + (*s - d) * w;
                 }
+            }
+        }
+
+        if !(self.fade.is_settled() && self.fade.target() == 1.0) {
+            for x in block.iter_mut() {
+                *x *= self.fade.tick();
             }
         }
 
@@ -165,6 +215,7 @@ pub struct ChainHandle {
     descs: Vec<&'static EffectDesc>,
     norms: Vec<Vec<f32>>,
     active: Vec<bool>,
+    order: Vec<u8>,
     telemetry: Arc<Telemetry>,
 }
 
@@ -231,12 +282,111 @@ impl ChainHandle {
         Ok(())
     }
 
-    /// Human-readable state of every slot and parameter (for `list`).
-    pub fn state_lines(&self) -> Vec<String> {
-        self.descs
+    /// Reorder the chain. `keys` must name every slot exactly once; the
+    /// engine fades through silence while switching.
+    pub fn set_order(&mut self, keys: &[&str]) -> Result<(), EngineError> {
+        if keys.len() != self.descs.len() {
+            return Err(EngineError::BadOrder(format!(
+                "need all {} slots, got {}",
+                self.descs.len(),
+                keys.len()
+            )));
+        }
+        let mut order = [0u8; MAX_SLOTS];
+        let mut seen = [false; MAX_SLOTS];
+        for (i, key) in keys.iter().enumerate() {
+            let idx = self.slot_index(key)?;
+            if seen[idx] {
+                return Err(EngineError::BadOrder(format!("duplicate slot {key:?}")));
+            }
+            seen[idx] = true;
+            order[i] = idx as u8;
+        }
+        self.tx
+            .push(EngineMsg::SetOrder {
+                order,
+                len: keys.len() as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
+        self.order = order[..keys.len()].to_vec();
+        Ok(())
+    }
+
+    /// Slot keys in current processing order.
+    pub fn order_keys(&self) -> Vec<&'static str> {
+        self.order
             .iter()
-            .enumerate()
-            .map(|(i, desc)| {
+            .map(|&i| self.descs[i as usize].key)
+            .collect()
+    }
+
+    /// Capture the chain (order, bypass, real param values) for a preset.
+    pub fn snapshot_chain(&self) -> Vec<SlotState> {
+        self.order
+            .iter()
+            .map(|&i| {
+                let i = i as usize;
+                let desc = self.descs[i];
+                SlotState {
+                    key: desc.key.to_string(),
+                    active: self.active[i],
+                    params: desc
+                        .params
+                        .iter()
+                        .enumerate()
+                        .map(|(j, p)| (p.key.to_string(), p.range.to_real(self.norms[i][j])))
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Apply a preset's chain: params, bypass flags, and order. Unknown
+    /// slots/params are skipped with a warning (forward compatibility);
+    /// slots the preset doesn't mention keep playing, appended at the end.
+    pub fn apply_preset_chain(&mut self, chain: &[SlotState]) -> Result<Vec<String>, EngineError> {
+        let mut warnings = Vec::new();
+        let mut order_keys: Vec<&'static str> = Vec::new();
+
+        for state in chain {
+            let Ok(idx) = self.slot_index(&state.key) else {
+                warnings.push(format!("unknown slot {:?} skipped", state.key));
+                continue;
+            };
+            order_keys.push(self.descs[idx].key);
+            self.set_active(&state.key, state.active)?;
+            for (param_key, value) in &state.params {
+                match self.set_param(&state.key, param_key, *value) {
+                    Ok(_) => {}
+                    Err(EngineError::UnknownParam { .. }) => warnings.push(format!(
+                        "unknown param {:?} on {:?} skipped",
+                        param_key, state.key
+                    )),
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        for &i in &self.order.clone() {
+            let key = self.descs[i as usize].key;
+            if !order_keys.contains(&key) {
+                order_keys.push(key);
+                warnings.push(format!(
+                    "slot {key:?} missing from preset — kept at the end"
+                ));
+            }
+        }
+        self.set_order(&order_keys)?;
+        Ok(warnings)
+    }
+
+    /// Human-readable state of every slot and parameter, in processing order.
+    pub fn state_lines(&self) -> Vec<String> {
+        self.order
+            .iter()
+            .map(|&i| {
+                let i = i as usize;
+                let desc = self.descs[i];
                 let params = desc
                     .params
                     .iter()
@@ -252,7 +402,7 @@ impl ChainHandle {
                     .collect::<Vec<_>>()
                     .join(" | ");
                 format!(
-                    "{:<6} [{}]  {}",
+                    "{:<7} [{}]  {}",
                     desc.key,
                     if self.active[i] { "on " } else { "off" },
                     params
@@ -274,6 +424,12 @@ impl ChainHandle {
 /// Wire up a chain and its control handle. Call [`Chain::prepare`] with the
 /// stream's sample rate before processing.
 pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
+    assert!(
+        effects.len() <= MAX_SLOTS,
+        "chain of {} exceeds MAX_SLOTS {}",
+        effects.len(),
+        MAX_SLOTS
+    );
     let (tx, rx) = rtrb::RingBuffer::new(MSG_CAPACITY);
     let telemetry = Arc::new(Telemetry::default());
 
@@ -283,6 +439,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
         .map(|d| d.params.iter().map(|p| p.default_norm()).collect())
         .collect();
     let active = vec![true; descs.len()];
+    let order: Vec<u8> = (0..effects.len() as u8).collect();
     let slots = effects
         .into_iter()
         .map(|effect| Slot {
@@ -294,6 +451,9 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
     (
         Chain {
             slots,
+            order: order.clone(),
+            pending_order: None,
+            fade: Smoothed::new(1.0),
             rx,
             dry: Vec::new(),
             telemetry: Arc::clone(&telemetry),
@@ -303,6 +463,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             descs,
             norms,
             active,
+            order,
             telemetry,
         },
     )
