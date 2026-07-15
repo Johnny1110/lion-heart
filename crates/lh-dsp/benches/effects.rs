@@ -47,6 +47,27 @@ fn bench_effects(c: &mut Criterion) {
         })
     });
 
+    // Cab with a realistic 100 ms IR (4800 taps at 48 kHz, 128-sample partitions).
+    let (mut cab, mut cab_handle) = lh_dsp::cab::CabIr::new();
+    cab.prepare(SR);
+    let ir: Vec<f32> = (0..4_800)
+        .map(|n| {
+            let env = (-(n as f32) / (SR as f32 * 0.02)).exp();
+            ((n as f32 * 12.9898).sin() * 43_758.547).fract() * env
+        })
+        .collect();
+    let mut convolver = fft_convolver::FFTConvolver::<f32>::default();
+    convolver.init(128, &ir).unwrap();
+    cab_handle
+        .install(Box::new(lh_dsp::cab::IrAsset { convolver }))
+        .unwrap();
+    group.bench_function("cab_ir_100ms", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            cab.process(black_box(&mut buf));
+        })
+    });
+
     let mut g2 = NoiseGate::new();
     let mut d2 = Drive::new();
     let mut dl2 = Delay::new();

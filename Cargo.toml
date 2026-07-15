@@ -4,6 +4,8 @@ members = [
     "crates/lh-core",
     "crates/lh-dsp",
     "crates/lh-engine",
+    "crates/lh-nam",
+    "crates/lh-assets",
     "crates/lh-io",
     "app/lion-heart",
 ]
@@ -19,6 +21,9 @@ repository = "https://github.com/Johnny1110/lion-heart"
 cpal = "0.18"
 rtrb = "0.3"
 assert_no_alloc = "1.1"
+nam-rs = "0.3"
+fft-convolver = "0.4"
+hound = "3.5"
 # cli & errors
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
@@ -31,6 +36,8 @@ realfft = "3.5"
 lh-core = { path = "crates/lh-core" }
 lh-dsp = { path = "crates/lh-dsp" }
 lh-engine = { path = "crates/lh-engine" }
+lh-nam = { path = "crates/lh-nam" }
+lh-assets = { path = "crates/lh-assets" }
 lh-io = { path = "crates/lh-io" }
 
 [profile.release]

@@ -1,0 +1,13 @@
+[package]
+name = "lh-assets"
+description = "Control-thread asset loading for Lion-Heart: IR wav decoding, resampling, convolver construction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+lh-dsp.workspace = true
+fft-convolver.workspace = true
+hound.workspace = true
+thiserror.workspace = true

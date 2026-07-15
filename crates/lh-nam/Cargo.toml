@@ -1,6 +1,6 @@
 [package]
-name = "lh-dsp"
-description = "Hand-written effects for Lion-Heart: offline-testable, real-time-safe DSP"
+name = "lh-nam"
+description = "NAM amp block for Lion-Heart: nam-rs integration behind the asset-swap seam"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,13 @@ repository.workspace = true
 
 [dependencies]
 lh-core.workspace = true
-rtrb.workspace = true
-fft-convolver.workspace = true
+lh-dsp.workspace = true
+nam-rs.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-realfft.workspace = true
 
 [[bench]]
-name = "effects"
+name = "amp"
 harness = false

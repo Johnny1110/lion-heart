@@ -14,12 +14,16 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M1 (first pedals) — code landed.** Existing crates: `lh-core` (ParamId/Range/descriptors),
-`lh-dsp` (`Effect` trait, `Smoothed`, hand-written 4× oversampler, gate/drive/delay,
-offline test harness, criterion benches), `lh-engine` (linear chain, lock-free
-param/bypass messages, telemetry), `lh-io` (generic `DuplexRunner` with injectable
-processor), `app/lion-heart` (CLI: `devices` / `run` / `latency` / `jam`).
-`lh-nam` and `lh-assets` land with M2.
+**M2 (the amp) — code landed.** All planned crates exist. On top of M1: `lh-dsp` gained
+`swap` (lock-free asset install/retire — the "garbage chute"), `cab` (partitioned FFT
+convolution via fft-convolver), and `limiter` (always-on output safety); `lh-nam` wraps
+nam-rs behind the `NamAsset` seam (loudness-normalized to −18 dB, rate-locked with an
+actionable mismatch error; FFI fallback to NeuralAmpModelerCore would replace the asset
+behind the same effect — ADR required); `lh-assets` loads IR WAVs (hound decode, offline
+windowed-sinc resample to engine rate, 0.5 s cap, energy normalization). `jam` chains
+gate → drive → amp → cab → delay → limiter with `load nam/ir`, `unload`, hot-swap
+mid-stream. The NAM test fixture in `crates/lh-nam/tests/fixtures/` is vendored from
+nam-rs/NAM Core (MIT — see its README).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
@@ -49,16 +53,16 @@ cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable
 
 CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu.
 
-## Workspace layout (`lh-nam`/`lh-assets` = planned, M2)
+## Workspace layout
 
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |
 | `lh-core`        | Param IDs & ranges, chain model, preset schema. No I/O, no threads | —             |
 | `lh-dsp`         | Effects (gate, drive, delay, …). Offline-testable, RT-safe        | `lh-core`     |
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
-| `lh-nam`         | `AmpModel` trait + `nam-rs` integration                           | core          |
-| `lh-io`          | cpal device management, stream config, latency measurement        | core          |
-| `lh-assets`      | Worker-side loading: `.nam`, IR wav, convolver construction       | core, nam     |
+| `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
+| `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |
+| `lh-assets`      | IR WAV loading: decode, sinc-resample, normalize, build convolver | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
 
 GUI code is never imported by `lh-*` crates — the engine must build and test without any UI.

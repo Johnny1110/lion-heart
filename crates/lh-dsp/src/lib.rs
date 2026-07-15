@@ -6,11 +6,14 @@
 //! (no allocation, no locks, no syscalls); `prepare` is the one place allowed
 //! to allocate.
 
+pub mod cab;
 pub mod delay;
 pub mod drive;
 pub mod gate;
+pub mod limiter;
 pub mod oversample;
 pub mod smooth;
+pub mod swap;
 pub mod testutil;
 
 use lh_core::EffectDesc;

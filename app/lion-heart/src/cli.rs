@@ -5,7 +5,7 @@ use lh_io::DEFAULT_SAMPLE_RATE;
 #[command(
     name = "lion-heart",
     version,
-    about = "Lion-Heart — guitar amp & effects processor (M1: first pedals)"
+    about = "Lion-Heart — guitar amp & effects processor (M2: the amp)"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -20,7 +20,7 @@ pub enum Command {
     Run(RunArgs),
     /// Measure round-trip latency over a physical loopback cable
     Latency(LatencyArgs),
-    /// Play through the pedalboard (gate → drive → delay) with a live REPL
+    /// Play through the pedalboard (gate → drive → amp → cab → delay) with a live REPL
     Jam(JamArgs),
 }
 

@@ -4,10 +4,11 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M1 — first pedals (pre-alpha).** A chain of hand-written DSP — noise gate →
-> drive (4× oversampled waveshaper) → delay — runs in real time under `lion-heart jam`,
-> with live click-free parameter control from a REPL and a zero-allocation audio thread
-> (enforced by `assert_no_alloc` in debug builds). M0's latency tooling included.
+> **Status: M2 — the amp (pre-alpha).** `lion-heart jam` now runs the full tone chain in
+> real time: gate → drive → **NAM amp** (`.nam` captures via nam-rs, loudness-normalized)
+> → **cab IR** (partitioned FFT convolution, auto-resampled) → delay → safety limiter.
+> Captures and IRs hot-swap mid-stream over lock-free rings; the audio thread stays
+> allocation-free (enforced by `assert_no_alloc` in debug builds).
 > The complete technical plan lives in the [white paper](docs/white-paper.md)
 > (Traditional Chinese / 繁體中文).
 
@@ -61,7 +62,7 @@ Milestones are **completion units, not dates** (this is a burst-driven side proj
 | --------- | ---------------- | --------------------------------------------------------------------------- |
 | M0 ✅     | First sound      | Duplex passthrough; measured round-trip latency report; xrun counter        |
 | M1 ✅     | First pedal      | Gate + drive (oversampled) + basic delay; glitch-free param changes; offline test harness |
-| M2        | The amp          | `.nam` loading + IR cab + gain staging + safety limiter — a record-worthy tone |
+| M2 ✅     | The amp          | `.nam` loading + IR cab + gain staging + safety limiter — a record-worthy tone |
 | M3        | Chain & memory   | Reorder/bypass chain; JSON presets; click-free preset switching             |
 | M4        | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
 | M5        | Full pedalboard  | Modulation family, reverb (FDN), compressor, EQ                             |
@@ -111,11 +112,12 @@ cargo run -p lion-heart -- devices
 # duplex passthrough: guitar in → guitar out (Ctrl-C to stop)
 cargo run -p lion-heart --release -- run --buffer 64
 
-# play through the pedalboard (gate → drive → delay) with a live control REPL
+# play through the pedalboard (gate → drive → amp → cab → delay → limiter)
 cargo run -p lion-heart --release -- jam --buffer 64
-#   > set drive.drive 24        # dB, smoothed — no clicks
-#   > set delay.time 500        # ms, tape-style pitch slew
-#   > off gate / on gate        # crossfaded bypass
+#   > load nam ~/captures/plexi.nam     # amp capture (48 kHz models)
+#   > load ir ~/irs/4x12-sm57.wav       # cab IR (any rate — auto-resampled)
+#   > set drive.drive 24                # dB, smoothed — no clicks
+#   > off gate / on gate                # crossfaded bypass
 
 # measure round-trip latency (needs a loopback cable: interface out → in)
 cargo run -p lion-heart --release -- latency --buffer 64 --markdown
