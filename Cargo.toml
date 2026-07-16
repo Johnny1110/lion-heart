@@ -27,6 +27,8 @@ assert_no_alloc = "1.1"
 nam-rs = "0.3"
 fft-convolver = "0.4"
 hound = "3.5"
+# gui (app crate only — never a dependency of lh-* engine crates)
+iced = { version = "0.14", features = ["canvas"] }
 # cli & errors
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"

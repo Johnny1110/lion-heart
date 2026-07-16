@@ -14,24 +14,30 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M4 (the face) — spike done, product UI next.** The white-paper §5.5 GUI spike is
-complete: the same screen (custom rotary knob on the live chain + realtime meters at
-60 fps) built in both iced 0.14 and vizia 0.4 under `spikes/` (a **separate cargo
-workspace**, excluded from the root so GUI deps never touch engine builds/CI).
-**Decision: iced** — see `docs/adr/001-gui-framework.md` (vizia lost on the skia-safe
-C++ dependency, deprecated-OpenGL macOS backend, and its 0.4 state-system rewrite).
-Pending user check on the Mac: run both spikes (`cd spikes && cargo run -p spike-iced
---release`), confirm 60 fps and feel; then the product UI gets built with iced in
-`app/lion-heart` (chain view, knobs, NAM/IR/preset browsers, meters, tuner). The
-engine↔UI pattern from the spike carries over: UI owns `ChainHandle`/asset handles,
-mutates in `update()`, polls `Telemetry` via `window::frames()`.
+**M4 (the face) — code landed.** `lion-heart` with **no subcommand opens the iced
+GUI** (framework decided by the spike in `spikes/` — see
+`docs/adr/001-gui-framework.md`; vizia lost on the skia-safe C++ dependency,
+deprecated-OpenGL macOS backend, and its 0.4 state rewrite). The GUI: chain strip
+(select / bypass / ◀▶ reorder, limiter pinned last), per-param canvas knobs, NAM/IR
+file browsers (last directory per kind persisted in `config.json`), preset browser
+(save / click-to-load), header peak meters, and a **tuner** — YIN pitch detection in
+`lh_dsp::tuner` (±2-cent tests at 44.1/48/96 kHz) fed by a raw-input rtrb tap
+installed via `Chain::set_input_tap` (lock-free chunk write, drop-on-full).
+`app/.../session.rs` owns chain build + stream startup + asset/preset/config logic,
+shared by the GUI and the jam REPL. Everything rides `window::frames()`: telemetry
+poll + meter ballistics per frame, asset GC every 12 frames, tuner estimate at
+~15 Hz. Audio startup failure renders an in-window error screen (device fixes
+included). The engine↔UI contract: the UI thread owns `ChainHandle`/asset handles,
+mutates only in `update()`, and never blocks the audio thread.
 
-M3 recap: runtime chain reorder rides a ~4 ms master fade through silence
-(`EngineMsg::SetOrder`); `lh-core::preset` is the versioned JSON schema; assets are
-referenced by **path + SHA-256** with same-name relocation
-(`lh_assets::{hash_file, resolve_asset}`); `jam` persists
-`~/.lion-heart/{config.json, presets/}` and auto-loads the last preset. The NAM test
-fixture in `crates/lh-nam/tests/fixtures/` is vendored from nam-rs/NAM Core (MIT).
+Pending user verification on the Mac: GUI holds 60 fps and xruns don't increase
+with the UI open (footer shows both), tuner sanity-check against a reference,
+RTL numbers into `docs/latency.md`, by-ear click tests.
+
+M3 recap: runtime chain reorder rides a ~4 ms master fade through silence; versioned
+JSON presets reference assets by **path + SHA-256** with same-name relocation;
+`~/.lion-heart/{config.json, presets/}` persists state; last preset auto-loads. The
+NAM fixture in `crates/lh-nam/tests/fixtures/` is vendored from nam-rs (MIT).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
@@ -53,6 +59,7 @@ cargo fmt --check                              # formatting gate
 cargo clippy --all-targets -- -D warnings      # lint gate
 cargo test                                     # all tests run offline, no device needed
 cargo bench -p lh-dsp --bench effects          # per-block DSP cost (criterion)
+cargo run -p lion-heart --release              # the GUI (no subcommand)
 cargo run -p lion-heart -- devices             # list devices
 cargo run -p lion-heart --release -- run       # passthrough (Ctrl-C to stop)
 cargo run -p lion-heart --release -- jam       # pedalboard + control REPL

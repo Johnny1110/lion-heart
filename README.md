@@ -4,12 +4,14 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M4 — the face (pre-alpha).** The full tone chain — gate → drive →
-> **NAM amp** → **cab IR** → delay → safety limiter — runs in real time, is
-> **reorderable on the fly**, and **saves/restores as JSON presets** with
-> content-hashed asset references. The GUI framework spike is done:
-> **iced beat vizia** ([ADR 001](docs/adr/001-gui-framework.md), spike code in
-> [`spikes/`](spikes/)); the first product UI is next. The audio thread stays
+> **Status: M4 — the face (pre-alpha).** Lion-Heart now opens as a **GUI**: chain
+> view with drag-free reorder & bypass, rotary knobs for every parameter, NAM/IR
+> file browsers, a preset browser, live peak meters, and a **built-in tuner**
+> (YIN pitch detection tapped losslessly off the input). The full tone chain —
+> gate → drive → **NAM amp** → **cab IR** → delay → safety limiter — runs in real
+> time and persists as JSON presets with content-hashed asset references. GUI
+> framework: **iced**, chosen over vizia by a spike
+> ([ADR 001](docs/adr/001-gui-framework.md)). The audio thread stays
 > allocation-free (enforced by `assert_no_alloc` in debug builds). Full technical
 > plan: [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
 
@@ -65,7 +67,7 @@ Milestones are **completion units, not dates** (this is a burst-driven side proj
 | M1 ✅     | First pedal      | Gate + drive (oversampled) + basic delay; glitch-free param changes; offline test harness |
 | M2 ✅     | The amp          | `.nam` loading + IR cab + gain staging + safety limiter — a record-worthy tone |
 | M3 ✅     | Chain & memory   | Reorder/bypass chain; JSON presets; click-free preset switching             |
-| M4        | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
+| M4 ✅     | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
 | M5        | Full pedalboard  | Modulation family, reverb (FDN), compressor, EQ                             |
 | M6        | On stage         | MIDI foot control; live view; 32-sample-buffer performance hardening        |
 | M7        | Plugin & release | CLAP/VST3 via nih-plug; codesign + notarization; CI releases; v0.1          |
@@ -101,12 +103,17 @@ docs/
 - [CLAUDE.md](CLAUDE.md) — engineering conventions, including the non-negotiable real-time audio rules
 - `docs/adr/` — architecture decision records (created as decisions happen)
 
-## Building & running (M0)
+## Building & running
 
 Requires stable Rust (macOS; Linux also builds, given `libasound2-dev` + `pkg-config`).
 
 ```sh
 cargo build --release
+
+# the GUI — chain view, knobs, browsers, presets, meters, tuner
+cargo run -p lion-heart --release
+#   picks system default devices; select explicitly with e.g.
+#   cargo run -p lion-heart --release -- --input scarlett --output scarlett --buffer 64
 
 # list audio devices and their capabilities
 cargo run -p lion-heart -- devices

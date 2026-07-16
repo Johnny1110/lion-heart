@@ -1,5 +1,7 @@
 mod cli;
 mod commands;
+mod gui;
+mod session;
 
 use anyhow::Result;
 use clap::Parser;
@@ -14,10 +16,12 @@ use cli::{Cli, Command};
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
-        Command::Devices => commands::devices::run(),
-        Command::Run(args) => commands::run::run(args),
-        Command::Latency(args) => commands::latency::run(args),
-        Command::Jam(args) => commands::jam::run(args),
+    let cli = Cli::parse();
+    match cli.command {
+        None => gui::run(cli.gui),
+        Some(Command::Devices) => commands::devices::run(),
+        Some(Command::Run(args)) => commands::run::run(args),
+        Some(Command::Latency(args)) => commands::latency::run(args),
+        Some(Command::Jam(args)) => commands::jam::run(args),
     }
 }

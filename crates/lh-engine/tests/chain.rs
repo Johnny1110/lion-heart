@@ -235,6 +235,36 @@ fn preset_snapshot_applies_back_identically() {
 }
 
 #[test]
+fn input_tap_sees_raw_input_and_never_blocks() {
+    let (mut chain, _handle) = build_chain(pedalboard());
+    chain.prepare(SR);
+
+    let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(4_096);
+    chain.set_input_tap(producer);
+
+    // The tap must carry the *input* even though the chain mutates the block.
+    let x = sine(SR, 220.0, 1_024);
+    let mut y = x.clone();
+    for block in y.chunks_mut(64) {
+        chain.process(block);
+    }
+    let tapped: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+    assert_eq!(tapped, x, "tap is the pre-processing input");
+
+    // Unread tap fills up: processing must go on, new samples are dropped.
+    let mut z = sine(SR, 220.0, 3 * 4_096);
+    chain.process(&mut z);
+    assert_finite("output with full tap", &z);
+    assert_eq!(consumer.slots(), 4_096, "ring capped, nothing blocked");
+
+    // A vanished consumer (tuner closed) must not disturb the audio path.
+    drop(consumer);
+    let mut w = sine(SR, 220.0, 512);
+    chain.process(&mut w);
+    assert_finite("output after consumer dropped", &w);
+}
+
+#[test]
 fn preset_apply_is_forward_compatible() {
     use lh_core::preset::SlotState;
     use std::collections::BTreeMap;

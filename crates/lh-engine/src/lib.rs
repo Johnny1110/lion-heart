@@ -101,6 +101,8 @@ pub struct Chain {
     rx: rtrb::Consumer<EngineMsg>,
     dry: Vec<f32>,
     telemetry: Arc<Telemetry>,
+    /// Optional raw-input copy for control-thread analyzers (tuner).
+    tap: Option<rtrb::Producer<f32>>,
 }
 
 impl Chain {
@@ -119,6 +121,12 @@ impl Chain {
         for slot in &mut self.slots {
             slot.effect.reset();
         }
+    }
+
+    /// Install a raw-input tap. Call before the chain moves to the audio
+    /// thread; the consumer side is drained by a control thread (tuner).
+    pub fn set_input_tap(&mut self, tap: rtrb::Producer<f32>) {
+        self.tap = Some(tap);
     }
 
     pub fn process(&mut self, block: &mut [f32]) {
@@ -156,6 +164,20 @@ impl Chain {
         self.telemetry
             .peak_in_bits
             .store(peak(block).to_bits(), Ordering::Relaxed);
+
+        // Copy the raw input into the analysis tap (tuner). Lock-free chunk
+        // write, drop-on-full: an unread tap must never stall the callback.
+        if let Some(tap) = &mut self.tap {
+            let n = block.len().min(tap.slots());
+            if n > 0
+                && let Ok(mut chunk) = tap.write_chunk(n)
+            {
+                let (a, b) = chunk.as_mut_slices();
+                a.copy_from_slice(&block[..a.len()]);
+                b.copy_from_slice(&block[a.len()..a.len() + b.len()]);
+                chunk.commit_all();
+            }
+        }
 
         for chunk in block.chunks_mut(MAX_BLOCK) {
             for i in 0..self.order.len() {
@@ -457,6 +479,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             rx,
             dry: Vec::new(),
             telemetry: Arc::clone(&telemetry),
+            tap: None,
         },
         ChainHandle {
             tx,

@@ -1,6 +1,6 @@
 [package]
 name = "lion-heart"
-description = "Lion-Heart — open-source guitar amp & multi-effects processor (M0: audio I/O foundation)"
+description = "Lion-Heart — open-source guitar amp & multi-effects processor"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,6 +13,8 @@ lh-engine.workspace = true
 lh-nam.workspace = true
 lh-assets.workspace = true
 lh-io.workspace = true
+rtrb.workspace = true
+iced.workspace = true
 assert_no_alloc.workspace = true
 clap.workspace = true
 anyhow.workspace = true

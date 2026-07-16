@@ -5,11 +5,15 @@ use lh_io::DEFAULT_SAMPLE_RATE;
 #[command(
     name = "lion-heart",
     version,
-    about = "Lion-Heart — guitar amp & effects processor (M3: chain & memory)"
+    about = "Lion-Heart — guitar amp & effects processor (M4: the face).\n\
+             With no subcommand, opens the GUI."
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+    /// GUI options (used when no subcommand is given)
+    #[command(flatten)]
+    pub gui: GuiArgs,
 }
 
 #[derive(Subcommand)]
@@ -22,6 +26,21 @@ pub enum Command {
     Latency(LatencyArgs),
     /// Play through the pedalboard (gate → drive → amp → cab → delay) with a live REPL
     Jam(JamArgs),
+}
+
+#[derive(Args)]
+pub struct GuiArgs {
+    #[command(flatten)]
+    pub io: IoArgs,
+    /// Preset to load on start (default: the last one used)
+    #[arg(long)]
+    pub preset: Option<String>,
+    /// Output gain in dB (applied with a 100 ms soft-start ramp)
+    #[arg(long, default_value_t = 0.0)]
+    pub gain_db: f32,
+    /// Ring prefill in blocks; more absorbs jitter, each adds one buffer of latency
+    #[arg(long, default_value_t = 1)]
+    pub prefill_blocks: u32,
 }
 
 #[derive(Args)]

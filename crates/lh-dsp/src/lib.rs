@@ -15,6 +15,7 @@ pub mod oversample;
 pub mod smooth;
 pub mod swap;
 pub mod testutil;
+pub mod tuner;
 
 use lh_core::EffectDesc;
 
