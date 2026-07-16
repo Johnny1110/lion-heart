@@ -1,0 +1,10 @@
+[package]
+name = "xtask"
+description = "cargo xtask — bundles the plugin into .clap/.vst3 packages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+nih_plug_xtask.workspace = true

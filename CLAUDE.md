@@ -14,24 +14,32 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M7 in progress — the stereo bus landed (part 1 of plugin & release).** The chain
-is now **stereo end to end**: `Effect::process(left, right)`, the duplex runner
-duplicates the mono input onto L/R and interleaves stereo out (even device
-channels L, odd R). Per-effect stereo semantics: gate/comp/limiter use **linked
-detectors** (one gain, image stays put); drive/EQ run **dual channel state**;
-**modulation is true stereo** (two voices, right LFO in quadrature — tremolo in
-opposite phase = auto-pan); **reverb takes two decorrelated ±1 Hadamard tap
-mixes** off the shared 8-line FDN; NAM **mono-sums** (a capture is a mono amp);
-cab runs two convolvers on the same IR. ADR 002 updated. Stereo width tests:
-mod decorrelation per voice, reverb channel-energy match + cross-correlation
-< 0.5, tremolo L+R steadiness (pan compensation).
+**M7 (plugin & release) — code landed.** Two parts:
 
-Still to come in M7: nih-plug CLAP/VST3 wrap, codesign/notarization scaffolding,
-CI release workflow, v0.1.
+1. **Stereo bus** — `Effect::process(left, right)` end to end; gate/comp/limiter
+   linked detectors, drive/EQ dual channel state, modulation true stereo
+   (quadrature LFO; tremolo auto-pans), reverb dual ±1 Hadamard tap mixes off
+   the shared FDN, NAM mono-sums, cab dual convolvers; duplex runner duplicates
+   the mono input to L/R and interleaves out (even device channels L, odd R).
+   ADR 002 marked implemented.
+2. **Plugin** — `plugin/lion-heart-plugin` wraps the same chain via nih-plug
+   (git dep, **pinned rev** in the workspace `Cargo.toml`): manual
+   `unsafe impl Params` built from the effect descriptors (every param + per-slot
+   bypass host-automatable, real units, stepped params show labels), a
+   **Preset (assets)** IntParam loads NAM/IR from `~/.lion-heart/presets/` on
+   nih-plug's background thread through the same `AssetHandle` hot-swap seam.
+   Chain order fixed in the plugin (no editor yet). **Passes clap-validator
+   (16/16 applicable)**. `cargo xtask bundle lion-heart-plugin --release` makes
+   `target/bundled/Lion-Heart.{clap,vst3}`; VST3 builds are GPLv3 (crate license
+   differs from the workspace on purpose). Release pipeline:
+   `.github/workflows/release.yml` (tag `v*` → macOS build → draft release),
+   `scripts/codesign-notarize.sh` gated on Apple secrets — see `docs/release.md`.
 
-M6 recap: `lh-midi` foot control (PC→preset, CC→param/bypass via
-`~/.lion-heart/midi.json`, zero-config first port + sorted-preset PC), GUI live
-view, 32-frame headroom verified.
+Pending user verification on the Mac: stereo width by ear (chorus/reverb/
+tremolo), plugin in a real host (Reaper/Bitwig/Live: insert, pick a preset,
+automate knobs), foot controller end-to-end, `--buffer 32` on hardware, RTL
+numbers into `docs/latency.md`. **v0.1 tagging is the user's call** after that
+verification (`git tag v0.1.0 && git push origin v0.1.0` drafts the release).
 
 - `lh-midi` (new crate): PC/CC parsing and a JSON mapping
   (`~/.lion-heart/midi.json`: `input` port, `channel` filter, `pc_presets` names,
@@ -85,6 +93,10 @@ cargo run -p lion-heart --release -- jam       # pedalboard + control REPL
 cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable)
 ```
 
+Plugin bundling: `cargo xtask bundle lion-heart-plugin --release` →
+`target/bundled/Lion-Heart.{clap,vst3}`; conformance:
+`clap-validator validate target/bundled/Lion-Heart.clap`.
+
 The GUI spike workspace has its own gates (run from `spikes/`):
 `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 
@@ -103,6 +115,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | `lh-midi`        | MIDI foot control: PC/CC parsing, mapping, midir input            | —             |
 | `lh-assets`      | IR WAV loading: decode, sinc-resample, normalize, build convolver | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
+| `plugin/…`       | CLAP/VST3 wrapper via nih-plug (GPLv3 for VST3 builds)            | core→assets   |
 
 GUI code is never imported by `lh-*` crates — the engine must build and test without any UI.
 

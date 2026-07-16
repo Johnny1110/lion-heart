@@ -1,0 +1,20 @@
+[package]
+name = "lion-heart-plugin"
+description = "Lion-Heart guitar amp & multi-effects as a CLAP/VST3 plugin"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+# The VST3 export path (vst3-sys) is GPLv3; distributing VST3 builds makes
+# the plugin binary GPLv3 (README §License). CLAP alone would be MIT/Apache.
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug.workspace = true
+lh-core.workspace = true
+lh-dsp.workspace = true
+lh-engine.workspace = true
+lh-nam.workspace = true
+lh-assets.workspace = true

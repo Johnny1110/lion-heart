@@ -1,0 +1,55 @@
+name: release
+
+# Pushing a tag like `v0.1.0` builds the macOS standalone binary and the
+# CLAP/VST3 bundles, then attaches them to a GitHub Release (as a draft, so
+# a human presses the final button).
+#
+# Codesigning/notarization runs only when the Apple credentials exist as
+# repository secrets — see docs/release.md. Unsigned artifacts still work
+# via `xattr -dr com.apple.quarantine` (documented in the release notes).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build standalone (release)
+        run: cargo build --release -p lion-heart
+
+      - name: Bundle plugin (CLAP + VST3)
+        run: cargo xtask bundle lion-heart-plugin --release
+
+      - name: Codesign & notarize (when credentials exist)
+        if: ${{ env.APPLE_ID != '' }}
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: ./scripts/codesign-notarize.sh
+
+      - name: Package artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          tar -C target/release -czf "dist/lion-heart-${VERSION}-macos.tar.gz" lion-heart
+          tar -C target/bundled -czf "dist/lion-heart-plugins-${VERSION}-macos.tar.gz" .
+
+      - name: Draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --draft \
+            --title "Lion-Heart ${GITHUB_REF_NAME}" \
+            --notes "Standalone app + CLAP/VST3 bundles (macOS). Unsigned builds: run \`xattr -dr com.apple.quarantine <file>\` after unpacking. VST3 bundles are GPLv3 (see README §License)."

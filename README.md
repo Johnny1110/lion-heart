@@ -4,16 +4,18 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M7 in progress — the bus went stereo.** The full rig — gate →
+> **Status: M7 — plugin & release (pre-alpha).** The full rig — gate →
 > compressor → drive → **NAM amp** → EQ → modulation → delay → **reverb
 > (FDN)** → **cab IR** → safety limiter — now runs a **stereo bus end to
 > end**: chorus/flanger/phaser spread wide (quadrature LFOs), tremolo
 > auto-pans, the reverb tail decorrelates left from right
 > ([ADR 002](docs/adr/002-mono-chain-through-m5.md)), while dynamics stay
-> image-stable via linked detectors. **MIDI foot control** (PC → presets,
-> CC → any knob or bypass), a **live view**, tuner, meters and the full GUI
-> (iced, [ADR 001](docs/adr/001-gui-framework.md)) ride on top. Next up in
-> M7: CLAP/VST3 plugin builds and v0.1. The audio thread stays
+> image-stable via linked detectors. The rig now also builds as a
+> **CLAP/VST3 plugin** (nih-plug, passes the clap-validator conformance
+> suite) with every knob host-automatable, next to the standalone GUI with
+> **MIDI foot control**, live view, tuner and meters. A tagged `v*` push
+> drafts a GitHub release with signed/notarized artifacts when Apple
+> credentials are configured ([docs/release.md](docs/release.md)). The audio thread stays
 > allocation-free (enforced by `assert_no_alloc` in debug builds). Full
 > technical plan: [white paper](docs/white-paper.md) (Traditional Chinese /
 > 繁體中文).
@@ -33,7 +35,7 @@ Plug your guitar into an audio interface, shape your tone in software — noise 
 - **Chain** — reorderable signal chain, per-slot bypass, glitch-free preset switching
 - **Presets** — versioned JSON, referencing NAM/IR assets by path + content hash
 - **MIDI foot control** — program change → presets, CC → any param / bypass, expression pedals
-- **Later** — CLAP + VST3 plugin builds
+- **Plugin builds** — CLAP + VST3 via nih-plug (`cargo xtask bundle lion-heart-plugin --release`)
 
 ## Signal path
 
@@ -58,8 +60,8 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 | NAM inference         | [nam-rs](https://lib.rs/crates/nam-rs)                        | pure-Rust, RT-safe; fallback: FFI to NeuralAmpModelerCore (C++) |
 | IR convolution        | [fft-convolver](https://github.com/neodsp/fft-convolver)      | uniform-partitioned FFT, zero latency, RT-safe                  |
 | GUI                   | [iced](https://iced.rs)                                       | chosen over vizia by the M4 spike ([ADR 001](docs/adr/001-gui-framework.md)); `egui` allowed for internal dev tools |
-| Plugin export (later) | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (note: VST3 builds are GPLv3)                       |
-| MIDI (later)          | midir / coremidi                                              | foot controller: program change, CC, expression                 |
+| Plugin export         | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (note: VST3 builds are GPLv3)                       |
+| MIDI                  | midir (CoreMIDI backend)                                      | foot controller: program change, CC, expression                 |
 
 ## Roadmap
 
@@ -74,7 +76,7 @@ Milestones are **completion units, not dates** (this is a burst-driven side proj
 | M4 ✅     | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
 | M5 ✅     | Full pedalboard  | Modulation family, reverb (FDN), compressor, EQ                             |
 | M6 ✅     | On stage         | MIDI foot control; live view; 32-sample-buffer performance hardening        |
-| M7        | Plugin & release | CLAP/VST3 via nih-plug; codesign + notarization; CI releases; v0.1          |
+| M7 ✅     | Plugin & release | CLAP/VST3 via nih-plug; codesign + notarization; CI releases; v0.1          |
 | M8+       | Deep water       | WDF circuit modeling research, convolution reverb, Windows/Linux ports      |
 
 ## Non-goals (for now)
@@ -96,6 +98,8 @@ crates/
   lh-assets    # worker-side loading: .nam, IR wav, convolver building
 app/
   lion-heart   # the standalone GUI application
+plugin/
+  lion-heart-plugin  # CLAP/VST3 wrapper (nih-plug); VST3 builds are GPLv3
 spikes/        # M4 GUI framework spike (separate workspace, excluded from CI)
 docs/
   white-paper.md   # the plan (zh-TW) — authoritative

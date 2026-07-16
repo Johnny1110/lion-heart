@@ -9,6 +9,8 @@ members = [
     "crates/lh-io",
     "crates/lh-midi",
     "app/lion-heart",
+    "plugin/lion-heart-plugin",
+    "xtask",
 ]
 # The M4 GUI spike is its own workspace: its heavy GUI dependency trees
 # (wgpu, skia) must never leak into the engine build or CI gates.
@@ -31,6 +33,9 @@ fft-convolver = "0.4"
 hound = "3.5"
 # gui (app crate only — never a dependency of lh-* engine crates)
 iced = { version = "0.14", features = ["canvas"] }
+# plugin wrapper (plugin crate only) — pinned rev; VST3 export is GPLv3
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7", features = ["assert_process_allocs"] }
+nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7" }
 # cli & errors
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
