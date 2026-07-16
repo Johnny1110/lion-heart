@@ -235,9 +235,26 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     println!("usage: set <slot>.<param> <value>");
                     return true;
                 };
-                let Ok(v) = value.parse::<f32>() else {
-                    println!("  not a number: {value}");
-                    return true;
+                // Numbers first; otherwise stepped params accept their
+                // labels, e.g. `set mod.type flanger`.
+                let v = match value.parse::<f32>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        let by_label = session
+                            .chain
+                            .descriptors()
+                            .iter()
+                            .find(|d| d.key == slot)
+                            .and_then(|d| d.params.iter().find(|p| p.key == param))
+                            .and_then(|p| p.range.index_of_label(value));
+                        match by_label {
+                            Some(v) => v,
+                            None => {
+                                println!("  not a number or option: {value}");
+                                return true;
+                            }
+                        }
+                    }
                 };
                 match session.chain.set_param(slot, param, v) {
                     Ok(applied) => {

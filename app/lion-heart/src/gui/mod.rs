@@ -39,7 +39,7 @@ pub fn run(args: GuiArgs) -> anyhow::Result<()> {
         .subscription(App::subscription)
         .theme(App::theme)
         .antialiasing(true)
-        .window_size(Size::new(860.0, 580.0))
+        .window_size(Size::new(960.0, 580.0))
         .title("Lion-Heart")
         .run()?;
     Ok(())
@@ -250,7 +250,11 @@ impl Running {
                                 key: p.key,
                                 name: p.name,
                                 norm: p.range.to_norm(real),
-                                display: format_value(real, p.unit),
+                                display: p
+                                    .range
+                                    .label(real)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format_value(real, p.unit)),
                             }
                         })
                         .collect(),

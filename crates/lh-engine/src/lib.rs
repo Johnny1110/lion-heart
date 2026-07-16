@@ -24,7 +24,7 @@ use thiserror::Error;
 /// bigger blocks; `Chain::process` slices them down to this.
 pub const MAX_BLOCK: usize = 1024;
 /// Upper bound on chain length (fits the order message on the ring).
-pub const MAX_SLOTS: usize = 8;
+pub const MAX_SLOTS: usize = 12;
 const MSG_CAPACITY: usize = 256;
 /// Bypass toggles crossfade over this window instead of hard-switching.
 const BYPASS_FADE_MS: f32 = 10.0;
@@ -415,7 +415,9 @@ impl ChainHandle {
                     .enumerate()
                     .map(|(j, p)| {
                         let real = p.range.to_real(self.norms[i][j]);
-                        if p.unit.is_empty() {
+                        if let Some(label) = p.range.label(real) {
+                            format!("{} {}", p.key, label)
+                        } else if p.unit.is_empty() {
                             format!("{} {:.2}", p.key, real)
                         } else {
                             format!("{} {:.1} {}", p.key, real, p.unit)

@@ -6,12 +6,17 @@
 //! (no allocation, no locks, no syscalls); `prepare` is the one place allowed
 //! to allocate.
 
+pub mod biquad;
 pub mod cab;
+pub mod comp;
 pub mod delay;
 pub mod drive;
+pub mod eq;
 pub mod gate;
 pub mod limiter;
+pub mod modulation;
 pub mod oversample;
+pub mod reverb;
 pub mod smooth;
 pub mod swap;
 pub mod testutil;

@@ -41,23 +41,34 @@ pub enum Range {
         min: f32,
         max: f32,
     },
+    /// Discrete choices; real values are the indices `0..labels.len()`.
+    /// Presets store the index, UIs display the label.
+    Stepped {
+        labels: &'static [&'static str],
+    },
 }
 
 impl Range {
     pub fn min(&self) -> f32 {
         match *self {
             Range::Linear { min, .. } | Range::Log { min, .. } => min,
+            Range::Stepped { .. } => 0.0,
         }
     }
 
     pub fn max(&self) -> f32 {
         match *self {
             Range::Linear { max, .. } | Range::Log { max, .. } => max,
+            Range::Stepped { labels } => (labels.len().max(1) - 1) as f32,
         }
     }
 
     pub fn clamp(&self, real: f32) -> f32 {
-        real.clamp(self.min(), self.max())
+        let clamped = real.clamp(self.min(), self.max());
+        match *self {
+            Range::Stepped { .. } => clamped.round(),
+            _ => clamped,
+        }
     }
 
     pub fn to_real(&self, normalized: f32) -> f32 {
@@ -65,6 +76,7 @@ impl Range {
         match *self {
             Range::Linear { min, max } => min + (max - min) * n,
             Range::Log { min, max } => min * (max / min).powf(n),
+            Range::Stepped { .. } => (self.max() * n).round(),
         }
     }
 
@@ -73,8 +85,34 @@ impl Range {
         let n = match *self {
             Range::Linear { min, max } => (r - min) / (max - min),
             Range::Log { min, max } => (r / min).ln() / (max / min).ln(),
+            Range::Stepped { .. } => {
+                if self.max() > 0.0 {
+                    r / self.max()
+                } else {
+                    0.0
+                }
+            }
         };
         n.clamp(0.0, 1.0)
+    }
+
+    /// The label for a real value of a stepped range, `None` otherwise.
+    pub fn label(&self, real: f32) -> Option<&'static str> {
+        match *self {
+            Range::Stepped { labels } => labels.get(self.clamp(real) as usize).copied(),
+            _ => None,
+        }
+    }
+
+    /// The index of a label in a stepped range (case-insensitive).
+    pub fn index_of_label(&self, label: &str) -> Option<f32> {
+        match *self {
+            Range::Stepped { labels } => labels
+                .iter()
+                .position(|l| l.eq_ignore_ascii_case(label))
+                .map(|i| i as f32),
+            _ => None,
+        }
     }
 }
 
@@ -150,5 +188,30 @@ mod tests {
         assert!((r.to_real(0.5) - 1_000.0).abs() < 1.0);
         assert!((r.to_norm(1_000.0) - 0.5).abs() < 1e-4);
         assert!((r.to_norm(r.to_real(0.3)) - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn stepped_range_quantizes_and_labels() {
+        let r = Range::Stepped {
+            labels: &["chorus", "flanger", "phaser", "tremolo"],
+        };
+        assert_eq!(r.max(), 3.0);
+        // Quantization: real values snap to whole indices.
+        assert_eq!(r.clamp(1.4), 1.0);
+        assert_eq!(r.clamp(1.6), 2.0);
+        assert_eq!(r.clamp(9.0), 3.0);
+        // Normalized round-trips hit exact steps.
+        for i in 0..4 {
+            let norm = r.to_norm(i as f32);
+            assert_eq!(r.to_real(norm), i as f32);
+        }
+        assert_eq!(r.label(2.0), Some("phaser"));
+        assert_eq!(r.label(2.4), Some("phaser"));
+        assert_eq!(r.index_of_label("FLANGER"), Some(1.0));
+        assert_eq!(r.index_of_label("wah"), None);
+        // Non-stepped ranges have no labels.
+        let lin = Range::Linear { min: 0.0, max: 1.0 };
+        assert_eq!(lin.label(0.5), None);
+        assert_eq!(lin.index_of_label("x"), None);
     }
 }

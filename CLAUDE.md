@@ -14,30 +14,32 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M4 (the face) — code landed.** `lion-heart` with **no subcommand opens the iced
-GUI** (framework decided by the spike in `spikes/` — see
-`docs/adr/001-gui-framework.md`; vizia lost on the skia-safe C++ dependency,
-deprecated-OpenGL macOS backend, and its 0.4 state rewrite). The GUI: chain strip
-(select / bypass / ◀▶ reorder, limiter pinned last), per-param canvas knobs, NAM/IR
-file browsers (last directory per kind persisted in `config.json`), preset browser
-(save / click-to-load), header peak meters, and a **tuner** — YIN pitch detection in
-`lh_dsp::tuner` (±2-cent tests at 44.1/48/96 kHz) fed by a raw-input rtrb tap
-installed via `Chain::set_input_tap` (lock-free chunk write, drop-on-full).
-`app/.../session.rs` owns chain build + stream startup + asset/preset/config logic,
-shared by the GUI and the jam REPL. Everything rides `window::frames()`: telemetry
-poll + meter ballistics per frame, asset GC every 12 frames, tuner estimate at
-~15 Hz. Audio startup failure renders an in-window error screen (device fixes
-included). The engine↔UI contract: the UI thread owns `ChainHandle`/asset handles,
-mutates only in `update()`, and never blocks the audio thread.
+**M5 (full pedalboard) — code landed.** The chain is now ten slots:
+**gate → comp → drive → amp → eq → mod → delay → reverb → cab → limiter**
+(`MAX_SLOTS` raised to 12). New hand-written DSP in `lh-dsp`:
 
-Pending user verification on the Mac: GUI holds 60 fps and xruns don't increase
-with the UI open (footer shows both), tuner sanity-check against a reference,
-RTL numbers into `docs/latency.md`, by-ear click tests.
+- `comp` — feed-forward peak compressor (threshold/ratio/attack/release/makeup),
+  static-curve verified against the ratio math.
+- `eq` — low shelf 120 Hz / sweepable mid peak / high shelf 3.2 kHz on shared RBJ
+  `biquad` sections; smoothed params, coefficients rebuilt once per block.
+- `mod` — one pedal, four voices via the new **`Range::Stepped { labels }`** param
+  (chorus / flanger / phaser / tremolo): swept delay line, 4-stage swept allpass,
+  amplitude LFO. `set mod.type flanger` works by label in the REPL; UIs show labels.
+- `reverb` — 8-line FDN, Householder feedback (O(N)), per-line damping, T60-exact
+  decay gains, predelay + 2 diffusion allpasses. **Mono for now — ADR 002** records
+  the stereo deferral (target: with/after M6, before the M7 plugin bus).
 
-M3 recap: runtime chain reorder rides a ~4 ms master fade through silence; versioned
-JSON presets reference assets by **path + SHA-256** with same-name relocation;
-`~/.lion-heart/{config.json, presets/}` persists state; last preset auto-loads. The
-NAM fixture in `crates/lh-nam/tests/fixtures/` is vendored from nam-rs (MIT).
+Old 6-slot presets load forward-compatibly; unmentioned slots default and the
+session moves the limiter back to the end (it must always run last).
+
+M4 recap: no subcommand opens the iced GUI (ADR 001) — chain strip, canvas knobs,
+NAM/IR/preset browsers, header meters, YIN tuner (`lh_dsp::tuner`) fed via
+`Chain::set_input_tap`; `app/.../session.rs` is shared by GUI and jam REPL; UI
+rides `window::frames()` and never blocks the audio thread.
+
+Pending user verification on the Mac: play through all new pedals by ear (sweep
+params, switch mod types, preset A/B), GUI 60 fps + stable xruns, tuner
+sanity-check, RTL numbers into `docs/latency.md`.
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat

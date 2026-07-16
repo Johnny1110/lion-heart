@@ -11,10 +11,14 @@ use std::path::{Path, PathBuf};
 use lh_core::preset::{AssetRef, PRESET_SCHEMA_VERSION, Preset, PresetAssets};
 use lh_dsp::Effect;
 use lh_dsp::cab::{CabIr, IrAsset};
+use lh_dsp::comp::Compressor;
 use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
+use lh_dsp::eq::Eq;
 use lh_dsp::gate::NoiseGate;
 use lh_dsp::limiter::Limiter;
+use lh_dsp::modulation::Modulation;
+use lh_dsp::reverb::Reverb;
 use lh_dsp::swap::AssetHandle;
 use lh_engine::{ChainHandle, build_chain};
 use lh_io::passthrough::{DuplexRunner, RunnerOpts};
@@ -62,16 +66,22 @@ pub struct Session {
 }
 
 impl Session {
-    /// Build gate → drive → amp → cab → delay → limiter and start the stream.
+    /// Build the full pedalboard —
+    /// gate → comp → drive → amp → eq → mod → delay → reverb → cab → limiter
+    /// — and start the stream.
     pub fn start(opts: &SessionOpts) -> Result<Self, lh_io::IoError> {
         let (nam_amp, nam_handle) = NamAmp::new();
         let (cab, cab_handle) = CabIr::new();
         let effects: Vec<Box<dyn Effect>> = vec![
             Box::new(NoiseGate::new()),
+            Box::new(Compressor::new()),
             Box::new(Drive::new()),
             Box::new(nam_amp),
-            Box::new(cab),
+            Box::new(Eq::new()),
+            Box::new(Modulation::new()),
             Box::new(Delay::new()),
+            Box::new(Reverb::new()),
+            Box::new(cab),
             Box::new(Limiter::new()),
         ];
         let (mut chain, chain_handle) = build_chain(effects);
@@ -264,6 +274,23 @@ impl Session {
             .apply_preset_chain(&preset.chain)
             .map_err(|e| e.to_string())?;
         lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+
+        // Presets from older chains don't mention newer slots, which the
+        // forward-compat rule appends at the end — after the limiter. The
+        // limiter is the safety net and always runs last.
+        let keys = self.chain.order_keys();
+        if keys.contains(&"limiter") && keys.last() != Some(&"limiter") {
+            let reordered: Vec<&str> = keys
+                .iter()
+                .copied()
+                .filter(|k| *k != "limiter")
+                .chain(std::iter::once("limiter"))
+                .collect();
+            self.chain
+                .set_order(&reordered)
+                .map_err(|e| e.to_string())?;
+            lines.push("limiter moved back to the end of the chain".into());
+        }
 
         self.apply_asset(preset.assets.nam.as_ref(), &dir, AssetKind::Nam, &mut lines);
         self.apply_asset(preset.assets.ir.as_ref(), &dir, AssetKind::Ir, &mut lines);

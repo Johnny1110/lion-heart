@@ -5,9 +5,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use lh_dsp::Effect;
+use lh_dsp::comp::Compressor;
 use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
+use lh_dsp::eq::Eq;
 use lh_dsp::gate::NoiseGate;
+use lh_dsp::modulation::{Modulation, TYPES};
+use lh_dsp::reverb::Reverb;
 
 const SR: u32 = 48_000;
 const BLOCK: usize = 64;
@@ -65,6 +69,45 @@ fn bench_effects(c: &mut Criterion) {
         b.iter(|| {
             buf.copy_from_slice(&signal());
             cab.process(black_box(&mut buf));
+        })
+    });
+
+    let mut comp = Compressor::new();
+    comp.prepare(SR);
+    group.bench_function("comp", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            comp.process(black_box(&mut buf));
+        })
+    });
+
+    let mut eq = Eq::new();
+    eq.prepare(SR);
+    group.bench_function("eq_3band", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            eq.process(black_box(&mut buf));
+        })
+    });
+
+    for (index, name) in TYPES.iter().enumerate() {
+        let mut modulation = Modulation::new();
+        modulation.prepare(SR);
+        modulation.set_param(0, index as f32 / (TYPES.len() - 1) as f32);
+        group.bench_function(format!("mod_{name}"), |b| {
+            b.iter(|| {
+                buf.copy_from_slice(&signal());
+                modulation.process(black_box(&mut buf));
+            })
+        });
+    }
+
+    let mut reverb = Reverb::new();
+    reverb.prepare(SR);
+    group.bench_function("reverb_fdn8", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            reverb.process(black_box(&mut buf));
         })
     });
 
