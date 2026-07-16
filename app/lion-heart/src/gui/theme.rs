@@ -1,7 +1,8 @@
 //! Palette and widget styles — dark amp-faceplate look, one amber accent.
 
-use iced::widget::{button, container, text_input};
-use iced::{Background, Border, Color, Theme};
+use iced::overlay::menu;
+use iced::widget::{button, container, pick_list, text_input};
+use iced::{Background, Border, Color, Shadow, Theme};
 
 pub const BG: Color = Color::from_rgb(0.075, 0.075, 0.095);
 pub const PANEL: Color = Color::from_rgb(0.115, 0.115, 0.145);
@@ -81,6 +82,28 @@ pub fn action(_: &Theme, status: button::Status) -> button::Style {
     let disabled = matches!(status, button::Status::Disabled);
     let fg = if disabled { TRACK } else { TEXT_BRIGHT };
     button_style(PANEL_HI, fg, TRACK, hovered)
+}
+
+pub fn pick(_: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let lit = !matches!(status, pick_list::Status::Active);
+    pick_list::Style {
+        text_color: TEXT_BRIGHT,
+        placeholder_color: TEXT_DIM,
+        handle_color: if lit { ACCENT } else { TEXT_DIM },
+        background: Background::Color(PANEL_HI),
+        border: rounded(if lit { ACCENT } else { TRACK }, 1.0),
+    }
+}
+
+pub fn menu(_: &Theme) -> menu::Style {
+    menu::Style {
+        background: Background::Color(PANEL_HI),
+        border: rounded(TRACK, 1.0),
+        text_color: TEXT_BRIGHT,
+        selected_text_color: ACCENT,
+        selected_background: Background::Color(PANEL),
+        shadow: Shadow::default(),
+    }
 }
 
 pub fn input(_: &Theme, _status: text_input::Status) -> text_input::Style {

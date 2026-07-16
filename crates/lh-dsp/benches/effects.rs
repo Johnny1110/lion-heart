@@ -43,9 +43,18 @@ fn bench_effects(c: &mut Criterion) {
     gate.prepare(SR);
     bench_stereo!(group, "gate", gate, buf, buf_r);
 
-    let mut drive = Drive::new();
-    drive.prepare(SR);
-    bench_stereo!(group, "drive_4x_oversampled", drive, buf, buf_r);
+    for (index, def) in lh_dsp::drive::MODELS.iter().enumerate() {
+        let mut drive = Drive::new();
+        drive.prepare(SR);
+        drive.set_param(0, index as f32 / (lh_dsp::drive::MODEL_COUNT - 1) as f32);
+        bench_stereo!(
+            group,
+            format!("drive_{}_4x_oversampled", def.label.replace(' ', "_")),
+            drive,
+            buf,
+            buf_r
+        );
+    }
 
     let mut delay = Delay::new();
     delay.prepare(SR);

@@ -57,17 +57,27 @@ pub struct IoArgs {
     /// Sample rate in Hz (0 = follow the input device's default rate)
     #[arg(long, default_value_t = DEFAULT_SAMPLE_RATE)]
     pub sample_rate: u32,
-    /// Requested buffer size in frames (0 = device default)
-    #[arg(long, default_value_t = 64)]
-    pub buffer: u32,
-    /// Input channel to tap, 1-based
-    #[arg(long, default_value_t = 1)]
-    pub in_channel: u16,
+    /// Requested buffer size in frames (default 64; 0 = device default)
+    #[arg(long)]
+    pub buffer: Option<u32>,
+    /// Input channel to tap, 1-based (default 1)
+    #[arg(long)]
+    pub in_channel: Option<u16>,
 }
 
 impl IoArgs {
+    /// Requested buffer for the stream layer: absent flag = the app default
+    /// of 64 frames, explicit 0 = device default (`None`).
     pub fn buffer_opt(&self) -> Option<u32> {
-        (self.buffer > 0).then_some(self.buffer)
+        match self.buffer {
+            None => Some(64),
+            Some(0) => None,
+            Some(n) => Some(n),
+        }
+    }
+
+    pub fn in_channel(&self) -> u16 {
+        self.in_channel.unwrap_or(1)
     }
 }
 
@@ -105,6 +115,28 @@ pub struct JamArgs {
     /// Ring prefill in blocks; more absorbs jitter, each adds one buffer of latency
     #[arg(long, default_value_t = 1)]
     pub prefill_blocks: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_flag_semantics_are_unchanged() {
+        let io = |buffer| IoArgs {
+            input: None,
+            output: None,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            buffer,
+            in_channel: None,
+        };
+        // Absent flag keeps the historical default of 64 frames.
+        assert_eq!(io(None).buffer_opt(), Some(64));
+        // Explicit 0 still means "device default".
+        assert_eq!(io(Some(0)).buffer_opt(), None);
+        assert_eq!(io(Some(128)).buffer_opt(), Some(128));
+        assert_eq!(io(None).in_channel(), 1);
+    }
 }
 
 #[derive(Args)]

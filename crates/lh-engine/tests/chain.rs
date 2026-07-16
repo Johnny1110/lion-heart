@@ -60,11 +60,11 @@ fn params_travel_through_the_queue() {
     };
 
     let applied = handle.set_param("drive", "drive", 0.0).unwrap();
-    assert_eq!(applied.unit, "dB");
+    assert_eq!(applied.unit, "");
     let quiet = render(&mut chain);
 
-    handle.set_param("drive", "drive", 40.0).unwrap();
-    handle.set_param("drive", "level", 6.0).unwrap();
+    handle.set_param("drive", "drive", 10.0).unwrap();
+    handle.set_param("drive", "level", 10.0).unwrap();
     let loud = render(&mut chain);
     assert!(
         loud > quiet * 1.2,
@@ -226,14 +226,16 @@ fn bad_orders_are_rejected() {
 fn preset_snapshot_applies_back_identically() {
     let (mut chain, mut handle) = build_chain(pedalboard());
     chain.prepare(SR);
-    handle.set_param("drive", "drive", 24.0).unwrap();
+    handle.set_param("drive", "drive", 7.5).unwrap();
+    handle.set_param("drive", "model", 1.0).unwrap();
     handle.set_param("delay", "time", 500.0).unwrap();
     handle.set_active("gate", false).unwrap();
     handle.set_order(&["drive", "gate", "delay"]).unwrap();
 
     let saved = handle.snapshot_chain();
     assert_eq!(saved[0].key, "drive");
-    assert_eq!(saved[0].params["drive"], 24.0);
+    assert_eq!(saved[0].params["drive"], 7.5);
+    assert_eq!(saved[0].params["model"], 1.0);
     assert!(!saved[1].active);
 
     // A fresh chain of the same pedals, restored from the snapshot.
@@ -291,7 +293,7 @@ fn preset_apply_is_forward_compatible() {
         SlotState {
             key: "drive".into(),
             active: true,
-            params: BTreeMap::from([("drive".into(), 30.0), ("sparkle".into(), 1.0)]),
+            params: BTreeMap::from([("drive".into(), 8.0), ("sparkle".into(), 1.0)]),
         },
         SlotState {
             key: "wah".into(),
@@ -309,7 +311,7 @@ fn preset_apply_is_forward_compatible() {
 
     let now = handle.snapshot_chain();
     assert_eq!(now[0].key, "drive");
-    assert_eq!(now[0].params["drive"], 30.0);
+    assert_eq!(now[0].params["drive"], 8.0);
     assert_eq!(now[1].key, "gate");
     assert_eq!(now[2].key, "delay", "unmentioned slot kept at the end");
 }

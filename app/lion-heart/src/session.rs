@@ -38,8 +38,20 @@ pub struct AppConfig {
     pub nam_dir: Option<String>,
     #[serde(default)]
     pub ir_dir: Option<String>,
+    /// Audio I/O applied from the GUI settings panel; used when the matching
+    /// CLI flag is absent. `buffer` stores the requested frames, 0 = device
+    /// default; absent fields fall back to the app defaults.
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub buffer: Option<u32>,
+    #[serde(default)]
+    pub in_channel: Option<u16>,
 }
 
+#[derive(Clone)]
 pub struct SessionOpts {
     pub input: Option<String>,
     pub output: Option<String>,
@@ -53,6 +65,14 @@ pub struct SessionOpts {
     /// MIDI input port override (name substring or index); `None` follows
     /// `midi.json` / first available port.
     pub midi_port: Option<String>,
+}
+
+/// Chain and asset state that survives an audio-engine restart
+/// ([`Session::carry_over`] → [`Session::resume`]).
+pub struct CarryOver {
+    chain: Vec<lh_core::preset::SlotState>,
+    nam: Option<AssetRef>,
+    ir: Option<AssetRef>,
 }
 
 /// A live MIDI input: the connection, its event stream, and the mapping.
@@ -138,8 +158,46 @@ impl Session {
         })
     }
 
+    /// Snapshot everything that must survive a stream restart (device or
+    /// buffer change): chain state and the loaded asset references.
+    pub fn carry_over(&self) -> CarryOver {
+        CarryOver {
+            chain: self.chain.snapshot_chain(),
+            nam: self.nam_ref.clone(),
+            ir: self.ir_ref.clone(),
+        }
+    }
+
+    /// Start a fresh session with `opts` and restore a [`CarryOver`] onto it.
+    /// The previous session must already be dropped — two sessions would race
+    /// for the same devices. Returns the restore messages (warnings, asset
+    /// loads) alongside the session.
+    pub fn resume(
+        opts: &SessionOpts,
+        carry: &CarryOver,
+    ) -> Result<(Self, Vec<String>), lh_io::IoError> {
+        let mut session = Self::start(opts)?;
+        let mut lines = Vec::new();
+        match session.chain.apply_preset_chain(&carry.chain) {
+            Ok(warnings) => lines.extend(warnings.into_iter().map(|w| format!("warning: {w}"))),
+            Err(e) => lines.push(format!("warning: chain state not restored: {e}")),
+        }
+        // Assets reload from their canonical paths — a rate change re-runs
+        // NAM validation and IR resampling against the new stream.
+        let fallback = presets_dir().unwrap_or_default();
+        session.apply_asset(carry.nam.as_ref(), &fallback, AssetKind::Nam, &mut lines);
+        session.apply_asset(carry.ir.as_ref(), &fallback, AssetKind::Ir, &mut lines);
+        Ok((session, lines))
+    }
+
     pub fn description(&self) -> &str {
         &self.runner.description
+    }
+
+    /// Resolved device names of the running stream (exact, for the settings
+    /// panel's preselection).
+    pub fn io_names(&self) -> (&str, &str) {
+        (&self.runner.in_name, &self.runner.out_name)
     }
 
     pub fn stats(&self) -> Snapshot {
@@ -232,6 +290,16 @@ impl Session {
 
     pub fn remember_preset(&mut self, name: &str) {
         self.config.last_preset = Some(name.to_string());
+        save_config(&self.config);
+    }
+
+    /// Persist the applied I/O configuration (GUI settings panel). These
+    /// become the defaults for the next launch; explicit CLI flags still win.
+    pub fn remember_io(&mut self, opts: &SessionOpts) {
+        self.config.input = opts.input.clone();
+        self.config.output = opts.output.clone();
+        self.config.buffer = Some(opts.buffer.unwrap_or(0));
+        self.config.in_channel = Some(opts.in_channel);
         save_config(&self.config);
     }
 
@@ -509,7 +577,7 @@ fn connect_midi(override_port: Option<&str>) -> (Option<MidiRuntime>, String) {
     }
 }
 
-fn load_config() -> AppConfig {
+pub(crate) fn load_config() -> AppConfig {
     app_dir()
         .map(|d| d.join("config.json"))
         .and_then(|p| std::fs::read_to_string(p).ok())

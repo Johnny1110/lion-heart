@@ -52,6 +52,23 @@ verification (`git tag v0.1.0 && git push origin v0.1.0` drafts the release).
   `--midi <port>` overrides on both; `lion-heart devices` lists MIDI inputs too.
 - GUI **live view** ("live" chip): big preset name, prev/next preset buttons, big
   meters, mini tuner readout, chain summary — stage mode.
+- GUI **settings panel** ("settings" chip): input/output device, input channel,
+  and buffer size at runtime. Apply restarts the stream via
+  `Session::carry_over()`/`resume()` (chain state + assets survive; on failure it
+  rolls back to the previous configuration). Applied choices persist in
+  `~/.lion-heart/config.json` and fill in whatever the CLI left unspecified —
+  explicit flags still win (`--buffer`/`--in-channel` are now optional args,
+  defaults unchanged). `devices::select` prefers exact name matches over
+  substrings so full-name GUI picks are unambiguous.
+- **Drive model registry — ADR 003.** The drive slot has a stepped `model`
+  param (`ts9`, `blues driver`, `classic`) + three pedal-style position knobs
+  0–10; each model is a `Circuit` impl (nonlinear `shape` at 4× OS rate,
+  linear `post` at base rate) registered in `lh_dsp::drive::MODELS` — append
+  a `ModelDef` (label, knob captions, builder) and the GUI dropdown + knob
+  captions ("Gain" on blues driver), REPL labels, MIDI, plugin param pick it
+  up. Preset **schema v2**: v1 drive values (dB/Hz) migrate through
+  `lh_core::drive_law` inverses onto `model=classic` — old presets sound
+  identical. Stepped params render as dropdowns in the GUI (mod type too).
 - 32-frame target verified: the 8-pedal hand-written chain is ~4 µs per 32-frame
   block (0.6 % of the 667 µs deadline, linear scaling — see `docs/benchmarks.md`),
   null-device run at `--buffer 32` clean under assert_no_alloc.
@@ -63,8 +80,11 @@ Old presets load forward-compatibly; the limiter is always moved back to last.
 
 Pending user verification on the Mac: foot controller end-to-end (PC preset
 switch, CC expression → param, CC bypass), live view at stage distance,
-`--buffer 32` xruns on real hardware, plus the standing items (M5 pedals by ear,
-tuner sanity, RTL numbers into `docs/latency.md`).
+`--buffer 32` xruns on real hardware, settings panel against real devices
+(switch Scarlett ↔ built-in mid-jam, buffer change, unplug rollback), drive
+models by ear (ts9 mid-hump vs blues driver openness, knob tapers, model
+switch mid-note, an old preset still sounding right), plus the standing items
+(M5 pedals by ear, tuner sanity, RTL numbers into `docs/latency.md`).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat

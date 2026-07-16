@@ -105,13 +105,28 @@ pub fn select(
         };
     }
 
+    // Exact (case-insensitive) names win over substrings, so a GUI pick of
+    // "Scarlett 2i2" is unambiguous even when "Scarlett 2i2 USB" enumerates
+    // first.
     let needle = spec.to_lowercase();
-    for device in host.devices()? {
-        if device_name(&device).to_lowercase().contains(&needle) && supports(&device, dir) {
-            return Ok(device);
+    for exact in [true, false] {
+        for device in host.devices()? {
+            if name_matches(&device_name(&device), &needle, exact) && supports(&device, dir) {
+                return Ok(device);
+            }
         }
     }
     Err(IoError::DeviceNotFound(spec.to_string()))
+}
+
+/// One pass of [`select`]'s name matching; `needle` is already lowercased.
+fn name_matches(name: &str, needle: &str, exact: bool) -> bool {
+    let name = name.to_lowercase();
+    if exact {
+        name == needle
+    } else {
+        name.contains(needle)
+    }
 }
 
 fn supports(device: &cpal::Device, dir: Direction) -> bool {
@@ -160,4 +175,28 @@ fn port_desc(device: &cpal::Device, dir: Direction) -> Option<PortDesc> {
         sample_format: format!("{}", default.sample_format()),
         buffer_range,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirror of [`select`]'s two-pass loop over plain names.
+    fn pick(names: &[&str], spec: &str) -> Option<usize> {
+        let needle = spec.to_lowercase();
+        [true, false]
+            .into_iter()
+            .find_map(|exact| names.iter().position(|n| name_matches(n, &needle, exact)))
+    }
+
+    #[test]
+    fn exact_name_beats_earlier_substring() {
+        let names = ["Scarlett 2i2 USB", "Scarlett 2i2"];
+        assert_eq!(pick(&names, "scarlett 2i2"), Some(1));
+        assert_eq!(pick(&names, "Scarlett 2i2 USB"), Some(0));
+        // Pure substrings still fall back to first match.
+        assert_eq!(pick(&names, "scarlett"), Some(0));
+        assert_eq!(pick(&names, "2i2 usb"), Some(0));
+        assert_eq!(pick(&names, "umc"), None);
+    }
 }

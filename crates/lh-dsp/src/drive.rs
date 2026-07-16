@@ -1,47 +1,156 @@
-//! Drive: asymmetric tanh waveshaper run at 4× oversampling, followed by a
-//! DC blocker (the asymmetry generates signal-dependent DC), a one-pole tone
-//! lowpass, and an output level.
+//! Drive: a family of overdrive pedals behind one chain slot. The stepped
+//! `model` param picks the pedal; the three knobs are positions `0..=10`,
+//! laid out like the face of the modelled pedal so nothing has to be
+//! relearned.
 //!
-//! Signal path: input gain → ↑4× → shape → ↓4× → DC block → tone → level.
+//! Registered models:
+//!
+//! - **ts9** — Tube-Screamer-style. The gained path is the input high-passed
+//!   at 720 Hz (4.7 kΩ + 47 nF into the op-amp), amplified 21–41 dB
+//!   (51 kΩ + 500 kΩ drive pot over 4.7 kΩ) and squashed by the feedback
+//!   diodes; summing it with the unity dry path is what makes the classic
+//!   mid-hump with lows that stay clean. The 51 pF feedback cap darkens the
+//!   clipped path as the drive pot rises. Tone is the usual one-pole
+//!   dark↔bright tilt around 723 Hz.
+//! - **blues driver** — BD-2-style. Near-full-range gain (lows are kept, the
+//!   corner sits at 28 Hz), a fixed bright pre-emphasis into the clipper, and
+//!   *asymmetric* knees (one diode drop against two) for even harmonics; low
+//!   gain is honestly clean, max is raw breakup. Tone is a ±high shelf.
+//! - **classic** — the original Lion-Heart biased-tanh waveshaper, kept so
+//!   v1 presets keep their exact sound (the preset migration targets it —
+//!   `lh_core::preset::CLASSIC_DRIVE_MODEL`).
+//! - **centaur** — Klon-style. A clean path (never clips — the 18 V charge
+//!   pump's headroom) is always in the mix; the gain knob blends in a
+//!   250 Hz-high-passed path squashed by germanium diodes (soft ~0.35 V
+//!   knees). Low gain is the famous transparent boost; the knobs follow the
+//!   original face: Gain / Treble / Output.
+//!
+//! Every model runs its nonlinearity inside the shared 4× oversampler
+//! ([`crate::oversample`]) and its linear tone stack at the base rate. Knob
+//! smoothing is written once per chunk into trajectory buffers shared by
+//! both channels.
+//!
+//! # Adding your own model
+//!
+//! 1. Implement [`Circuit`]: the nonlinear `shape` pass at the oversampled
+//!    rate and the linear `post` pass (tone stack, makeup) at the base rate.
+//! 2. **Append** a [`ModelDef`] to [`MODEL_DEFS`]: menu label, knob captions,
+//!    builder. Append only — presets store the model *index*.
+//!
+//! Everything downstream picks the entry up from the registry: the GUI
+//! dropdown and knob captions, REPL labels (`set drive.model ts9`), MIDI CC
+//! mapping, preset save/load, and the plugin's host-automatable model param.
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin};
+use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin, drive_law};
 
 use crate::Effect;
-use crate::oversample::Oversampler4x;
+use crate::oversample::{CHUNK, Oversampler4x};
 use crate::smooth::Smoothed;
 
-static PARAMS: [ParamDesc; 3] = [
+/// One entry in the drive model registry.
+pub struct ModelDef {
+    /// Menu label, lowercase like the modulation types ("ts9").
+    pub label: &'static str,
+    /// Knob captions in param order (drive, tone, level) — matching the face
+    /// of the modelled pedal ("Gain" on a Blues Driver, "Drive" on a TS9).
+    pub knobs: [&'static str; 3],
+    build: fn() -> Box<dyn Circuit>,
+}
+
+const MODEL_DEFS: [ModelDef; 4] = [
+    ModelDef {
+        label: "ts9",
+        knobs: ["Drive", "Tone", "Level"],
+        build: || Box::new(Ts9::new()),
+    },
+    ModelDef {
+        label: "blues driver",
+        knobs: ["Gain", "Tone", "Level"],
+        build: || Box::new(BluesDriver::new()),
+    },
+    ModelDef {
+        label: "classic",
+        knobs: ["Drive", "Tone", "Level"],
+        build: || Box::new(Classic::new()),
+    },
+    // Appended after classic: the preset migration pins classic at index 2.
+    ModelDef {
+        label: "centaur",
+        knobs: ["Gain", "Treble", "Output"],
+        build: || Box::new(Centaur::new()),
+    },
+];
+
+pub const MODEL_COUNT: usize = MODEL_DEFS.len();
+
+/// The drive model registry, in menu order.
+pub static MODELS: [ModelDef; MODEL_COUNT] = MODEL_DEFS;
+
+/// Stepped-range labels, derived from the registry at compile time.
+static MODEL_LABELS: [&str; MODEL_COUNT] = {
+    let mut labels = [""; MODEL_COUNT];
+    let mut i = 0;
+    while i < MODEL_COUNT {
+        labels[i] = MODEL_DEFS[i].label;
+        i += 1;
+    }
+    labels
+};
+
+/// Knob caption for `param_key` under `model` (the GUI asks per slot).
+/// `None` for the model selector itself and out-of-range models.
+pub fn model_knob_name(model: usize, param_key: &str) -> Option<&'static str> {
+    let knobs = &MODELS.get(model)?.knobs;
+    match param_key {
+        "drive" => Some(knobs[0]),
+        "tone" => Some(knobs[1]),
+        "level" => Some(knobs[2]),
+        _ => None,
+    }
+}
+
+static PARAMS: [ParamDesc; 4] = [
+    ParamDesc {
+        key: "model",
+        name: "Model",
+        unit: "",
+        range: Range::Stepped {
+            labels: &MODEL_LABELS,
+        },
+        default: 0.0,
+        smoothing_ms: 0.0,
+    },
     ParamDesc {
         key: "drive",
         name: "Drive",
-        unit: "dB",
+        unit: "",
         range: Range::Linear {
             min: 0.0,
-            max: 40.0,
+            max: 10.0,
         },
-        default: 16.0,
+        default: 5.0,
         smoothing_ms: 20.0,
     },
     ParamDesc {
         key: "tone",
         name: "Tone",
-        unit: "Hz",
-        range: Range::Log {
-            min: 500.0,
-            max: 8_000.0,
+        unit: "",
+        range: Range::Linear {
+            min: 0.0,
+            max: 10.0,
         },
-        default: 3_200.0,
+        default: 5.0,
         smoothing_ms: 30.0,
     },
     ParamDesc {
         key: "level",
         name: "Level",
-        unit: "dB",
+        unit: "",
         range: Range::Linear {
-            min: -24.0,
-            max: 6.0,
+            min: 0.0,
+            max: 10.0,
         },
-        default: -6.0,
+        default: 6.0,
         smoothing_ms: 20.0,
     },
 ];
@@ -52,55 +161,411 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
+/// One channel of one drive model. Built off the audio thread
+/// ([`ModelDef::build`]); both passes run on the audio thread and must obey
+/// the real-time rules (no allocation, no locks, flush denormals).
+pub trait Circuit: Send {
+    fn prepare(&mut self, base_rate: f32, os_rate: f32);
+    fn reset(&mut self);
+    /// Nonlinear stage at the oversampled rate. `drive[i]` is the smoothed
+    /// drive-knob position (0..10) for `block[i]`.
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]);
+    /// Linear stage (tone stack, makeup) at the base rate; `tone[i]`
+    /// likewise holds the smoothed tone-knob position.
+    fn post(&mut self, block: &mut [f32], tone: &[f32]);
+}
+
+// --- shared building blocks ---
+
+fn lp_coeff(hz: f32, rate: f32) -> f32 {
+    1.0 - (-std::f32::consts::TAU * hz / rate).exp()
+}
+
+/// One-pole lowpass state; highpass is the input minus this. The flush keeps
+/// decaying feedback out of denormal territory (RT rule 7).
+#[derive(Default)]
+struct OnePole {
+    y: f32,
+}
+
+impl OnePole {
+    #[inline]
+    fn lp(&mut self, x: f32, c: f32) -> f32 {
+        self.y += c * (x - self.y);
+        if self.y.abs() < 1e-20 {
+            self.y = 0.0;
+        }
+        self.y
+    }
+
+    fn reset(&mut self) {
+        self.y = 0.0;
+    }
+}
+
+/// Per-sample linear ramp between a chunk's first and last mapped knob
+/// values — the mapping (`powf`, `exp`) runs twice per chunk instead of per
+/// sample, while the pot still moves smoothly under it.
+struct Ramp {
+    v: f32,
+    step: f32,
+}
+
+impl Ramp {
+    fn over(traj: &[f32], f: impl Fn(f32) -> f32) -> Self {
+        let a = f(traj[0]);
+        let b = f(traj[traj.len() - 1]);
+        Self {
+            v: a,
+            step: (b - a) / traj.len() as f32,
+        }
+    }
+
+    #[inline]
+    fn tick(&mut self) -> f32 {
+        let v = self.v;
+        self.v += self.step;
+        v
+    }
+}
+
+// --- ts9 ---
+
+/// Diode knee scale: the clipped path flattens out around ±0.65 of full
+/// scale, leaving headroom for the dry sum.
+const TS9_DIODE: f32 = 0.65;
+/// Calibrated so drive 5 / tone 5 / level 6 lands near unity loudness
+/// (asserted by `levels_roughly_matched`).
+const TS9_MAKEUP: f32 = 0.22;
+
+struct Ts9 {
+    hp720: OnePole,
+    fb_lp: OnePole,
+    tone_lp: OnePole,
+    dc: OnePole,
+    c720: f32,
+    c723: f32,
+    c_dc: f32,
+    /// Feedback-cap lowpass coefficient, eased toward a per-chunk target.
+    fb_c: f32,
+    os_rate: f32,
+}
+
+impl Ts9 {
+    fn new() -> Self {
+        Self {
+            hp720: OnePole::default(),
+            fb_lp: OnePole::default(),
+            tone_lp: OnePole::default(),
+            dc: OnePole::default(),
+            c720: 0.0,
+            c723: 0.0,
+            c_dc: 0.0,
+            fb_c: 0.0,
+            os_rate: 4.0 * 48_000.0,
+        }
+    }
+
+    /// Feedback resistance for a drive-pot position 0..10 (51 kΩ series plus
+    /// the 500 kΩ pot, audio taper).
+    #[inline]
+    fn feedback_ohms(pos: f32) -> f32 {
+        let n = pos * 0.1;
+        51_000.0 + 500_000.0 * n * n
+    }
+}
+
+impl Circuit for Ts9 {
+    fn prepare(&mut self, base_rate: f32, os_rate: f32) {
+        self.os_rate = os_rate;
+        self.c720 = lp_coeff(720.0, os_rate);
+        self.c723 = lp_coeff(723.0, base_rate);
+        self.c_dc = lp_coeff(10.0, base_rate);
+        self.fb_c = lp_coeff(6_000.0, os_rate);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.hp720.reset();
+        self.fb_lp.reset();
+        self.tone_lp.reset();
+        self.dc.reset();
+    }
+
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
+        // The 51 pF across the feedback network: 5.7 kHz at max drive up to
+        // far above Nyquist at min. One exp per chunk, eased per sample.
+        let fc =
+            1.0 / (std::f32::consts::TAU * Self::feedback_ohms(drive[drive.len() - 1]) * 51e-12);
+        let fb_target = lp_coeff(fc.min(self.os_rate * 0.45), self.os_rate);
+        for (s, d) in block.iter_mut().zip(drive) {
+            self.fb_c += 0.002 * (fb_target - self.fb_c);
+            let x = *s;
+            let hp = x - self.hp720.lp(x, self.c720);
+            let g = 1.0 + Self::feedback_ohms(*d) / 4_700.0;
+            let v = g * hp / TS9_DIODE;
+            let clipped = TS9_DIODE * (v / (1.0 + v * v).sqrt());
+            // Unity dry plus the clipped mids: the screamer sum.
+            *s = x + self.fb_lp.lp(clipped, self.fb_c);
+        }
+    }
+
+    fn post(&mut self, block: &mut [f32], tone: &[f32]) {
+        for (s, t) in block.iter_mut().zip(tone) {
+            let x = *s;
+            let lp = self.tone_lp.lp(x, self.c723);
+            let hp = x - lp;
+            let n = t * 0.1;
+            // 0 = dark (8% of the treble), 10 = bright (+3.4 dB tilt).
+            let bright = 0.08 + 1.4 * n * n;
+            let y = (lp + bright * hp) * TS9_MAKEUP;
+            *s = y - self.dc.lp(y, self.c_dc);
+        }
+    }
+}
+
+// --- blues driver ---
+
+/// Asymmetric knees: two diode drops against one. Even harmonics come from
+/// the mismatch; the DC it creates is blocked inside the oversampled stage.
+const BD2_KNEE_POS: f32 = 1.0;
+const BD2_KNEE_NEG: f32 = 0.5;
+/// Fixed bright pre-emphasis into the clipper (+4.6 dB above 1.5 kHz).
+const BD2_BRIGHT: f32 = 0.7;
+/// Calibrated with `ts9_and_blues_driver_sit_near_unity_at_default_knobs`.
+const BD2_MAKEUP: f32 = 0.2;
+
+struct BluesDriver {
+    hp_in: OnePole,
+    pre_hp: OnePole,
+    dc_os: OnePole,
+    tone_hp: OnePole,
+    c28: f32,
+    c1500: f32,
+    c12: f32,
+    c1000: f32,
+}
+
+impl BluesDriver {
+    fn new() -> Self {
+        Self {
+            hp_in: OnePole::default(),
+            pre_hp: OnePole::default(),
+            dc_os: OnePole::default(),
+            tone_hp: OnePole::default(),
+            c28: 0.0,
+            c1500: 0.0,
+            c12: 0.0,
+            c1000: 0.0,
+        }
+    }
+}
+
+impl Circuit for BluesDriver {
+    fn prepare(&mut self, base_rate: f32, os_rate: f32) {
+        self.c28 = lp_coeff(28.0, os_rate);
+        self.c1500 = lp_coeff(1_500.0, os_rate);
+        self.c12 = lp_coeff(12.0, os_rate);
+        self.c1000 = lp_coeff(1_000.0, base_rate);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.hp_in.reset();
+        self.pre_hp.reset();
+        self.dc_os.reset();
+        self.tone_hp.reset();
+    }
+
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
+        // +2 dB (honest clean boost) up to +42 dB (raw breakup); powf twice
+        // per chunk, ramped per sample.
+        let mut gain = Ramp::over(drive, |d| db_to_lin(2.0 + 40.0 * (d * 0.1).powf(1.5)));
+        for s in block.iter_mut() {
+            let x = *s;
+            let x = x - self.hp_in.lp(x, self.c28);
+            let x = x + BD2_BRIGHT * (x - self.pre_hp.lp(x, self.c1500));
+            let v = gain.tick() * x;
+            let clipped = if v >= 0.0 {
+                BD2_KNEE_POS * (v / BD2_KNEE_POS).tanh()
+            } else {
+                BD2_KNEE_NEG * (v / BD2_KNEE_NEG).tanh()
+            };
+            *s = clipped - self.dc_os.lp(clipped, self.c12);
+        }
+    }
+
+    fn post(&mut self, block: &mut [f32], tone: &[f32]) {
+        // High shelf around 1 kHz: −14 dB muffled to +8 dB cutting.
+        let mut shelf = Ramp::over(tone, |t| db_to_lin(-14.0 + 2.2 * t) - 1.0);
+        for s in block.iter_mut() {
+            let x = *s;
+            let hp = x - self.tone_hp.lp(x, self.c1000);
+            *s = (x + shelf.tick() * hp) * BD2_MAKEUP;
+        }
+    }
+}
+
+// --- classic ---
+
 /// Static bias into the tanh: breaks symmetry so even harmonics appear
 /// (tube-flavoured). The constant output offset is removed analytically and
 /// the signal-dependent remainder by the DC blocker.
 const BIAS: f32 = 0.2;
+/// tanh(BIAS), precomputed (rustc has no const tanh).
+const BIAS_TANH: f32 = 0.197_375_32;
 const DC_R: f32 = 0.995;
 
-/// Per-channel signal state; parameters and their smoothers are shared.
-struct DriveChannel {
-    os: Oversampler4x,
+struct Classic {
     dc_x1: f32,
     dc_y1: f32,
-    lp: f32,
+    lp: OnePole,
+    tone_c: f32,
+    base_rate: f32,
 }
 
-impl DriveChannel {
+impl Classic {
     fn new() -> Self {
         Self {
-            os: Oversampler4x::new(),
             dc_x1: 0.0,
             dc_y1: 0.0,
-            lp: 0.0,
+            lp: OnePole::default(),
+            tone_c: 0.5,
+            base_rate: 48_000.0,
         }
+    }
+}
+
+impl Circuit for Classic {
+    fn prepare(&mut self, base_rate: f32, _os_rate: f32) {
+        self.base_rate = base_rate;
+        self.tone_c = lp_coeff(drive_law::classic_tone_hz(PARAMS[2].default), base_rate);
+        self.reset();
     }
 
     fn reset(&mut self) {
-        self.os.reset();
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
-        self.lp = 0.0;
+        self.lp.reset();
     }
 
-    /// DC blocker + tone lowpass for one post-shaper sample.
-    #[inline]
-    fn post(&mut self, x: f32, tone_coeff: f32) -> f32 {
-        let y = x - self.dc_x1 + DC_R * self.dc_y1;
-        self.dc_x1 = x;
-        self.dc_y1 = if y.abs() < 1e-15 { 0.0 } else { y };
-        self.lp += tone_coeff * (self.dc_y1 - self.lp);
-        self.lp
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
+        let mut gain = Ramp::over(drive, |d| db_to_lin(drive_law::classic_drive_db(d)));
+        for s in block.iter_mut() {
+            // Subtracting tanh(BIAS) recenters the idle point at zero.
+            *s = (*s * gain.tick() + BIAS).tanh() - BIAS_TANH;
+        }
+    }
+
+    fn post(&mut self, block: &mut [f32], tone: &[f32]) {
+        let target = lp_coeff(
+            drive_law::classic_tone_hz(tone[tone.len() - 1]),
+            self.base_rate,
+        );
+        for s in block.iter_mut() {
+            self.tone_c += 0.01 * (target - self.tone_c);
+            let x = *s;
+            let y = x - self.dc_x1 + DC_R * self.dc_y1;
+            self.dc_x1 = x;
+            self.dc_y1 = if y.abs() < 1e-15 { 0.0 } else { y };
+            *s = self.lp.lp(self.dc_y1, self.tone_c);
+        }
     }
 }
 
+// --- centaur ---
+
+/// Germanium knee — much lower and softer than silicon.
+const CENTAUR_KNEE: f32 = 0.35;
+/// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs` and
+/// `centaur_low_gain_is_a_transparent_boost`.
+const CENTAUR_MAKEUP: f32 = 0.65;
+
+struct Centaur {
+    hp250: OnePole,
+    treble_hp: OnePole,
+    dc: OnePole,
+    c250: f32,
+    c1200: f32,
+    c_dc: f32,
+}
+
+impl Centaur {
+    fn new() -> Self {
+        Self {
+            hp250: OnePole::default(),
+            treble_hp: OnePole::default(),
+            dc: OnePole::default(),
+            c250: 0.0,
+            c1200: 0.0,
+            c_dc: 0.0,
+        }
+    }
+
+    /// Germanium pair: even softer knee than silicon — `u/(1+|u|)` instead
+    /// of `tanh`, scaled to the diode drop.
+    #[inline]
+    fn germanium(v: f32) -> f32 {
+        let u = v / CENTAUR_KNEE;
+        CENTAUR_KNEE * (u / (1.0 + u.abs()))
+    }
+}
+
+impl Circuit for Centaur {
+    fn prepare(&mut self, base_rate: f32, os_rate: f32) {
+        self.c250 = lp_coeff(250.0, os_rate);
+        self.c1200 = lp_coeff(1_200.0, base_rate);
+        self.c_dc = lp_coeff(10.0, base_rate);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.hp250.reset();
+        self.treble_hp.reset();
+        self.dc.reset();
+    }
+
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
+        // The dual-ganged gain pot: one gang sweeps the dirty path's gain
+        // +8..+38 dB, the other lifts the ever-present clean path a little;
+        // the dirty share of the mix comes in progressively (b²), so gain 0
+        // leaves nothing but the clean boost.
+        let mut gain = Ramp::over(drive, |d| db_to_lin(8.0 + 30.0 * (d * 0.1).powf(1.5)));
+        for (s, d) in block.iter_mut().zip(drive) {
+            let b = d * 0.1;
+            let x = *s;
+            let dirty_in = x - self.hp250.lp(x, self.c250);
+            let dirty = Self::germanium(gain.tick() * dirty_in);
+            *s = (1.2 + 0.8 * b) * x + b * b * dirty;
+        }
+    }
+
+    fn post(&mut self, block: &mut [f32], tone: &[f32]) {
+        // Treble: a gentle ±6 dB shelf above 1.2 kHz, flat at noon.
+        let mut shelf = Ramp::over(tone, |t| db_to_lin(-6.0 + 1.2 * t) - 1.0);
+        for s in block.iter_mut() {
+            let x = *s;
+            let hp = x - self.treble_hp.lp(x, self.c1200);
+            let y = (x + shelf.tick() * hp) * CENTAUR_MAKEUP;
+            *s = y - self.dc.lp(y, self.c_dc);
+        }
+    }
+}
+
+// --- the effect ---
+
 pub struct Drive {
-    sample_rate: u32,
-    ch: [DriveChannel; 2],
-    pregain: Smoothed,
-    tone_coeff: Smoothed,
-    level: Smoothed,
-    tone_hz: f32,
+    model: usize,
+    os: [Oversampler4x; 2],
+    /// One stereo pair of state per registered model, preallocated so a
+    /// model switch on the audio thread is just an index change.
+    circuits: Vec<[Box<dyn Circuit>; 2]>,
+    /// Ticked at the oversampled rate (its trajectory feeds `shape`).
+    drive_s: Smoothed,
+    tone_s: Smoothed,
+    level_s: Smoothed,
+    drive_traj: Vec<f32>,
+    tone_traj: Vec<f32>,
 }
 
 impl Default for Drive {
@@ -112,27 +577,16 @@ impl Default for Drive {
 impl Drive {
     pub fn new() -> Self {
         Self {
-            sample_rate: 48_000,
-            ch: [DriveChannel::new(), DriveChannel::new()],
-            pregain: Smoothed::new(db_to_lin(PARAMS[0].default)),
-            tone_coeff: Smoothed::new(0.5),
-            level: Smoothed::new(db_to_lin(PARAMS[2].default)),
-            tone_hz: PARAMS[1].default,
+            model: PARAMS[0].default as usize,
+            os: [Oversampler4x::new(), Oversampler4x::new()],
+            circuits: MODELS.iter().map(|m| [(m.build)(), (m.build)()]).collect(),
+            drive_s: Smoothed::new(PARAMS[1].default),
+            tone_s: Smoothed::new(PARAMS[2].default),
+            level_s: Smoothed::new(PARAMS[3].default),
+            drive_traj: vec![0.0; 4 * CHUNK],
+            tone_traj: vec![0.0; CHUNK],
         }
     }
-}
-
-fn lp_coeff(hz: f32, sample_rate: u32) -> f32 {
-    1.0 - (-2.0 * std::f32::consts::PI * hz / sample_rate as f32).exp()
-}
-
-/// tanh(BIAS), precomputed (rustc has no const tanh).
-const BIAS_TANH: f32 = 0.197_375_32;
-
-#[inline]
-fn shape(x: f32) -> f32 {
-    // Subtracting the constant tanh(BIAS) recenters the idle point at zero.
-    (x + BIAS).tanh() - BIAS_TANH
 }
 
 impl Effect for Drive {
@@ -141,66 +595,78 @@ impl Effect for Drive {
     }
 
     fn prepare(&mut self, sample_rate: u32) {
-        self.sample_rate = sample_rate;
-        self.pregain.configure(PARAMS[0].smoothing_ms, sample_rate);
-        self.tone_coeff
-            .configure(PARAMS[1].smoothing_ms, sample_rate);
-        self.level.configure(PARAMS[2].smoothing_ms, sample_rate);
-        self.tone_coeff
-            .set_target(lp_coeff(self.tone_hz, sample_rate));
-        self.pregain.snap_to_target();
-        self.tone_coeff.snap_to_target();
-        self.level.snap_to_target();
+        let base = sample_rate as f32;
+        self.drive_s
+            .configure(PARAMS[1].smoothing_ms, sample_rate * 4);
+        self.tone_s.configure(PARAMS[2].smoothing_ms, sample_rate);
+        self.level_s.configure(PARAMS[3].smoothing_ms, sample_rate);
+        self.drive_s.snap_to_target();
+        self.tone_s.snap_to_target();
+        self.level_s.snap_to_target();
+        for pair in &mut self.circuits {
+            for circuit in pair {
+                circuit.prepare(base, base * 4.0);
+            }
+        }
         self.reset();
     }
 
     fn reset(&mut self) {
-        for ch in &mut self.ch {
-            ch.reset();
+        for os in &mut self.os {
+            os.reset();
+        }
+        for pair in &mut self.circuits {
+            for circuit in pair {
+                circuit.reset();
+            }
         }
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
+        let real = PARAMS[index].range.to_real(normalized);
         match index {
-            0 => self
-                .pregain
-                .set_target(db_to_lin(PARAMS[0].range.to_real(normalized))),
-            1 => {
-                self.tone_hz = PARAMS[1].range.to_real(normalized);
-                self.tone_coeff
-                    .set_target(lp_coeff(self.tone_hz, self.sample_rate));
+            0 => {
+                let model = real as usize;
+                if model != self.model && model < self.circuits.len() {
+                    self.model = model;
+                    // Fresh filter state for the incoming model; the linear
+                    // oversampler keeps running. Like the modulation family,
+                    // switching mid-note is a brief discontinuity, never NaN.
+                    for circuit in &mut self.circuits[model] {
+                        circuit.reset();
+                    }
+                }
             }
-            2 => self
-                .level
-                .set_target(db_to_lin(PARAMS[2].range.to_real(normalized))),
+            1 => self.drive_s.set_target(real),
+            2 => self.tone_s.set_target(real),
+            3 => self.level_s.set_target(real),
             _ => {}
         }
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        // Input gain at the base rate (scalar gain commutes with resampling);
-        // smoothers tick once per sample frame and feed both channels.
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let g = self.pregain.tick();
-            *l *= g;
-            *r *= g;
-        }
-        self.ch[0].os.process(left, |os_block| {
-            for s in os_block.iter_mut() {
-                *s = shape(*s);
+        let [os_l, os_r] = &mut self.os;
+        let [circuit_l, circuit_r] = &mut self.circuits[self.model];
+        for (bl, br) in left.chunks_mut(CHUNK).zip(right.chunks_mut(CHUNK)) {
+            let n = bl.len();
+            // Knob trajectories, shared by both channels: tone at the base
+            // rate, drive at the oversampled rate the shaper runs at.
+            for v in &mut self.tone_traj[..n] {
+                *v = self.tone_s.tick();
             }
-        });
-        self.ch[1].os.process(right, |os_block| {
-            for s in os_block.iter_mut() {
-                *s = shape(*s);
+            for v in &mut self.drive_traj[..4 * n] {
+                *v = self.drive_s.tick();
             }
-        });
-        let (ch_l, ch_r) = self.ch.split_at_mut(1);
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let c = self.tone_coeff.tick();
-            let lv = self.level.tick();
-            *l = ch_l[0].post(*l, c) * lv;
-            *r = ch_r[0].post(*r, c) * lv;
+            let drive_traj = &self.drive_traj[..4 * n];
+            os_l.process(bl, |b| circuit_l.shape(b, drive_traj));
+            os_r.process(br, |b| circuit_r.shape(b, drive_traj));
+            circuit_l.post(bl, &self.tone_traj[..n]);
+            circuit_r.post(br, &self.tone_traj[..n]);
+            for (l, r) in bl.iter_mut().zip(br.iter_mut()) {
+                let level = drive_law::level_lin(self.level_s.tick());
+                *l *= level;
+                *r *= level;
+            }
         }
     }
 }
@@ -208,86 +674,327 @@ impl Effect for Drive {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{assert_finite, process_in_blocks, sine};
+    use crate::testutil::{assert_finite, peak, process_in_blocks, rms, sine};
 
     const SR: u32 = 48_000;
 
-    fn prepared() -> Drive {
+    fn prepared(model: usize) -> Drive {
         let mut d = Drive::new();
         d.prepare(SR);
+        d.set_param(0, PARAMS[0].range.to_norm(model as f32));
         d
     }
 
-    #[test]
-    fn output_is_finite_and_bounded_at_max_drive() {
-        let mut d = prepared();
-        d.set_param(0, 1.0); // 40 dB
-        d.set_param(2, 1.0); // +6 dB
-        let x = sine(SR, 220.0, SR as usize / 2);
-        let y = process_in_blocks(&mut d, &x, 64);
-        assert_finite("drive output", &y);
-        let p = crate::testutil::peak(&y);
-        assert!(p < 3.0, "bounded output, got peak {p}");
-        assert!(p > 0.5, "signal present, got peak {p}");
+    fn set_pos(d: &mut Drive, index: usize, pos: f32) {
+        d.set_param(index, PARAMS[index].range.to_norm(pos));
     }
 
-    #[test]
-    fn asymmetric_shaper_leaves_no_dc() {
-        let mut d = prepared();
-        d.set_param(0, 1.0);
-        let x = sine(SR, 220.0, SR as usize);
-        let y = process_in_blocks(&mut d, &x, 256);
-        let tail = &y[SR as usize / 2..];
-        let mean = tail.iter().map(|s| f64::from(*s)).sum::<f64>() / tail.len() as f64;
-        assert!(mean.abs() < 1e-3, "DC blocker must remove offset: {mean}");
+    /// A sine at nominal guitar level (−18 dBFS). The character tests run
+    /// here: full scale would drown every model in saturation and erase the
+    /// differences the models exist for.
+    fn guitar(freq: f32, len: usize) -> Vec<f32> {
+        let mut x = sine(SR, freq, len);
+        for s in &mut x {
+            *s *= 0.126;
+        }
+        x
     }
 
-    #[test]
-    fn creates_harmonics() {
-        let mut d = prepared();
-        let f0 = 220.0;
-        let x = sine(SR, f0, SR as usize);
-        let y = process_in_blocks(&mut d, &x, 256);
-        let tail = &y[SR as usize / 2..];
-
-        // Project onto the fundamental (sin & cos at f0); what remains is
-        // harmonic content created by the shaper.
+    /// Magnitude of the projection onto `freq` over the settled tail.
+    fn tone_at(y: &[f32], freq: f32) -> f64 {
+        let tail = &y[y.len() / 2..];
         let n = tail.len() as f64;
         let (mut cs, mut cc) = (0.0f64, 0.0f64);
         for (i, s) in tail.iter().enumerate() {
-            let ph = 2.0 * std::f64::consts::PI * f64::from(f0) * i as f64 / f64::from(SR);
+            let ph = 2.0 * std::f64::consts::PI * f64::from(freq) * i as f64 / f64::from(SR);
             cs += f64::from(*s) * ph.sin();
             cc += f64::from(*s) * ph.cos();
         }
-        let fund_rms = ((cs * 2.0 / n).powi(2) + (cc * 2.0 / n).powi(2)).sqrt() / 2f64.sqrt();
-        let total_rms = f64::from(crate::testutil::rms(tail));
-        let residual = (total_rms.powi(2) - fund_rms.powi(2)).max(0.0).sqrt();
+        ((cs * 2.0 / n).powi(2) + (cc * 2.0 / n).powi(2)).sqrt()
+    }
+
+    /// RMS fraction of the output that is *not* the fundamental — the
+    /// distortion fingerprint used by the character tests.
+    fn harmonic_residual(y: &[f32], f0: f32) -> f64 {
+        let tail = &y[y.len() / 2..];
+        let fund_rms = tone_at(y, f0) / 2f64.sqrt();
+        let total_rms = f64::from(rms(tail));
+        (total_rms.powi(2) - fund_rms.powi(2)).max(0.0).sqrt() / total_rms
+    }
+
+    #[test]
+    fn registry_is_consistent() {
+        assert_eq!(MODEL_LABELS.len(), MODELS.len());
+        for (def, label) in MODELS.iter().zip(MODEL_LABELS) {
+            assert_eq!(def.label, label);
+        }
+        // Labels are unique (they are REPL/preset-facing identifiers).
+        for (i, a) in MODELS.iter().enumerate() {
+            for b in &MODELS[i + 1..] {
+                assert_ne!(a.label, b.label);
+            }
+        }
+        // The preset migration targets the classic model by index; pin it.
+        assert_eq!(
+            MODELS[lh_core::preset::CLASSIC_DRIVE_MODEL as usize].label,
+            "classic"
+        );
+        assert_eq!(model_knob_name(1, "drive"), Some("Gain"));
+        assert_eq!(model_knob_name(0, "drive"), Some("Drive"));
+        assert_eq!(model_knob_name(0, "model"), None);
+        // The centaur wears the original faceplate.
+        assert_eq!(model_knob_name(3, "drive"), Some("Gain"));
+        assert_eq!(model_knob_name(3, "tone"), Some("Treble"));
+        assert_eq!(model_knob_name(3, "level"), Some("Output"));
+    }
+
+    #[test]
+    fn every_model_is_finite_bounded_and_alive_at_max_drive() {
+        for (model, def) in MODELS.iter().enumerate() {
+            let mut d = prepared(model);
+            set_pos(&mut d, 1, 10.0);
+            set_pos(&mut d, 3, 10.0);
+            let x = sine(SR, 220.0, SR as usize / 2);
+            let y = process_in_blocks(&mut d, &x, 64);
+            assert_finite(def.label, &y);
+            let p = peak(&y);
+            // Full-scale input with every knob maxed: clippers saturate, and
+            // the centaur's never-clipping clean path may legitimately ride
+            // above full scale (level tops out at +9 dB) — bounded means "no
+            // runaway", not "inside 0 dBFS".
+            assert!(p < 4.5, "{}: bounded output, got peak {p}", def.label);
+            assert!(p > 0.2, "{}: signal present, got peak {p}", def.label);
+        }
+    }
+
+    #[test]
+    fn every_model_removes_dc_and_dies_to_silence() {
+        for (model, def) in MODELS.iter().enumerate() {
+            let mut d = prepared(model);
+            set_pos(&mut d, 1, 9.0);
+            let x = sine(SR, 220.0, SR as usize);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let tail = &y[SR as usize / 2..];
+            let mean = tail.iter().map(|s| f64::from(*s)).sum::<f64>() / tail.len() as f64;
+            assert!(
+                mean.abs() < 2e-3,
+                "{}: DC must be blocked, mean {mean}",
+                def.label
+            );
+
+            d.reset();
+            let silence = vec![0.0f32; SR as usize / 4];
+            let y = process_in_blocks(&mut d, &silence, 128);
+            let out = rms(&y[y.len() / 2..]);
+            assert!(
+                out < 1e-4,
+                "{}: silence in → silence out, got rms {out}",
+                def.label
+            );
+        }
+    }
+
+    #[test]
+    fn every_model_creates_harmonics() {
+        // At nominal guitar level: character lives at real signal levels
+        // (full scale would let the centaur's linear clean path drown its
+        // saturated dirty path — the opposite of how the pedal is played).
+        for (model, def) in MODELS.iter().enumerate() {
+            let mut d = prepared(model);
+            set_pos(&mut d, 1, 7.0);
+            let x = guitar(220.0, SR as usize);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let residual = harmonic_residual(&y, 220.0);
+            assert!(
+                residual > 0.05,
+                "{}: expected >5% harmonic content, got {residual:.3}",
+                def.label
+            );
+        }
+    }
+
+    #[test]
+    fn ts9_clips_mids_harder_than_lows() {
+        // The screamer signature: the gained path is high-passed at 720 Hz,
+        // so a low note stays much cleaner than a mid note at the same knob.
+        let mut d = prepared(0);
+        set_pos(&mut d, 1, 6.0);
+        let lows = {
+            let x = guitar(110.0, SR as usize);
+            harmonic_residual(&process_in_blocks(&mut d, &x, 256), 110.0)
+        };
+        d.reset();
+        let mids = {
+            let x = guitar(720.0, SR as usize);
+            harmonic_residual(&process_in_blocks(&mut d, &x, 256), 720.0)
+        };
         assert!(
-            residual / total_rms > 0.05,
-            "expected >5% harmonic content, got {:.3}",
-            residual / total_rms
+            mids > 1.5 * lows,
+            "ts9 must distort mids ≫ lows: mids {mids:.3} vs lows {lows:.3}"
         );
     }
 
     #[test]
-    fn param_changes_are_smooth() {
-        let mut d = prepared();
-        d.set_param(0, 0.0);
+    fn blues_driver_clips_lows_that_the_ts9_leaves_clean() {
+        // Full-range vs mid-focused: at the same drive position, a 110 Hz
+        // note comes out dirtier from the BD-2 than from the TS9.
+        let x = guitar(110.0, SR as usize);
+        let mut ts9 = prepared(0);
+        set_pos(&mut ts9, 1, 7.0);
+        let ts9_res = harmonic_residual(&process_in_blocks(&mut ts9, &x, 256), 110.0);
+        let mut bd2 = prepared(1);
+        set_pos(&mut bd2, 1, 7.0);
+        let bd2_res = harmonic_residual(&process_in_blocks(&mut bd2, &x, 256), 110.0);
+        assert!(
+            bd2_res > 1.5 * ts9_res,
+            "blues driver keeps (and clips) lows: bd2 {bd2_res:.3} vs ts9 {ts9_res:.3}"
+        );
+    }
+
+    #[test]
+    fn blues_driver_makes_even_harmonics_and_the_ts9_does_not() {
+        // Asymmetric knees put energy at 2·f0; matched diodes cancel it.
+        // (Peak ratios are useless here — the DC blocker recenters a
+        // saturated waveform — the second harmonic is the honest metric.)
+        let x = guitar(220.0, SR as usize);
+        let h2 = |y: &[f32]| tone_at(y, 440.0) / tone_at(y, 220.0);
+
+        let mut bd2 = prepared(1);
+        set_pos(&mut bd2, 1, 6.0);
+        let bd2_h2 = h2(&process_in_blocks(&mut bd2, &x, 256));
+
+        let mut ts9 = prepared(0);
+        set_pos(&mut ts9, 1, 6.0);
+        let ts9_h2 = h2(&process_in_blocks(&mut ts9, &x, 256));
+
+        assert!(
+            bd2_h2 > 0.03,
+            "bd2 knees are one diode against two — expected 2nd harmonic, got {bd2_h2:.4}"
+        );
+        assert!(
+            ts9_h2 < 0.01,
+            "ts9 diodes are matched — 2nd harmonic should vanish, got {ts9_h2:.4}"
+        );
+        assert!(bd2_h2 > 3.0 * ts9_h2);
+    }
+
+    #[test]
+    fn modelled_pedals_sit_near_unity_at_default_knobs() {
+        // Model switching mid-set must not blast the monitors: the modelled
+        // pedals are calibrated to comparable loudness at their default
+        // positions and nominal guitar level. (classic is exempt — its gain
+        // structure is pinned by v1 preset compatibility.)
+        let x = guitar(220.0, SR as usize);
+        let in_rms = f64::from(rms(&x[x.len() / 2..]));
+        let mut levels = Vec::new();
+        for model in [0usize, 1, 3] {
+            let mut d = prepared(model);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let out = f64::from(rms(&y[y.len() / 2..]));
+            let db = 20.0 * (out / in_rms).log10();
+            assert!(
+                db.abs() < 6.0,
+                "{}: default knobs should sit near unity, got {db:.1} dB",
+                MODELS[model].label
+            );
+            levels.push(db);
+        }
+        let spread =
+            levels.iter().cloned().fold(f64::MIN, f64::max) - levels.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            spread < 5.0,
+            "modelled pedals at defaults are {spread:.1} dB apart ({levels:?})"
+        );
+    }
+
+    #[test]
+    fn centaur_low_gain_is_a_transparent_boost() {
+        // The Klon party trick: with the gain low, the clean path dominates
+        // — barely any harmonics, level near (or a touch above) unity.
+        let x = guitar(220.0, SR as usize);
+        let mut c = prepared(3);
+        set_pos(&mut c, 1, 1.5);
+        let y = process_in_blocks(&mut c, &x, 256);
+        let residual = harmonic_residual(&y, 220.0);
+        assert!(
+            residual < 0.04,
+            "low-gain centaur must stay clean, got {residual:.3} residual"
+        );
+        let db = 20.0
+            * (f64::from(rms(&y[y.len() / 2..])) / f64::from(rms(&x[x.len() / 2..]))).log10();
+        assert!(
+            (-3.0..6.0).contains(&db),
+            "transparent boost, not a cut: {db:.1} dB"
+        );
+
+        // And the same pedal still breaks up when pushed.
+        let mut c = prepared(3);
+        set_pos(&mut c, 1, 9.0);
+        let y = process_in_blocks(&mut c, &x, 256);
+        let pushed = harmonic_residual(&y, 220.0);
+        assert!(
+            pushed > 2.0 * residual.max(0.01),
+            "cranked centaur must break up: {pushed:.3}"
+        );
+    }
+
+    #[test]
+    fn model_switch_mid_note_stays_finite() {
+        let mut d = prepared(0);
+        set_pos(&mut d, 1, 8.0);
         let x = sine(SR, 220.0, SR as usize / 2);
-        let mut y = x.clone();
-        let mut yr = x.clone();
-        let (a, b) = y.split_at_mut(SR as usize / 4);
-        let (ar, br) = yr.split_at_mut(SR as usize / 4);
-        d.process(a, ar);
-        d.set_param(0, 1.0); // slam the knob mid-stream
-        d.set_param(2, 0.0);
-        d.process(b, br);
-        assert_finite("drive sweep", &y);
-        let max_step = y
-            .windows(2)
-            .map(|w| (w[1] - w[0]).abs())
-            .fold(0.0f32, f32::max);
-        // 220 Hz at unity swings ~0.03/sample; a hard gain jump would spike this.
-        assert!(max_step < 0.5, "click detected: step {max_step}");
+        let mut left = x.clone();
+        let mut right = x.clone();
+        for (i, (bl, br)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
+            // Cycle through every model while the note rings.
+            d.set_param(0, PARAMS[0].range.to_norm((i % MODEL_COUNT) as f32));
+            d.process(bl, br);
+        }
+        assert_finite("model switching", &left);
+        assert!(peak(&left) < 4.0);
+    }
+
+    #[test]
+    fn param_changes_are_smooth() {
+        for (model, def) in MODELS.iter().enumerate() {
+            let mut d = prepared(model);
+            set_pos(&mut d, 1, 0.0);
+            let x = sine(SR, 220.0, SR as usize / 2);
+            let mut y = x.clone();
+            let mut yr = x.clone();
+            let (a, b) = y.split_at_mut(SR as usize / 4);
+            let (ar, br) = yr.split_at_mut(SR as usize / 4);
+            d.process(a, ar);
+            d.set_param(1, 1.0); // slam the knob mid-stream
+            d.set_param(3, 0.0);
+            d.process(b, br);
+            assert_finite("drive sweep", &y);
+            let max_step = y
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max);
+            // 220 Hz at unity swings ~0.03/sample; a hard gain jump spikes this.
+            assert!(
+                max_step < 0.5,
+                "{}: click detected, step {max_step}",
+                def.label
+            );
+        }
+    }
+
+    #[test]
+    fn all_models_run_at_studio_rates() {
+        for sr in [44_100u32, 96_000] {
+            for (model, def) in MODELS.iter().enumerate() {
+                let mut d = Drive::new();
+                d.prepare(sr);
+                d.set_param(0, PARAMS[0].range.to_norm(model as f32));
+                set_pos(&mut d, 1, 7.0);
+                let x = sine(sr, 220.0, sr as usize / 2);
+                let y = process_in_blocks(&mut d, &x, 96);
+                assert_finite(def.label, &y);
+                assert!(rms(&y[y.len() / 2..]) > 1e-3);
+            }
+        }
     }
 }

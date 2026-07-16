@@ -77,6 +77,9 @@ pub struct DuplexRunner {
     stats: Arc<Stats>,
     pub description: String,
     pub sample_rate: u32,
+    /// Resolved device names (exact), so a settings UI can preselect them.
+    pub in_name: String,
+    pub out_name: String,
 }
 
 impl DuplexRunner {
@@ -221,6 +224,8 @@ impl DuplexRunner {
             stats,
             description,
             sample_rate: sr,
+            in_name: setup.in_name.clone(),
+            out_name: setup.out_name.clone(),
         })
     }
 

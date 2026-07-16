@@ -9,7 +9,7 @@ pub fn run(args: LatencyArgs) -> Result<()> {
         output: args.io.output.clone(),
         sample_rate: args.io.sample_rate,
         buffer: args.io.buffer_opt(),
-        in_channel: args.io.in_channel,
+        in_channel: args.io.in_channel(),
         trials: args.trials,
         interval_ms: args.interval_ms,
         amplitude: args.amplitude,

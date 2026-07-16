@@ -8,6 +8,7 @@
 //! **real** values keyed by names, so files stay meaningful to humans and
 //! robust against parameter reordering.
 
+pub mod drive_law;
 pub mod preset;
 
 /// Decibels → linear amplitude.

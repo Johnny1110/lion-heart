@@ -52,26 +52,14 @@ fn oversampled_drive_suppresses_aliasing_by_at_least_20_db() {
         .map(|s| (s * gain + 0.2).tanh() - 0.2f32.tanh())
         .collect();
 
-    // Device under test, tone wide open so the lowpass doesn't do the work.
+    // Device under test: the classic model (the same biased tanh as the
+    // naive reference), tone wide open so the lowpass doesn't do the work.
     let mut drive = Drive::new();
     drive.prepare(SR);
-    drive.set_param(
-        0,
-        lh_core::Range::Linear {
-            min: 0.0,
-            max: 40.0,
-        }
-        .to_norm(DRIVE_DB),
-    );
-    drive.set_param(1, 1.0); // tone = 8 kHz max
-    drive.set_param(
-        2,
-        lh_core::Range::Linear {
-            min: -24.0,
-            max: 6.0,
-        }
-        .to_norm(0.0),
-    );
+    drive.set_param(0, 1.0); // model = classic (last registry index)
+    drive.set_param(1, lh_core::drive_law::classic_drive_pos(DRIVE_DB) / 10.0);
+    drive.set_param(2, 1.0); // tone pos 10 = 8 kHz
+    drive.set_param(3, lh_core::drive_law::level_pos(1.0) / 10.0); // unity
     let mut processed = x.clone();
     let mut processed_r = x.clone();
     for (chunk, chunk_r) in processed.chunks_mut(256).zip(processed_r.chunks_mut(256)) {

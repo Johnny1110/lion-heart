@@ -10,7 +10,12 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 1;
+pub const PRESET_SCHEMA_VERSION: u32 = 2;
+
+/// Stepped index of the "classic" model in the drive registry. The registry
+/// lives in `lh-dsp` (which this crate cannot see); a test over there pins
+/// the two together so they cannot drift.
+pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -57,14 +62,44 @@ impl Preset {
     }
 
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let preset: Preset = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        let mut preset: Preset = serde_json::from_str(json).map_err(|e| e.to_string())?;
         if preset.schema_version > PRESET_SCHEMA_VERSION {
             return Err(format!(
                 "preset schema v{} is newer than this build understands (v{}) — update Lion-Heart",
                 preset.schema_version, PRESET_SCHEMA_VERSION
             ));
         }
+        if preset.schema_version < 2 {
+            migrate_v1_drive_knobs(&mut preset);
+            preset.schema_version = PRESET_SCHEMA_VERSION;
+        }
         Ok(preset)
+    }
+}
+
+/// v1 → v2: the drive slot's params changed from real units (dB / Hz / dB)
+/// to pedal-style knob positions 0..10, and the slot gained a stepped
+/// `model` param. v1 files predate the model registry, so they get the
+/// "classic" model and their values pass through the inverse knob laws —
+/// the audible result is unchanged. Missing params are pinned to the old
+/// defaults (the new defaults belong to a different model).
+fn migrate_v1_drive_knobs(preset: &mut Preset) {
+    use crate::{db_to_lin, drive_law};
+    const OLD_DRIVE_DB: f32 = 16.0;
+    const OLD_TONE_HZ: f32 = 3_200.0;
+    const OLD_LEVEL_DB: f32 = -6.0;
+
+    for slot in preset.chain.iter_mut().filter(|s| s.key == "drive") {
+        let drive_db = slot.params.get("drive").copied().unwrap_or(OLD_DRIVE_DB);
+        let tone_hz = slot.params.get("tone").copied().unwrap_or(OLD_TONE_HZ);
+        let level_db = slot.params.get("level").copied().unwrap_or(OLD_LEVEL_DB);
+        slot.params
+            .insert("drive".into(), drive_law::classic_drive_pos(drive_db));
+        slot.params
+            .insert("tone".into(), drive_law::classic_tone_pos(tone_hz));
+        slot.params
+            .insert("level".into(), drive_law::level_pos(db_to_lin(level_db)));
+        slot.params.insert("model".into(), CLASSIC_DRIVE_MODEL);
     }
 }
 
@@ -88,7 +123,7 @@ mod tests {
                 SlotState {
                     key: "drive".into(),
                     active: false,
-                    params: BTreeMap::from([("drive".into(), 24.0)]),
+                    params: BTreeMap::from([("model".into(), 0.0), ("drive".into(), 6.0)]),
                 },
             ],
             assets: PresetAssets {
@@ -133,5 +168,52 @@ mod tests {
         let future = r#"{"schema_version": 999, "name": "x", "chain": []}"#;
         let err = Preset::from_json(future).unwrap_err();
         assert!(err.contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn v1_drive_params_migrate_to_knob_positions() {
+        let v1 = r#"{
+            "schema_version": 1,
+            "name": "old",
+            "chain": [
+                {"key": "gate", "params": {"threshold": -50.0}},
+                {"key": "drive", "params": {"drive": 16.0, "tone": 3200.0, "level": -6.0}}
+            ]
+        }"#;
+        let p = Preset::from_json(v1).unwrap();
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
+        let drive = &p.chain[1].params;
+        assert_eq!(drive["model"], CLASSIC_DRIVE_MODEL);
+        assert!((drive["drive"] - 4.0).abs() < 1e-4, "{}", drive["drive"]);
+        assert!((drive["tone"] - 6.695).abs() < 1e-3, "{}", drive["tone"]);
+        assert!((drive["level"] - 4.217).abs() < 1e-3, "{}", drive["level"]);
+        // Untouched slots pass through as-is.
+        assert_eq!(p.chain[0].params["threshold"], -50.0);
+    }
+
+    #[test]
+    fn v1_sparse_drive_slot_pins_the_old_defaults() {
+        // A v1 file that mentions drive without params meant "old defaults"
+        // (16 dB / 3200 Hz / -6 dB) — the migration must pin those, because
+        // the v2 defaults belong to a different model.
+        let v1 = r#"{"schema_version": 1, "name": "sparse", "chain": [{"key": "drive"}]}"#;
+        let p = Preset::from_json(v1).unwrap();
+        let drive = &p.chain[0].params;
+        assert_eq!(drive["model"], CLASSIC_DRIVE_MODEL);
+        assert!((drive["drive"] - 4.0).abs() < 1e-4);
+        assert!((drive["tone"] - 6.695).abs() < 1e-3);
+        assert!((drive["level"] - 4.217).abs() < 1e-3);
+    }
+
+    #[test]
+    fn v2_drive_params_are_not_remapped() {
+        let v2 = r#"{
+            "schema_version": 2,
+            "name": "new",
+            "chain": [{"key": "drive", "params": {"model": 1.0, "drive": 7.0}}]
+        }"#;
+        let p = Preset::from_json(v2).unwrap();
+        assert_eq!(p.chain[0].params["model"], 1.0);
+        assert_eq!(p.chain[0].params["drive"], 7.0);
     }
 }

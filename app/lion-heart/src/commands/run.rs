@@ -14,7 +14,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         output: args.io.output.clone(),
         sample_rate: args.io.sample_rate,
         buffer: args.io.buffer_opt(),
-        in_channel: args.io.in_channel,
+        in_channel: args.io.in_channel(),
         gain_db: args.gain_db,
         prefill_blocks: args.prefill_blocks,
     };

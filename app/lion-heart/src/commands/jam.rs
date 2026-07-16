@@ -24,7 +24,7 @@ commands:
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
   order <slot> <slot> ...      reorder the chain (limiter stays last)
-  set <slot>.<param> <value>   e.g. `set drive.drive 24`, `set amp.gain 3`
+  set <slot>.<param> <value>   e.g. `set drive.drive 6`, `set drive.model ts9`
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -37,7 +37,7 @@ pub fn run(args: JamArgs) -> Result<()> {
         output: args.io.output.clone(),
         sample_rate: args.io.sample_rate,
         buffer: args.io.buffer_opt(),
-        in_channel: args.io.in_channel,
+        in_channel: args.io.in_channel(),
         gain_db: args.gain_db,
         prefill_blocks: args.prefill_blocks,
         // The REPL has no tuner, but keeping the tap installed means every
