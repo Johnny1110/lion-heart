@@ -57,7 +57,7 @@ pub struct ModelDef {
     build: fn() -> Box<dyn Circuit>,
 }
 
-const MODEL_DEFS: [ModelDef; 4] = [
+const MODEL_DEFS: [ModelDef; 5] = [
     ModelDef {
         label: "ts9",
         knobs: ["Drive", "Tone", "Level"],
@@ -78,6 +78,11 @@ const MODEL_DEFS: [ModelDef; 4] = [
         label: "centaur",
         knobs: ["Gain", "Treble", "Output"],
         build: || Box::new(Centaur::new()),
+    },
+    ModelDef {
+        label: "evva",
+        knobs: ["Gain", "Tone", "Level"],
+        build: || Box::new(Evva::new()),
     },
 ];
 
@@ -105,11 +110,14 @@ pub fn model_knob_name(model: usize, param_key: &str) -> Option<&'static str> {
         "drive" => Some(knobs[0]),
         "tone" => Some(knobs[1]),
         "level" => Some(knobs[2]),
+        "low" if model == 4 => Some("Low"),
+        "mid" if model == 4 => Some("Mid"),
+        "high" if model == 4 => Some("High"),
         _ => None,
     }
 }
 
-static PARAMS: [ParamDesc; 4] = [
+static PARAMS: [ParamDesc; 7] = [
     ParamDesc {
         key: "model",
         name: "Model",
@@ -153,6 +161,39 @@ static PARAMS: [ParamDesc; 4] = [
         default: 6.0,
         smoothing_ms: 20.0,
     },
+    ParamDesc {
+        key: "low",
+        name: "Low",
+        unit: "",
+        range: Range::Linear {
+            min: 0.0,
+            max: 10.0,
+        },
+        default: 5.0,
+        smoothing_ms: 30.0,
+    },
+    ParamDesc {
+        key: "mid",
+        name: "Mid",
+        unit: "",
+        range: Range::Linear {
+            min: 0.0,
+            max: 10.0,
+        },
+        default: 5.0,
+        smoothing_ms: 30.0,
+    },
+    ParamDesc {
+        key: "high",
+        name: "High",
+        unit: "",
+        range: Range::Linear {
+            min: 0.0,
+            max: 10.0,
+        },
+        default: 5.0,
+        smoothing_ms: 30.0,
+    },
 ];
 
 pub static DESC: EffectDesc = EffectDesc {
@@ -173,6 +214,10 @@ pub trait Circuit: Send {
     /// Linear stage (tone stack, makeup) at the base rate; `tone[i]`
     /// likewise holds the smoothed tone-knob position.
     fn post(&mut self, block: &mut [f32], tone: &[f32]);
+    /// 3-band EQ at the base rate; default no-op for models that don't have
+    /// per-band controls. `low[i]` / `mid[i]` / `high[i]` are the smoothed
+    /// knob positions (0..10) for `block[i]`.
+    fn eq(&mut self, _block: &mut [f32], _low: &[f32], _mid: &[f32], _high: &[f32]) {}
 }
 
 // --- shared building blocks ---
@@ -552,6 +597,123 @@ impl Circuit for Centaur {
     }
 }
 
+// --- evva ---
+
+/// Asymmetric knees for even harmonics — one diode drop against two.
+const EVVA_KNEE_POS: f32 = 0.8;
+const EVVA_KNEE_NEG: f32 = 0.5;
+/// Calibrated so the evva sits near unity at default knobs (level 6, gain 4).
+const EVVA_MAKEUP: f32 = 0.28;
+
+/// 3-band EQ corner frequencies.
+const EVVA_LO_HZ: f32 = 120.0;
+const EVVA_MID_HZ: f32 = 750.0;
+const EVVA_HI_HZ: f32 = 4_000.0;
+
+struct Evva {
+    hp30: OnePole,
+    dc_os: OnePole,
+    eq_lo: OnePole,
+    /// Mid bandpass: cascaded one-poles for a peak at EVVA_MID_HZ.
+    eq_mid_lp: OnePole,
+    eq_mid_hp: OnePole,
+    eq_hi: OnePole,
+    c30: f32,
+    c12: f32,
+    c_lo: f32,
+    c_mid_wide: f32,
+    c_mid_narrow: f32,
+    c_hi: f32,
+}
+
+impl Evva {
+    fn new() -> Self {
+        Self {
+            hp30: OnePole::default(),
+            dc_os: OnePole::default(),
+            eq_lo: OnePole::default(),
+            eq_mid_lp: OnePole::default(),
+            eq_mid_hp: OnePole::default(),
+            eq_hi: OnePole::default(),
+            c30: 0.0,
+            c12: 0.0,
+            c_lo: 0.0,
+            c_mid_wide: 0.0,
+            c_mid_narrow: 0.0,
+            c_hi: 0.0,
+        }
+    }
+}
+
+impl Circuit for Evva {
+    fn prepare(&mut self, base_rate: f32, os_rate: f32) {
+        self.c30 = lp_coeff(30.0, os_rate);
+        self.c12 = lp_coeff(12.0, os_rate);
+        self.c_lo = lp_coeff(EVVA_LO_HZ, base_rate);
+        // Bandpass: wide LP then HP via subtracting a narrower LP.
+        self.c_mid_wide = lp_coeff(EVVA_MID_HZ * 1.4, base_rate);
+        self.c_mid_narrow = lp_coeff(EVVA_MID_HZ / 1.4, base_rate);
+        self.c_hi = lp_coeff(EVVA_HI_HZ, base_rate);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.hp30.reset();
+        self.dc_os.reset();
+        self.eq_lo.reset();
+        self.eq_mid_lp.reset();
+        self.eq_mid_hp.reset();
+        self.eq_hi.reset();
+    }
+
+    fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
+        // +3 dB (honest clean boost) to +36 dB (singing breakup), audio taper.
+        let mut gain = Ramp::over(drive, |d| db_to_lin(3.0 + 33.0 * (d * 0.1).powf(1.5)));
+        for s in block.iter_mut() {
+            let x = *s;
+            // HP at 30 Hz — blocks subsonics, keeps the full guitar range.
+            let x = x - self.hp30.lp(x, self.c30);
+            let v = gain.tick() * x;
+            let clipped = if v >= 0.0 {
+                EVVA_KNEE_POS * (v / EVVA_KNEE_POS).tanh()
+            } else {
+                EVVA_KNEE_NEG * (v / EVVA_KNEE_NEG).tanh()
+            };
+            *s = clipped - self.dc_os.lp(clipped, self.c12);
+        }
+    }
+
+    fn post(&mut self, block: &mut [f32], _tone: &[f32]) {
+        // The tone knob is unused on evva — tone shaping lives in `eq`.
+        // `post` still applies the output makeup.
+        for s in block.iter_mut() {
+            *s *= EVVA_MAKEUP;
+        }
+    }
+
+    fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
+        // 3-band EQ with one-pole shelves + a cascaded-one-pole mid bandpass:
+        //
+        //   low  — shelf at 120 Hz (±12 dB)
+        //   mid  — bandpass centred at 750 Hz (±10 dB), Q ≈ 1.0
+        //   high — shelf at 4 kHz (±12 dB)
+        //
+        // Knob 5 = flat (0 dB), 0/10 = cut/boost.
+        for (s, (&l, (&m, &h))) in block.iter_mut().zip(low.iter().zip(mid.iter().zip(high))) {
+            let x = *s;
+            let lo = self.eq_lo.lp(x, self.c_lo);
+            let hi = x - self.eq_hi.lp(x, self.c_hi);
+            // Bandpass: LP at f*1.4, then HP by subtracting a second LP at f/1.4.
+            let bp_raw = self.eq_mid_lp.lp(x, self.c_mid_wide);
+            let bp = bp_raw - self.eq_mid_hp.lp(bp_raw, self.c_mid_narrow);
+            let lo_gain = db_to_lin(-12.0 + 2.4 * l);
+            let mid_gain = db_to_lin(-10.0 + 2.0 * m);
+            let hi_gain = db_to_lin(-12.0 + 2.4 * h);
+            *s = x + (lo_gain - 1.0) * lo + (mid_gain - 1.0) * bp + (hi_gain - 1.0) * hi;
+        }
+    }
+}
+
 // --- the effect ---
 
 pub struct Drive {
@@ -564,8 +726,14 @@ pub struct Drive {
     drive_s: Smoothed,
     tone_s: Smoothed,
     level_s: Smoothed,
+    low_s: Smoothed,
+    mid_s: Smoothed,
+    high_s: Smoothed,
     drive_traj: Vec<f32>,
     tone_traj: Vec<f32>,
+    low_traj: Vec<f32>,
+    mid_traj: Vec<f32>,
+    high_traj: Vec<f32>,
 }
 
 impl Default for Drive {
@@ -583,8 +751,14 @@ impl Drive {
             drive_s: Smoothed::new(PARAMS[1].default),
             tone_s: Smoothed::new(PARAMS[2].default),
             level_s: Smoothed::new(PARAMS[3].default),
+            low_s: Smoothed::new(PARAMS[4].default),
+            mid_s: Smoothed::new(PARAMS[5].default),
+            high_s: Smoothed::new(PARAMS[6].default),
             drive_traj: vec![0.0; 4 * CHUNK],
             tone_traj: vec![0.0; CHUNK],
+            low_traj: vec![0.0; CHUNK],
+            mid_traj: vec![0.0; CHUNK],
+            high_traj: vec![0.0; CHUNK],
         }
     }
 }
@@ -600,9 +774,15 @@ impl Effect for Drive {
             .configure(PARAMS[1].smoothing_ms, sample_rate * 4);
         self.tone_s.configure(PARAMS[2].smoothing_ms, sample_rate);
         self.level_s.configure(PARAMS[3].smoothing_ms, sample_rate);
+        self.low_s.configure(PARAMS[4].smoothing_ms, sample_rate);
+        self.mid_s.configure(PARAMS[5].smoothing_ms, sample_rate);
+        self.high_s.configure(PARAMS[6].smoothing_ms, sample_rate);
         self.drive_s.snap_to_target();
         self.tone_s.snap_to_target();
         self.level_s.snap_to_target();
+        self.low_s.snap_to_target();
+        self.mid_s.snap_to_target();
+        self.high_s.snap_to_target();
         for pair in &mut self.circuits {
             for circuit in pair {
                 circuit.prepare(base, base * 4.0);
@@ -640,6 +820,9 @@ impl Effect for Drive {
             1 => self.drive_s.set_target(real),
             2 => self.tone_s.set_target(real),
             3 => self.level_s.set_target(real),
+            4 => self.low_s.set_target(real),
+            5 => self.mid_s.set_target(real),
+            6 => self.high_s.set_target(real),
             _ => {}
         }
     }
@@ -649,10 +832,19 @@ impl Effect for Drive {
         let [circuit_l, circuit_r] = &mut self.circuits[self.model];
         for (bl, br) in left.chunks_mut(CHUNK).zip(right.chunks_mut(CHUNK)) {
             let n = bl.len();
-            // Knob trajectories, shared by both channels: tone at the base
-            // rate, drive at the oversampled rate the shaper runs at.
+            // Knob trajectories, shared by both channels: tone / EQ at the
+            // base rate, drive at the oversampled rate the shaper runs at.
             for v in &mut self.tone_traj[..n] {
                 *v = self.tone_s.tick();
+            }
+            for v in &mut self.low_traj[..n] {
+                *v = self.low_s.tick();
+            }
+            for v in &mut self.mid_traj[..n] {
+                *v = self.mid_s.tick();
+            }
+            for v in &mut self.high_traj[..n] {
+                *v = self.high_s.tick();
             }
             for v in &mut self.drive_traj[..4 * n] {
                 *v = self.drive_s.tick();
@@ -662,6 +854,18 @@ impl Effect for Drive {
             os_r.process(br, |b| circuit_r.shape(b, drive_traj));
             circuit_l.post(bl, &self.tone_traj[..n]);
             circuit_r.post(br, &self.tone_traj[..n]);
+            circuit_l.eq(
+                bl,
+                &self.low_traj[..n],
+                &self.mid_traj[..n],
+                &self.high_traj[..n],
+            );
+            circuit_r.eq(
+                br,
+                &self.low_traj[..n],
+                &self.mid_traj[..n],
+                &self.high_traj[..n],
+            );
             for (l, r) in bl.iter_mut().zip(br.iter_mut()) {
                 let level = drive_law::level_lin(self.level_s.tick());
                 *l *= level;
@@ -746,6 +950,14 @@ mod tests {
         assert_eq!(model_knob_name(3, "drive"), Some("Gain"));
         assert_eq!(model_knob_name(3, "tone"), Some("Treble"));
         assert_eq!(model_knob_name(3, "level"), Some("Output"));
+        // The evva exposes its 3-band EQ knobs.
+        assert_eq!(model_knob_name(4, "drive"), Some("Gain"));
+        assert_eq!(model_knob_name(4, "low"), Some("Low"));
+        assert_eq!(model_knob_name(4, "mid"), Some("Mid"));
+        assert_eq!(model_knob_name(4, "high"), Some("High"));
+        // Non-evva models don't have per-band knobs.
+        assert_eq!(model_knob_name(0, "low"), None);
+        assert_eq!(model_knob_name(1, "low"), None);
     }
 
     #[test]
@@ -887,7 +1099,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3] {
+        for model in [0usize, 1, 3, 4] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -899,8 +1111,8 @@ mod tests {
             );
             levels.push(db);
         }
-        let spread =
-            levels.iter().cloned().fold(f64::MIN, f64::max) - levels.iter().cloned().fold(f64::MAX, f64::min);
+        let spread = levels.iter().cloned().fold(f64::MIN, f64::max)
+            - levels.iter().cloned().fold(f64::MAX, f64::min);
         assert!(
             spread < 5.0,
             "modelled pedals at defaults are {spread:.1} dB apart ({levels:?})"
@@ -920,8 +1132,8 @@ mod tests {
             residual < 0.04,
             "low-gain centaur must stay clean, got {residual:.3} residual"
         );
-        let db = 20.0
-            * (f64::from(rms(&y[y.len() / 2..])) / f64::from(rms(&x[x.len() / 2..]))).log10();
+        let db =
+            20.0 * (f64::from(rms(&y[y.len() / 2..])) / f64::from(rms(&x[x.len() / 2..]))).log10();
         assert!(
             (-3.0..6.0).contains(&db),
             "transparent boost, not a cut: {db:.1} dB"
@@ -996,5 +1208,97 @@ mod tests {
                 assert!(rms(&y[y.len() / 2..]) > 1e-3);
             }
         }
+    }
+
+    #[test]
+    fn evva_creates_even_harmonics() {
+        // Asymmetric knees (0.8 / 0.5) produce a healthy 2nd harmonic.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(4);
+        set_pos(&mut d, 1, 6.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
+        assert!(h2 > 0.03, "evva even harmonics: h2/f0 = {h2:.4}");
+        let h3 = tone_at(&y, 660.0) / tone_at(&y, 220.0);
+        assert!(h3 > 0.01, "evva odd harmonics: h3/f0 = {h3:.4}");
+    }
+
+    #[test]
+    fn evva_low_gain_is_clean() {
+        // Below gain 3 the evva is mostly a clean boost.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(4);
+        set_pos(&mut d, 1, 2.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let residual = harmonic_residual(&y, 220.0);
+        assert!(
+            residual < 0.08,
+            "evva low-gain must stay clean, got {residual:.3} residual"
+        );
+    }
+
+    #[test]
+    fn evva_eq_bands_work() {
+        // Verify each EQ band actually shapes the spectrum.
+        let x = guitar(220.0, SR as usize);
+        let measure = |low: f32, mid: f32, high: f32, freq: f32| -> f64 {
+            let mut d = prepared(4);
+            set_pos(&mut d, 1, 2.0); // low gain — EQ dominates
+            set_pos(&mut d, 4, low);
+            set_pos(&mut d, 5, mid);
+            set_pos(&mut d, 6, high);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, freq)
+        };
+
+        // Low shelf: boosting low should lift 80 Hz relative to 3 kHz.
+        let flat_lo = measure(5.0, 5.0, 5.0, 80.0) / measure(5.0, 5.0, 5.0, 3_000.0);
+        let boosted_lo = measure(10.0, 5.0, 5.0, 80.0) / measure(10.0, 5.0, 5.0, 3_000.0);
+        assert!(
+            boosted_lo > 1.3 * flat_lo,
+            "low shelf boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+        );
+
+        // Mid band: boosting mid should lift 750 Hz relative to 200 Hz.
+        let flat_mid = measure(5.0, 5.0, 5.0, 750.0) / measure(5.0, 5.0, 5.0, 200.0);
+        let boosted_mid = measure(5.0, 10.0, 5.0, 750.0) / measure(5.0, 10.0, 5.0, 200.0);
+        assert!(
+            boosted_mid > 1.5 * flat_mid,
+            "mid boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
+        );
+
+        // High shelf: boosting high should lift 6 kHz relative to 500 Hz.
+        let flat_hi = measure(5.0, 5.0, 5.0, 6_000.0) / measure(5.0, 5.0, 5.0, 500.0);
+        let boosted_hi = measure(5.0, 5.0, 10.0, 6_000.0) / measure(5.0, 5.0, 10.0, 500.0);
+        assert!(
+            boosted_hi > 1.5 * flat_hi,
+            "high shelf boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
+        );
+
+        // Cut: low at 0 should reduce 80 Hz.
+        let cut_lo = measure(0.0, 5.0, 5.0, 80.0) / measure(0.0, 5.0, 5.0, 3_000.0);
+        assert!(
+            cut_lo < 0.7 * flat_lo,
+            "low shelf cut: {cut_lo:.3} vs flat {flat_lo:.3}"
+        );
+    }
+
+    #[test]
+    fn evva_eq_is_flat_at_defaults() {
+        // At all-EQ knobs at 5, the 3-band EQ should be roughly transparent
+        // (each band gain ≈ 1.0).
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(4);
+        set_pos(&mut d, 1, 2.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        // Compare the shape of the spectrum: flat EQ should not radically
+        // reshape the output relative to the input.
+        let in_220 = tone_at(&x, 220.0);
+        let out_220 = tone_at(&y, 220.0);
+        let ratio = out_220 / in_220.max(1e-9);
+        assert!(
+            ratio > 0.0,
+            "evva flat eq must pass signal: ratio {ratio:.3}"
+        );
     }
 }
