@@ -14,16 +14,24 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M3 (chain & memory) — code landed.** On top of M2: the chain **reorders at runtime**
-(`EngineMsg::SetOrder`; the engine rides a ~4 ms master fade through silence before
-switching — the only true topology change, so params/bypass stay pure morphs);
-`lh-core::preset` is the versioned JSON schema (real values keyed by names, unknown
-keys skipped with warnings, newer schema rejected); assets are referenced by
-**path + SHA-256** with same-name relocation via the preset directory
-(`lh_assets::{hash_file, resolve_asset}`); `jam` gained `save` / `load preset` /
-`presets` / `order`, persists `~/.lion-heart/{config.json, presets/}`, and auto-loads
-the last preset on start (`--preset` overrides). The NAM test fixture in
-`crates/lh-nam/tests/fixtures/` is vendored from nam-rs/NAM Core (MIT — see its README).
+**M4 (the face) — spike done, product UI next.** The white-paper §5.5 GUI spike is
+complete: the same screen (custom rotary knob on the live chain + realtime meters at
+60 fps) built in both iced 0.14 and vizia 0.4 under `spikes/` (a **separate cargo
+workspace**, excluded from the root so GUI deps never touch engine builds/CI).
+**Decision: iced** — see `docs/adr/001-gui-framework.md` (vizia lost on the skia-safe
+C++ dependency, deprecated-OpenGL macOS backend, and its 0.4 state-system rewrite).
+Pending user check on the Mac: run both spikes (`cd spikes && cargo run -p spike-iced
+--release`), confirm 60 fps and feel; then the product UI gets built with iced in
+`app/lion-heart` (chain view, knobs, NAM/IR/preset browsers, meters, tuner). The
+engine↔UI pattern from the spike carries over: UI owns `ChainHandle`/asset handles,
+mutates in `update()`, polls `Telemetry` via `window::frames()`.
+
+M3 recap: runtime chain reorder rides a ~4 ms master fade through silence
+(`EngineMsg::SetOrder`); `lh-core::preset` is the versioned JSON schema; assets are
+referenced by **path + SHA-256** with same-name relocation
+(`lh_assets::{hash_file, resolve_asset}`); `jam` persists
+`~/.lion-heart/{config.json, presets/}` and auto-loads the last preset. The NAM test
+fixture in `crates/lh-nam/tests/fixtures/` is vendored from nam-rs/NAM Core (MIT).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
@@ -51,7 +59,11 @@ cargo run -p lion-heart --release -- jam       # pedalboard + control REPL
 cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable)
 ```
 
-CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu.
+The GUI spike workspace has its own gates (run from `spikes/`):
+`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
+
+CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
+(root workspace only; `spikes/` is excluded).
 
 ## Workspace layout
 

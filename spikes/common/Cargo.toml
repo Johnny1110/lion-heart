@@ -1,0 +1,11 @@
+[package]
+name = "spike-common"
+description = "Shared engine driver for the M4 GUI framework spike"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lh-core.workspace = true
+lh-dsp.workspace = true
+lh-engine.workspace = true

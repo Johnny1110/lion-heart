@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["common", "iced", "vizia"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+spike-common = { path = "common" }
+lh-core = { path = "../crates/lh-core" }
+lh-dsp = { path = "../crates/lh-dsp" }
+lh-engine = { path = "../crates/lh-engine" }
+
+[profile.release]
+lto = "thin"

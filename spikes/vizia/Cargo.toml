@@ -1,0 +1,11 @@
+[package]
+name = "spike-vizia"
+description = "M4 GUI spike: knob + realtime meter in vizia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+lh-core.workspace = true
+vizia = "0.4"

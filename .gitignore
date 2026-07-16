@@ -1,5 +1,6 @@
 # Rust
 /target/
+/spikes/target/
 Cargo.lock.orig
 
 # macOS

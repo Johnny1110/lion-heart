@@ -9,6 +9,9 @@ members = [
     "crates/lh-io",
     "app/lion-heart",
 ]
+# The M4 GUI spike is its own workspace: its heavy GUI dependency trees
+# (wgpu, skia) must never leak into the engine build or CI gates.
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.0.1"

@@ -1,0 +1,11 @@
+[package]
+name = "spike-iced"
+description = "M4 GUI spike: knob + realtime meter in iced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+spike-common.workspace = true
+lh-core.workspace = true
+iced = { version = "0.14", features = ["canvas"] }

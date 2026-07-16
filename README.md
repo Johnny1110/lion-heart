@@ -4,13 +4,14 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M3 — chain & memory (pre-alpha).** The full tone chain — gate → drive →
+> **Status: M4 — the face (pre-alpha).** The full tone chain — gate → drive →
 > **NAM amp** → **cab IR** → delay → safety limiter — runs in real time, is
-> **reorderable on the fly** (the switch rides a short fade through silence), and
-> **saves/restores as JSON presets** with content-hashed asset references. The last
-> preset auto-loads on start. The audio thread stays allocation-free (enforced by
-> `assert_no_alloc` in debug builds). Full technical plan:
-> [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
+> **reorderable on the fly**, and **saves/restores as JSON presets** with
+> content-hashed asset references. The GUI framework spike is done:
+> **iced beat vizia** ([ADR 001](docs/adr/001-gui-framework.md), spike code in
+> [`spikes/`](spikes/)); the first product UI is next. The audio thread stays
+> allocation-free (enforced by `assert_no_alloc` in debug builds). Full technical
+> plan: [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
 
 ## Why
 
@@ -50,7 +51,7 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 | Audio I/O             | [cpal](https://github.com/RustAudio/cpal) (CoreAudio backend) | escape hatch: `coreaudio-rs` for macOS-specific control         |
 | NAM inference         | [nam-rs](https://lib.rs/crates/nam-rs)                        | pure-Rust, RT-safe; fallback: FFI to NeuralAmpModelerCore (C++) |
 | IR convolution        | [fft-convolver](https://github.com/neodsp/fft-convolver)      | uniform-partitioned FFT, zero latency, RT-safe                  |
-| GUI                   | [iced](https://iced.rs) (primary candidate) / [vizia](https://github.com/vizia/vizia) | decided by a spike in M4; `egui` allowed for internal dev tools |
+| GUI                   | [iced](https://iced.rs)                                       | chosen over vizia by the M4 spike ([ADR 001](docs/adr/001-gui-framework.md)); `egui` allowed for internal dev tools |
 | Plugin export (later) | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (note: VST3 builds are GPLv3)                       |
 | MIDI (later)          | midir / coremidi                                              | foot controller: program change, CC, expression                 |
 
@@ -88,6 +89,7 @@ crates/
   lh-assets    # worker-side loading: .nam, IR wav, convolver building
 app/
   lion-heart   # the standalone GUI application
+spikes/        # M4 GUI framework spike (separate workspace, excluded from CI)
 docs/
   white-paper.md   # the plan (zh-TW) — authoritative
   adr/             # decision records for deltas against the white paper
