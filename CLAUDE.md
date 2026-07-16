@@ -14,32 +14,32 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M5 (full pedalboard) — code landed.** The chain is now ten slots:
-**gate → comp → drive → amp → eq → mod → delay → reverb → cab → limiter**
-(`MAX_SLOTS` raised to 12). New hand-written DSP in `lh-dsp`:
+**M6 (on stage) — code landed.** MIDI foot control + live view + 32-frame headroom:
 
-- `comp` — feed-forward peak compressor (threshold/ratio/attack/release/makeup),
-  static-curve verified against the ratio math.
-- `eq` — low shelf 120 Hz / sweepable mid peak / high shelf 3.2 kHz on shared RBJ
-  `biquad` sections; smoothed params, coefficients rebuilt once per block.
-- `mod` — one pedal, four voices via the new **`Range::Stepped { labels }`** param
-  (chorus / flanger / phaser / tremolo): swept delay line, 4-stage swept allpass,
-  amplitude LFO. `set mod.type flanger` works by label in the REPL; UIs show labels.
-- `reverb` — 8-line FDN, Householder feedback (O(N)), per-line damping, T60-exact
-  decay gains, predelay + 2 diffusion allpasses. **Mono for now — ADR 002** records
-  the stereo deferral (target: with/after M6, before the M7 plugin bus).
+- `lh-midi` (new crate): PC/CC parsing and a JSON mapping
+  (`~/.lion-heart/midi.json`: `input` port, `channel` filter, `pc_presets` names,
+  `cc` → `"slot.param"` or bare `"slot"` for bypass). Zero-config default: connect
+  the first input port, **PC n loads the n-th preset (sorted)**. midir events are
+  forwarded over `mpsc` to the control thread — the engine queue stays SPSC; MIDI
+  never touches the audio thread. Connection failure is never fatal.
+- Session drains MIDI in the control loop (`drain_midi()` → applied-action lines);
+  jam prints them, the GUI shows them in the status line and re-syncs its state.
+  `--midi <port>` overrides on both; `lion-heart devices` lists MIDI inputs too.
+- GUI **live view** ("live" chip): big preset name, prev/next preset buttons, big
+  meters, mini tuner readout, chain summary — stage mode.
+- 32-frame target verified: the 8-pedal hand-written chain is ~4 µs per 32-frame
+  block (0.6 % of the 667 µs deadline, linear scaling — see `docs/benchmarks.md`),
+  null-device run at `--buffer 32` clean under assert_no_alloc.
 
-Old 6-slot presets load forward-compatibly; unmentioned slots default and the
-session moves the limiter back to the end (it must always run last).
+M5 recap: ten-slot chain gate→comp→drive→amp→eq→mod→delay→reverb→cab→limiter;
+`Range::Stepped { labels }` for the mod-type param (labels work in REPL/UI);
+8-line Householder FDN reverb, **mono — ADR 002** defers stereo to the M7 bus.
+Old presets load forward-compatibly; the limiter is always moved back to last.
 
-M4 recap: no subcommand opens the iced GUI (ADR 001) — chain strip, canvas knobs,
-NAM/IR/preset browsers, header meters, YIN tuner (`lh_dsp::tuner`) fed via
-`Chain::set_input_tap`; `app/.../session.rs` is shared by GUI and jam REPL; UI
-rides `window::frames()` and never blocks the audio thread.
-
-Pending user verification on the Mac: play through all new pedals by ear (sweep
-params, switch mod types, preset A/B), GUI 60 fps + stable xruns, tuner
-sanity-check, RTL numbers into `docs/latency.md`.
+Pending user verification on the Mac: foot controller end-to-end (PC preset
+switch, CC expression → param, CC bypass), live view at stage distance,
+`--buffer 32` xruns on real hardware, plus the standing items (M5 pedals by ear,
+tuner sanity, RTL numbers into `docs/latency.md`).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
@@ -83,6 +83,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |
+| `lh-midi`        | MIDI foot control: PC/CC parsing, mapping, midir input            | —             |
 | `lh-assets`      | IR WAV loading: decode, sinc-resample, normalize, build convolver | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
 

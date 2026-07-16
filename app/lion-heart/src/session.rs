@@ -50,6 +50,16 @@ pub struct SessionOpts {
     pub prefill_blocks: u32,
     /// Install the raw-input tap for the tuner (GUI).
     pub tuner_tap: bool,
+    /// MIDI input port override (name substring or index); `None` follows
+    /// `midi.json` / first available port.
+    pub midi_port: Option<String>,
+}
+
+/// A live MIDI input: the connection, its event stream, and the mapping.
+struct MidiRuntime {
+    _conn: lh_midi::MidiConnection,
+    rx: std::sync::mpsc::Receiver<lh_midi::MidiEvent>,
+    map: lh_midi::MidiMap,
 }
 
 /// A running pedalboard: audio streams live, handles on this side.
@@ -63,6 +73,9 @@ pub struct Session {
     pub config: AppConfig,
     runner: DuplexRunner,
     tuner_tap: Option<rtrb::Consumer<f32>>,
+    midi: Option<MidiRuntime>,
+    /// Human-readable MIDI connection state for status lines.
+    pub midi_status: String,
 }
 
 impl Session {
@@ -108,6 +121,8 @@ impl Session {
             Box::new(move |block: &mut [f32]| chain.process(block))
         })?;
 
+        let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());
+
         Ok(Self {
             chain: chain_handle,
             nam: nam_handle,
@@ -118,6 +133,8 @@ impl Session {
             config: load_config(),
             runner,
             tuner_tap,
+            midi,
+            midi_status,
         })
     }
 
@@ -139,6 +156,73 @@ impl Session {
     pub fn collect_garbage(&mut self) {
         self.nam.collect_garbage();
         self.cab.collect_garbage();
+    }
+
+    /// Apply everything the foot controller sent since the last call.
+    /// Returns user-facing lines describing what happened.
+    pub fn drain_midi(&mut self) -> Vec<String> {
+        let Some(midi) = &self.midi else {
+            return Vec::new();
+        };
+        let events: Vec<lh_midi::MidiEvent> = midi.rx.try_iter().collect();
+        let actions: Vec<lh_midi::Action> = events
+            .iter()
+            .filter_map(|e| midi.map.action_for(e))
+            .collect();
+
+        let mut lines = Vec::new();
+        for action in actions {
+            match action {
+                lh_midi::Action::LoadPreset(name) => match self.load_preset(&name) {
+                    Ok(mut msgs) => lines.append(&mut msgs),
+                    Err(e) => lines.push(format!("midi: preset {name:?}: {e}")),
+                },
+                lh_midi::Action::LoadPresetIndex(index) => {
+                    match list_presets().get(index as usize) {
+                        Some(name) => {
+                            let name = name.clone();
+                            match self.load_preset(&name) {
+                                Ok(mut msgs) => lines.append(&mut msgs),
+                                Err(e) => lines.push(format!("midi: preset {name:?}: {e}")),
+                            }
+                        }
+                        None => lines.push(format!("midi: no preset at PC {index}")),
+                    }
+                }
+                lh_midi::Action::SetParam { slot, param, norm } => {
+                    let real = self
+                        .chain
+                        .descriptors()
+                        .iter()
+                        .find(|d| d.key == slot)
+                        .and_then(|d| d.params.iter().find(|p| p.key == param))
+                        .map(|p| (p.range.to_real(norm), p.range.label(p.range.to_real(norm))));
+                    match real {
+                        Some((real, label)) => match self.chain.set_param(&slot, &param, real) {
+                            Ok(applied) => lines.push(match label {
+                                Some(label) => format!("midi: {slot}.{param} = {label}"),
+                                None => format!(
+                                    "midi: {slot}.{param} = {:.2} {}",
+                                    applied.real, applied.unit
+                                ),
+                            }),
+                            Err(e) => lines.push(format!("midi: {e}")),
+                        },
+                        None => lines.push(format!("midi: unknown target {slot}.{param}")),
+                    }
+                }
+                lh_midi::Action::SetActive { slot, active } => {
+                    match self.chain.set_active(&slot, active) {
+                        Ok(()) => lines.push(format!(
+                            "midi: {slot} {}",
+                            if active { "on" } else { "off" }
+                        )),
+                        Err(e) => lines.push(format!("midi: {e}")),
+                    }
+                }
+            }
+        }
+        lines
     }
 
     /// Preset to load on startup: explicit override, else the last one used.
@@ -376,6 +460,53 @@ pub fn valid_preset_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Read `~/.lion-heart/midi.json` (defaults when absent, warning on bad JSON).
+fn load_midi_map() -> (lh_midi::MidiMap, Option<String>) {
+    let Some(path) = app_dir().map(|d| d.join("midi.json")) else {
+        return (lh_midi::MidiMap::default(), None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(json) => match lh_midi::MidiMap::from_json(&json) {
+            Ok(map) => (map, None),
+            Err(e) => (
+                lh_midi::MidiMap::default(),
+                Some(format!("{}: {e}", path.display())),
+            ),
+        },
+        Err(_) => (lh_midi::MidiMap::default(), None),
+    }
+}
+
+/// Try to bring up MIDI: never fatal — a pedalboard without a foot
+/// controller must still start. Zero config connects the first port; PC `n`
+/// then loads the n-th preset.
+fn connect_midi(override_port: Option<&str>) -> (Option<MidiRuntime>, String) {
+    let (map, warning) = load_midi_map();
+    let selector = override_port
+        .map(str::to_string)
+        .or_else(|| map.input.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = lh_midi::connect(selector.as_deref(), tx);
+    let with_warning = |status: String| match &warning {
+        Some(w) => format!("{status} — warning: {w}"),
+        None => status,
+    };
+    match result {
+        Ok(conn) => {
+            let status = with_warning(format!("midi: {}", conn.port_name));
+            (
+                Some(MidiRuntime {
+                    _conn: conn,
+                    rx,
+                    map,
+                }),
+                status,
+            )
+        }
+        Err(e) => (None, with_warning(format!("midi: none ({e})"))),
+    }
 }
 
 fn load_config() -> AppConfig {

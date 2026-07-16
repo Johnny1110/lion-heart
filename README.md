@@ -4,14 +4,15 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M5 — full pedalboard (pre-alpha).** The chain is now the complete
-> rig: gate → **compressor** → drive → **NAM amp** → **EQ** → **modulation**
-> (chorus / flanger / phaser / tremolo) → delay → **reverb (8-line FDN)** →
-> **cab IR** → safety limiter, all hand-written DSP, reorderable in real time,
-> persisted as JSON presets. The **GUI** (iced,
-> [ADR 001](docs/adr/001-gui-framework.md)) has a chain view, rotary knobs,
-> NAM/IR/preset browsers, live meters, and a built-in **tuner** (YIN pitch
-> detection). Stereo arrives with the plugin bus
+> **Status: M6 — on stage (pre-alpha).** The full rig — gate → compressor →
+> drive → **NAM amp** → EQ → modulation → delay → **reverb (FDN)** → **cab IR**
+> → safety limiter — now takes **MIDI foot control**: program changes switch
+> presets (zero config), CCs map to any parameter or bypass via
+> `~/.lion-heart/midi.json`, expression pedals ride knobs live. The **GUI**
+> (iced, [ADR 001](docs/adr/001-gui-framework.md)) gained a **live view** for
+> stage use next to the chain view, knobs, browsers, meters, and tuner. The
+> hand-written chain holds ~0.6 % of the deadline at **32-frame buffers**.
+> Stereo arrives with the plugin bus
 > ([ADR 002](docs/adr/002-mono-chain-through-m5.md)). The audio thread stays
 > allocation-free (enforced by `assert_no_alloc` in debug builds). Full technical
 > plan: [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
@@ -30,7 +31,8 @@ Plug your guitar into an audio interface, shape your tone in software — noise 
 - **Utilities** — tuner, input/output metering, output limiter (speaker & ear safety)
 - **Chain** — reorderable signal chain, per-slot bypass, glitch-free preset switching
 - **Presets** — versioned JSON, referencing NAM/IR assets by path + content hash
-- **Later** — MIDI foot control (program change / CC / expression), CLAP + VST3 plugin builds
+- **MIDI foot control** — program change → presets, CC → any param / bypass, expression pedals
+- **Later** — CLAP + VST3 plugin builds
 
 ## Signal path
 
@@ -70,7 +72,7 @@ Milestones are **completion units, not dates** (this is a burst-driven side proj
 | M3 ✅     | Chain & memory   | Reorder/bypass chain; JSON presets; click-free preset switching             |
 | M4 ✅     | The face         | Product-grade GUI (iced-vs-vizia spike first); tuner; metering              |
 | M5 ✅     | Full pedalboard  | Modulation family, reverb (FDN), compressor, EQ                             |
-| M6        | On stage         | MIDI foot control; live view; 32-sample-buffer performance hardening        |
+| M6 ✅     | On stage         | MIDI foot control; live view; 32-sample-buffer performance hardening        |
 | M7        | Plugin & release | CLAP/VST3 via nih-plug; codesign + notarization; CI releases; v0.1          |
 | M8+       | Deep water       | WDF circuit modeling research, convolution reverb, Windows/Linux ports      |
 
@@ -89,6 +91,7 @@ crates/
   lh-engine    # RT graph runner, node lifecycle, lock-free plumbing
   lh-nam       # AmpModel trait + nam-rs integration
   lh-io        # cpal device management, latency measurement
+  lh-midi      # MIDI foot control: PC/CC parsing, mapping, midir input
   lh-assets    # worker-side loading: .nam, IR wav, convolver building
 app/
   lion-heart   # the standalone GUI application
@@ -133,6 +136,14 @@ cargo run -p lion-heart --release -- jam --buffer 64
 
 # measure round-trip latency (needs a loopback cable: interface out → in)
 cargo run -p lion-heart --release -- latency --buffer 64 --markdown
+
+# MIDI foot control: zero config — first input port connects automatically,
+# program change n loads the n-th preset. Customize ~/.lion-heart/midi.json:
+#   { "input": "FCB1010", "channel": 1,
+#     "pc_presets": ["lead", "rhythm"],
+#     "cc": { "11": "drive.level", "80": "gate", "81": "mod.type" } }
+# ("slot.param" rides a knob from the CC value; a bare "slot" toggles bypass
+#  at CC ≥ 64. `lion-heart devices` lists MIDI inputs; --midi overrides.)
 
 # per-block DSP cost (criterion)
 cargo bench -p lh-dsp --bench effects

@@ -70,6 +70,7 @@ pub enum Message {
     UnloadAsset(AssetKind),
     TogglePresets,
     ToggleTuner,
+    ToggleLive,
     PresetNameChanged(String),
     SavePreset,
     LoadPreset(String),
@@ -80,6 +81,8 @@ enum Overlay {
     Tuner,
     Presets,
     Browser(Browser),
+    /// Stage mode: big preset name, prev/next, big meters.
+    Live,
 }
 
 /// One chain slot as the UI sees it, rebuilt from the engine snapshot.
@@ -121,6 +124,7 @@ struct Running {
     frame_secs: f32,
     knob_caches: Vec<canvas::Cache>,
     meter_cache: canvas::Cache,
+    live_meter_cache: canvas::Cache,
     tuner_cache: canvas::Cache,
 }
 
@@ -135,12 +139,13 @@ impl App {
             gain_db: args.gain_db,
             prefill_blocks: args.prefill_blocks,
             tuner_tap: true,
+            midi_port: args.midi.clone(),
         }) {
             Ok(session) => session,
             Err(e) => return App::Failed(e.to_string()),
         };
 
-        let mut status = session.description().to_string();
+        let mut status = format!("{} · {}", session.description(), session.midi_status);
         if let Some(name) = session.initial_preset(args.preset.clone()) {
             match session.load_preset(&name) {
                 Ok(lines) => {
@@ -174,6 +179,7 @@ impl App {
             frame_secs: 1.0 / 60.0,
             knob_caches: (0..MAX_KNOBS).map(|_| canvas::Cache::new()).collect(),
             meter_cache: canvas::Cache::new(),
+            live_meter_cache: canvas::Cache::new(),
             tuner_cache: canvas::Cache::new(),
         };
         running.refresh_slots();
@@ -372,6 +378,18 @@ impl Running {
                     }
                 };
             }
+            Message::ToggleLive => {
+                self.overlay = match self.overlay {
+                    Overlay::Live => Overlay::None,
+                    _ => {
+                        // The mini tuner readout runs in live mode too.
+                        self.drain_tap();
+                        self.tuner.reset();
+                        self.reading = None;
+                        Overlay::Live
+                    }
+                };
+            }
             Message::PresetNameChanged(name) => self.preset_name = name,
             Message::SavePreset => {
                 let name = self.preset_name.trim().to_string();
@@ -411,13 +429,27 @@ impl Running {
             self.session.collect_garbage();
         }
 
+        // Foot controller: apply queued MIDI and mirror the result in the UI.
+        let midi_lines = self.session.drain_midi();
+        if !midi_lines.is_empty() {
+            self.status = midi_lines.last().cloned().unwrap_or_default();
+            self.refresh_slots();
+            if self.session.config.last_preset != self.active_preset {
+                self.active_preset = self.session.config.last_preset.clone();
+                if let Some(name) = &self.active_preset {
+                    self.preset_name = name.clone();
+                }
+            }
+        }
+
         let telemetry = self.session.chain.telemetry();
         self.ballistics
             .tick(telemetry.peak_in(), telemetry.peak_out());
         self.meter_cache.clear();
+        self.live_meter_cache.clear();
 
         self.drain_tap();
-        if matches!(self.overlay, Overlay::Tuner) {
+        if matches!(self.overlay, Overlay::Tuner | Overlay::Live) {
             if self.frame_count.is_multiple_of(TUNER_FRAMES) {
                 if let Some(est) = self.tuner.estimate() {
                     self.reading = Some((
@@ -508,6 +540,9 @@ impl Running {
             button(text("tuner").size(13))
                 .on_press(Message::ToggleTuner)
                 .style(theme::chip(matches!(self.overlay, Overlay::Tuner))),
+            button(text("live").size(13))
+                .on_press(Message::ToggleLive)
+                .style(theme::chip(matches!(self.overlay, Overlay::Live))),
             space().width(Length::Fill),
             Canvas::new(Meters {
                 norms: self.ballistics.norms(),
@@ -564,8 +599,68 @@ impl Running {
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
+            Overlay::Live => self.live_view(),
             Overlay::None => self.params_panel(),
         }
+    }
+
+    /// Stage mode: what you need mid-song, readable from a meter away.
+    fn live_view(&self) -> Element<'_, Message> {
+        let preset = self.active_preset.clone().unwrap_or_else(|| "—".into());
+        let neighbor = |step: isize| -> Option<String> {
+            let current = self.active_preset.as_deref()?;
+            let pos = self.presets.iter().position(|p| p == current)? as isize;
+            let next = pos + step;
+            (next >= 0 && (next as usize) < self.presets.len())
+                .then(|| self.presets[next as usize].clone())
+        };
+        let big_button = |label: &'static str, msg: Option<Message>| {
+            button(text(label).size(26))
+                .padding([14, 30])
+                .on_press_maybe(msg)
+                .style(theme::action)
+        };
+
+        let tuner_line = match &self.reading {
+            Some((r, _)) => format!("{}{}  {:+.0}¢", r.note, r.octave, r.cents),
+            None => String::new(),
+        };
+        let chain_line = self
+            .slots
+            .iter()
+            .map(|s| {
+                if s.active {
+                    s.name.to_string()
+                } else {
+                    format!("({})", s.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" → ");
+
+        container(
+            column![
+                text(preset).size(54).color(theme::ACCENT),
+                row![
+                    big_button("◀ prev", neighbor(-1).map(Message::LoadPreset)),
+                    big_button("next ▶", neighbor(1).map(Message::LoadPreset)),
+                ]
+                .spacing(24),
+                Canvas::new(Meters {
+                    norms: self.ballistics.norms(),
+                    cache: &self.live_meter_cache,
+                })
+                .width(Length::Fixed(420.0))
+                .height(70),
+                text(tuner_line).size(22).color(theme::METER_OK),
+                text(chain_line).size(13).color(theme::TEXT_DIM),
+            ]
+            .spacing(22)
+            .align_x(iced::Alignment::Center),
+        )
+        .center(Length::Fill)
+        .style(theme::panel)
+        .into()
     }
 
     fn params_panel(&self) -> Element<'_, Message> {

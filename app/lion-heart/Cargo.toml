@@ -13,6 +13,7 @@ lh-engine.workspace = true
 lh-nam.workspace = true
 lh-assets.workspace = true
 lh-io.workspace = true
+lh-midi.workspace = true
 rtrb.workspace = true
 iced.workspace = true
 assert_no_alloc.workspace = true

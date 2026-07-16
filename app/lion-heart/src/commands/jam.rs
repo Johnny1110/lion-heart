@@ -44,9 +44,11 @@ pub fn run(args: JamArgs) -> Result<()> {
         // jam run (incl. the null-device smoke test under assert_no_alloc)
         // exercises the tap's real-time path.
         tuner_tap: true,
+        midi_port: args.midi.clone(),
     })?;
 
-    println!("{}\n", session.description());
+    println!("{}", session.description());
+    println!("{}\n", session.midi_status);
 
     if let Some(name) = session.initial_preset(args.preset.clone()) {
         println!("loading preset {name:?}…");
@@ -84,6 +86,9 @@ pub fn run(args: JamArgs) -> Result<()> {
             break;
         }
         session.collect_garbage();
+        for line in session.drain_midi() {
+            println!("  {line}");
+        }
 
         match line_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(line) => {

@@ -1,0 +1,13 @@
+[package]
+name = "lh-midi"
+description = "MIDI foot control: message parsing, mapping, midir input connection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+midir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

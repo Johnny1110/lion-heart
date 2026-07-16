@@ -129,5 +129,47 @@ fn bench_effects(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_effects);
+/// The full hand-written M5 pedalboard (everything but NAM) at the live
+/// 64-frame format and the M6 stage target of 32 frames, where per-block
+/// overhead weighs double.
+fn bench_full_chain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("full_chain_no_nam");
+    for block in [64usize, 32] {
+        let mut gate = NoiseGate::new();
+        let mut comp = Compressor::new();
+        let mut drive = Drive::new();
+        let mut eq = Eq::new();
+        let mut modulation = Modulation::new();
+        let mut delay = Delay::new();
+        let mut reverb = Reverb::new();
+        let mut limiter = lh_dsp::limiter::Limiter::new();
+        let effects: [&mut dyn Effect; 8] = [
+            &mut gate,
+            &mut comp,
+            &mut drive,
+            &mut eq,
+            &mut modulation,
+            &mut delay,
+            &mut reverb,
+            &mut limiter,
+        ];
+        let mut effects = effects;
+        for effect in effects.iter_mut() {
+            effect.prepare(SR);
+        }
+        let signal = lh_dsp::testutil::sine(SR, 220.0, block);
+        let mut buf = signal.clone();
+        group.bench_function(format!("block{block}"), |b| {
+            b.iter(|| {
+                buf.copy_from_slice(&signal);
+                for effect in effects.iter_mut() {
+                    effect.process(black_box(&mut buf));
+                }
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_effects, bench_full_chain);
 criterion_main!(benches);

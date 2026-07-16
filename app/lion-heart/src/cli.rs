@@ -35,6 +35,9 @@ pub struct GuiArgs {
     /// Preset to load on start (default: the last one used)
     #[arg(long)]
     pub preset: Option<String>,
+    /// MIDI input port (index or name substring; default: midi.json / first port)
+    #[arg(long)]
+    pub midi: Option<String>,
     /// Output gain in dB (applied with a 100 ms soft-start ramp)
     #[arg(long, default_value_t = 0.0)]
     pub gain_db: f32,
@@ -90,6 +93,9 @@ pub struct JamArgs {
     /// Preset to load on start (default: the last one used)
     #[arg(long)]
     pub preset: Option<String>,
+    /// MIDI input port (index or name substring; default: midi.json / first port)
+    #[arg(long)]
+    pub midi: Option<String>,
     /// Output gain in dB (applied with a 100 ms soft-start ramp)
     #[arg(long, default_value_t = 0.0)]
     pub gain_db: f32,

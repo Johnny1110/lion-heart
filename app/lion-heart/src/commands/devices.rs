@@ -35,5 +35,16 @@ pub fn run() -> Result<()> {
             }
         }
     }
+
+    println!("\nMIDI inputs:");
+    match lh_midi::list_inputs() {
+        Ok(ports) if ports.is_empty() => println!("  (none)"),
+        Ok(ports) => {
+            for (index, name) in ports.iter().enumerate() {
+                println!("  [{index}] {name}");
+            }
+        }
+        Err(e) => println!("  unavailable: {e}"),
+    }
     Ok(())
 }
