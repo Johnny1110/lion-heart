@@ -1,6 +1,9 @@
 # ADR 002: Mono chain through M5 — stereo deferred
 
-Status: **accepted**
+Status: **accepted — implemented at M7** (the stereo bus landed as M7's first
+step, exactly along the lines sketched below: FDN reverb grew a second
+decorrelated tap mix, modulation a per-channel LFO offset; dynamics went
+linked, drive/EQ dual-state, NAM mono-sums its input)
 Date: 2026-07-16
 Relates to: white paper §4 (DSP conventions), milestone M5
 

@@ -23,10 +23,12 @@ fn bench_amp(c: &mut Criterion) {
 
     let signal = lh_dsp::testutil::sine(SR, 220.0, BLOCK);
     let mut buf = signal.clone();
+    let mut buf_r = signal.clone();
     c.bench_function("block64_48k/nam_reference_wavenet", |b| {
         b.iter(|| {
             buf.copy_from_slice(&signal);
-            amp.process(black_box(&mut buf));
+            buf_r.copy_from_slice(&signal);
+            amp.process(black_box(&mut buf), black_box(&mut buf_r));
         })
     });
 }

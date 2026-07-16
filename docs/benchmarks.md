@@ -24,15 +24,16 @@ cargo bench -p lh-dsp --bench effects
 | cab IR (100 ms, 128-partitions)  | ~2.51 µs    | 0.19 %                 |
 | NAM (tiny 131-weight fixture)    | ~6.25 µs    | 0.47 %                 |
 | chain: gate → drive → delay      | ~6.18 µs    | 0.46 %                 |
-| full 8-pedal chain (no NAM), 64  | ~8.23 µs    | 0.62 %                 |
-| full 8-pedal chain (no NAM), 32  | ~3.97 µs    | 0.60 % of 667 µs       |
+| full 8-pedal chain (no NAM), 64  | ~13.9 µs    | 1.05 % (stereo bus)    |
+| full 8-pedal chain (no NAM), 32  | ~6.73 µs    | 1.01 % of 667 µs       |
 
 Drive still dominates the hand-written pedals (four half-band FIR passes plus tanh
 at 4× rate); the phaser is next (per-sample `tan` for the swept allpass corner).
-The full 10-slot M5 chain of hand-written DSP sums to **~14 µs ≈ 1 %** of the
-deadline. Cost scales linearly down to the M6 stage target of **32-frame blocks**
-(no per-block fixed-overhead cliff): the 8-pedal chain stays at ~0.6 % of its
-halved 667 µs deadline. The NAM row uses the tiny test fixture and is a plumbing-cost floor: a
+Since M7 the chain is **stereo end to end**; the full-chain rows above are stereo
+and cost ~1.7× their old mono numbers (linked dynamics and the shared reverb core
+keep it under 2×) — still ≈ 1 % of the deadline, scaling linearly down to
+32-frame blocks. Per-effect rows predate the stereo bus where noted in git
+history; refresh on the next hardware run. The NAM row uses the tiny test fixture and is a plumbing-cost floor: a
 realistic "standard" WaveNet capture runs ~1.9 µs/sample (nam-rs, x86 reference)
 ⇒ ~122 µs/block ≈ 9 % of the deadline. Full chain estimate with a real capture:
 **~10 %** — on budget (white paper §3.2 targets < 40 % average).

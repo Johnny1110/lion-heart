@@ -46,18 +46,22 @@ fn amp_processes_audio_through_the_swap_seam() {
     // Before install: exact passthrough.
     let x = sine(48_000, 220.0, 4_096);
     let mut y = x.clone();
-    for block in y.chunks_mut(64) {
-        amp.process(block);
+    let mut y_r = x.clone();
+    for (l, r) in y.chunks_mut(64).zip(y_r.chunks_mut(64)) {
+        amp.process(l, r);
     }
     assert_eq!(x, y, "unloaded amp must be a passthrough");
+    assert_eq!(x, y_r, "right channel too");
 
     // Install the capture and process again.
     let (asset, _info) = load_nam_file(&fixture(), 48_000).unwrap();
     handle.install(asset).unwrap();
     let mut z = x.clone();
-    for block in z.chunks_mut(64) {
-        amp.process(block);
+    let mut z_r = x.clone();
+    for (l, r) in z.chunks_mut(64).zip(z_r.chunks_mut(64)) {
+        amp.process(l, r);
     }
+    assert_eq!(z, z_r, "mono amp: both channels carry the same signal");
     assert_finite("amp output", &z);
     assert!(rms(&z[2_048..]) > 1e-4, "model must produce signal");
     let diff = x
@@ -70,8 +74,9 @@ fn amp_processes_audio_through_the_swap_seam() {
     // Unload: passthrough again, old model comes back to die here.
     assert!(handle.clear());
     let mut w = x.clone();
-    for block in w.chunks_mut(64) {
-        amp.process(block);
+    let mut w_r = x.clone();
+    for (l, r) in w.chunks_mut(64).zip(w_r.chunks_mut(64)) {
+        amp.process(l, r);
     }
     assert_eq!(x, w);
     assert_eq!(handle.collect_garbage(), 1);

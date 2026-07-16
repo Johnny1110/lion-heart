@@ -73,8 +73,9 @@ fn oversampled_drive_suppresses_aliasing_by_at_least_20_db() {
         .to_norm(0.0),
     );
     let mut processed = x.clone();
-    for chunk in processed.chunks_mut(256) {
-        drive.process(chunk);
+    let mut processed_r = x.clone();
+    for (chunk, chunk_r) in processed.chunks_mut(256).zip(processed_r.chunks_mut(256)) {
+        drive.process(chunk, chunk_r);
     }
 
     let fund_bin = (F0 / 5.0) as usize; // 1260

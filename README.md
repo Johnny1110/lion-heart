@@ -4,18 +4,19 @@
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M6 — on stage (pre-alpha).** The full rig — gate → compressor →
-> drive → **NAM amp** → EQ → modulation → delay → **reverb (FDN)** → **cab IR**
-> → safety limiter — now takes **MIDI foot control**: program changes switch
-> presets (zero config), CCs map to any parameter or bypass via
-> `~/.lion-heart/midi.json`, expression pedals ride knobs live. The **GUI**
-> (iced, [ADR 001](docs/adr/001-gui-framework.md)) gained a **live view** for
-> stage use next to the chain view, knobs, browsers, meters, and tuner. The
-> hand-written chain holds ~0.6 % of the deadline at **32-frame buffers**.
-> Stereo arrives with the plugin bus
-> ([ADR 002](docs/adr/002-mono-chain-through-m5.md)). The audio thread stays
-> allocation-free (enforced by `assert_no_alloc` in debug builds). Full technical
-> plan: [white paper](docs/white-paper.md) (Traditional Chinese / 繁體中文).
+> **Status: M7 in progress — the bus went stereo.** The full rig — gate →
+> compressor → drive → **NAM amp** → EQ → modulation → delay → **reverb
+> (FDN)** → **cab IR** → safety limiter — now runs a **stereo bus end to
+> end**: chorus/flanger/phaser spread wide (quadrature LFOs), tremolo
+> auto-pans, the reverb tail decorrelates left from right
+> ([ADR 002](docs/adr/002-mono-chain-through-m5.md)), while dynamics stay
+> image-stable via linked detectors. **MIDI foot control** (PC → presets,
+> CC → any knob or bypass), a **live view**, tuner, meters and the full GUI
+> (iced, [ADR 001](docs/adr/001-gui-framework.md)) ride on top. Next up in
+> M7: CLAP/VST3 plugin builds and v0.1. The audio thread stays
+> allocation-free (enforced by `assert_no_alloc` in debug builds). Full
+> technical plan: [white paper](docs/white-paper.md) (Traditional Chinese /
+> 繁體中文).
 
 ## Why
 

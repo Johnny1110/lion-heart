@@ -153,10 +153,11 @@ impl Effect for Compressor {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         let slope = 1.0 / self.ratio - 1.0; // dB of gain per dB over threshold
-        for x in block.iter_mut() {
-            let a = x.abs();
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            // Linked detector: one gain for both channels keeps the image put.
+            let a = l.abs().max(r.abs());
             let coeff = if a > self.env {
                 self.attack_coeff
             } else {
@@ -166,7 +167,9 @@ impl Effect for Compressor {
 
             let over = lin_to_db(self.env) - self.threshold_db;
             let gr_db = if over > 0.0 { over * slope } else { 0.0 };
-            *x *= db_to_lin(gr_db) * self.makeup.tick();
+            let gain = db_to_lin(gr_db) * self.makeup.tick();
+            *l *= gain;
+            *r *= gain;
         }
     }
 }
@@ -190,7 +193,8 @@ mod tests {
             .iter()
             .map(|s| s * amp)
             .collect();
-        c.process(&mut x);
+        let mut xr = x.clone();
+        c.process(&mut x, &mut xr);
         assert_finite("comp output", &x);
         x[SR as usize / 2..]
             .iter()
@@ -245,7 +249,8 @@ mod tests {
     fn silence_in_silence_out() {
         let mut c = prepared();
         let mut x = silence(4_096);
-        c.process(&mut x);
-        assert!(rms(&x) == 0.0);
+        let mut xr = silence(4_096);
+        c.process(&mut x, &mut xr);
+        assert!(rms(&x) == 0.0 && rms(&xr) == 0.0);
     }
 }

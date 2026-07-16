@@ -97,9 +97,10 @@ impl Effect for Limiter {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
-        for x in block.iter_mut() {
-            let a = x.abs();
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            // Linked: the louder channel sets one shared reduction.
+            let a = l.abs().max(r.abs());
             // Instant attack: jump straight to the required reduction;
             // smooth release back toward unity.
             let need = if a * self.gain > self.ceiling {
@@ -113,7 +114,8 @@ impl Effect for Limiter {
                 self.gain + self.release_coeff * (need - self.gain)
             };
             // Hard ceiling as the absolute guarantee.
-            *x = (*x * self.gain).clamp(-self.ceiling, self.ceiling);
+            *l = (*l * self.gain).clamp(-self.ceiling, self.ceiling);
+            *r = (*r * self.gain).clamp(-self.ceiling, self.ceiling);
         }
     }
 }
@@ -131,7 +133,8 @@ mod tests {
         l.prepare(SR);
         let x: Vec<f32> = sine(SR, 220.0, 4_096).iter().map(|s| s * 0.25).collect();
         let mut y = x.clone();
-        l.process(&mut y);
+        let mut yr = x.clone();
+        l.process(&mut y, &mut yr);
         let max_err = x
             .iter()
             .zip(&y)
@@ -149,7 +152,8 @@ mod tests {
             .iter()
             .map(|s| s * 2.0) // +6 dB over full scale
             .collect();
-        l.process(&mut y);
+        let mut yr = y.clone();
+        l.process(&mut y, &mut yr);
         assert_finite("limiter output", &y);
         let ceiling = db_to_lin(-6.0);
         assert!(

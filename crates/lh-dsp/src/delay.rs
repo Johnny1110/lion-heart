@@ -50,15 +50,43 @@ const MAX_SECONDS: usize = 2;
 /// Fixed lowpass in the feedback path: repeats get darker, analog-style.
 const FEEDBACK_LP_HZ: f32 = 4_000.0;
 
-pub struct Delay {
-    sample_rate: u32,
+/// One channel's circular buffer and feedback-filter state.
+struct DelayChannel {
     buf: Vec<f32>,
     write: usize,
+    fb_lp: f32,
+}
+
+impl DelayChannel {
+    /// One sample: interpolated read, filtered feedback write, returns wet.
+    #[inline]
+    fn step(&mut self, x: f32, delay_smp: f32, feedback: f32, fb_lp_coeff: f32) -> f32 {
+        let len = self.buf.len();
+        let rp = self.write as f32 - delay_smp + len as f32;
+        let i0 = rp as usize; // truncation: rp >= 0
+        let frac = rp - i0 as f32;
+        let s0 = self.buf[i0 % len];
+        let s1 = self.buf[(i0 + 1) % len];
+        let wet = s0 + frac * (s1 - s0);
+
+        self.fb_lp += fb_lp_coeff * (wet - self.fb_lp);
+        let mut fb_sample = x + self.fb_lp * feedback;
+        if fb_sample.abs() < 1e-15 {
+            fb_sample = 0.0;
+        }
+        self.buf[self.write] = fb_sample;
+        self.write = (self.write + 1) % len;
+        wet
+    }
+}
+
+pub struct Delay {
+    sample_rate: u32,
+    ch: [DelayChannel; 2],
     time_ms: f32,
     delay_smp: Smoothed,
     feedback: Smoothed,
     mix: Smoothed,
-    fb_lp: f32,
     fb_lp_coeff: f32,
 }
 
@@ -70,15 +98,18 @@ impl Default for Delay {
 
 impl Delay {
     pub fn new() -> Self {
-        Self {
-            sample_rate: 48_000,
+        let channel = || DelayChannel {
             buf: Vec::new(),
             write: 0,
+            fb_lp: 0.0,
+        };
+        Self {
+            sample_rate: 48_000,
+            ch: [channel(), channel()],
             time_ms: PARAMS[0].default,
             delay_smp: Smoothed::new(0.0),
             feedback: Smoothed::new(PARAMS[1].default),
             mix: Smoothed::new(PARAMS[2].default),
-            fb_lp: 0.0,
             fb_lp_coeff: 0.3,
         }
     }
@@ -91,7 +122,9 @@ impl Effect for Delay {
 
     fn prepare(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate;
-        self.buf = vec![0.0; MAX_SECONDS * sample_rate as usize];
+        for ch in &mut self.ch {
+            ch.buf = vec![0.0; MAX_SECONDS * sample_rate as usize];
+        }
         self.delay_smp
             .configure(PARAMS[0].smoothing_ms, sample_rate);
         self.feedback.configure(PARAMS[1].smoothing_ms, sample_rate);
@@ -107,9 +140,11 @@ impl Effect for Delay {
     }
 
     fn reset(&mut self) {
-        self.buf.iter_mut().for_each(|s| *s = 0.0);
-        self.write = 0;
-        self.fb_lp = 0.0;
+        for ch in &mut self.ch {
+            ch.buf.iter_mut().for_each(|s| *s = 0.0);
+            ch.write = 0;
+            ch.fb_lp = 0.0;
+        }
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
@@ -127,31 +162,19 @@ impl Effect for Delay {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
-        let len = self.buf.len();
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let len = self.ch[0].buf.len();
         if len == 0 {
             return; // prepare() not called yet
         }
-        for x in block.iter_mut() {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let d = self.delay_smp.tick().clamp(1.0, (len - 2) as f32);
-            // Interpolated read at write - d (modulo buffer length).
-            let rp = self.write as f32 - d + len as f32;
-            let i0 = rp as usize; // truncation: rp >= 0
-            let frac = rp - i0 as f32;
-            let s0 = self.buf[i0 % len];
-            let s1 = self.buf[(i0 + 1) % len];
-            let wet = s0 + frac * (s1 - s0);
-
-            // Darkened feedback, denormal-flushed.
-            self.fb_lp += self.fb_lp_coeff * (wet - self.fb_lp);
-            let mut fb_sample = *x + self.fb_lp * self.feedback.tick();
-            if fb_sample.abs() < 1e-15 {
-                fb_sample = 0.0;
-            }
-            self.buf[self.write] = fb_sample;
-            self.write = (self.write + 1) % len;
-
-            *x += wet * self.mix.tick();
+            let fb = self.feedback.tick();
+            let mix = self.mix.tick();
+            let wet_l = self.ch[0].step(*l, d, fb, self.fb_lp_coeff);
+            let wet_r = self.ch[1].step(*r, d, fb, self.fb_lp_coeff);
+            *l += wet_l * mix;
+            *r += wet_r * mix;
         }
     }
 }
@@ -177,7 +200,8 @@ mod tests {
         d.set_param(2, 1.0); // full wet level
         // Let the time smoother settle before measuring.
         let mut warm = silence(SR as usize);
-        d.process(&mut warm);
+        let mut warm_r = silence(SR as usize);
+        d.process(&mut warm, &mut warm_r);
 
         let x = impulse(SR as usize, 0);
         let y = process_in_blocks(&mut d, &x, 512);
@@ -200,8 +224,9 @@ mod tests {
     fn silence_in_silence_out() {
         let mut d = prepared();
         let mut x = silence(8_192);
-        d.process(&mut x);
-        assert!(peak(&x) == 0.0);
+        let mut xr = silence(8_192);
+        d.process(&mut x, &mut xr);
+        assert!(peak(&x) == 0.0 && peak(&xr) == 0.0);
     }
 
     #[test]
@@ -209,10 +234,12 @@ mod tests {
         let mut d = prepared();
         d.set_param(2, 1.0);
         let mut x = crate::testutil::sine(SR, 330.0, SR as usize);
+        let mut xr = x.clone();
         let (a, b) = x.split_at_mut(SR as usize / 2);
-        d.process(a);
+        let (ar, br) = xr.split_at_mut(SR as usize / 2);
+        d.process(a, ar);
         d.set_param(0, 0.0); // slam to 20 ms mid-flight
-        d.process(b);
+        d.process(b, br);
         assert_finite("delay sweep", &x);
     }
 }

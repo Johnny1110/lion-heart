@@ -99,7 +99,8 @@ pub struct Chain {
     /// Master output fade: 1.0 in normal operation, dips to ~0 across reorders.
     fade: Smoothed,
     rx: rtrb::Consumer<EngineMsg>,
-    dry: Vec<f32>,
+    dry_l: Vec<f32>,
+    dry_r: Vec<f32>,
     telemetry: Arc<Telemetry>,
     /// Optional raw-input copy for control-thread analyzers (tuner).
     tap: Option<rtrb::Producer<f32>>,
@@ -114,7 +115,8 @@ impl Chain {
         }
         self.fade.configure(ORDER_FADE_MS, sample_rate);
         self.fade.snap_to_target();
-        self.dry = vec![0.0; MAX_BLOCK];
+        self.dry_l = vec![0.0; MAX_BLOCK];
+        self.dry_r = vec![0.0; MAX_BLOCK];
     }
 
     pub fn reset(&mut self) {
@@ -129,7 +131,8 @@ impl Chain {
         self.tap = Some(tap);
     }
 
-    pub fn process(&mut self, block: &mut [f32]) {
+    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        debug_assert_eq!(left.len(), right.len());
         for _ in 0..MAX_MSGS_PER_BLOCK {
             match self.rx.pop() {
                 Ok(EngineMsg::SetParam { id, normalized }) => {
@@ -163,23 +166,25 @@ impl Chain {
 
         self.telemetry
             .peak_in_bits
-            .store(peak(block).to_bits(), Ordering::Relaxed);
+            .store(peak(left).to_bits(), Ordering::Relaxed);
 
-        // Copy the raw input into the analysis tap (tuner). Lock-free chunk
-        // write, drop-on-full: an unread tap must never stall the callback.
+        // Copy the raw input into the analysis tap (tuner) — left channel;
+        // the source is mono so both channels are identical at chain entry.
+        // Lock-free chunk write, drop-on-full: an unread tap must never
+        // stall the callback.
         if let Some(tap) = &mut self.tap {
-            let n = block.len().min(tap.slots());
+            let n = left.len().min(tap.slots());
             if n > 0
                 && let Ok(mut chunk) = tap.write_chunk(n)
             {
                 let (a, b) = chunk.as_mut_slices();
-                a.copy_from_slice(&block[..a.len()]);
-                b.copy_from_slice(&block[a.len()..a.len() + b.len()]);
+                a.copy_from_slice(&left[..a.len()]);
+                b.copy_from_slice(&left[a.len()..a.len() + b.len()]);
                 chunk.commit_all();
             }
         }
 
-        for chunk in block.chunks_mut(MAX_BLOCK) {
+        for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
             for i in 0..self.order.len() {
                 let Some(slot) = self.slots.get_mut(self.order[i] as usize) else {
                     continue;
@@ -193,29 +198,34 @@ impl Chain {
                     continue; // fully bypassed: skip the work entirely
                 }
                 if slot.wet.is_settled() && slot.wet.target() == 1.0 {
-                    slot.effect.process(chunk);
+                    slot.effect.process(chunk_l, chunk_r);
                     continue;
                 }
-                // Mid-crossfade: blend processed against the dry copy.
-                let dry = &mut self.dry[..chunk.len()];
-                dry.copy_from_slice(chunk);
-                slot.effect.process(chunk);
-                for (s, d) in chunk.iter_mut().zip(dry.iter()) {
+                // Mid-crossfade: blend processed against the dry copies.
+                let dry_l = &mut self.dry_l[..chunk_l.len()];
+                let dry_r = &mut self.dry_r[..chunk_r.len()];
+                dry_l.copy_from_slice(chunk_l);
+                dry_r.copy_from_slice(chunk_r);
+                slot.effect.process(chunk_l, chunk_r);
+                for (i, (l, r)) in chunk_l.iter_mut().zip(chunk_r.iter_mut()).enumerate() {
                     let w = slot.wet.tick();
-                    *s = d + (*s - d) * w;
+                    *l = dry_l[i] + (*l - dry_l[i]) * w;
+                    *r = dry_r[i] + (*r - dry_r[i]) * w;
                 }
             }
         }
 
         if !(self.fade.is_settled() && self.fade.target() == 1.0) {
-            for x in block.iter_mut() {
-                *x *= self.fade.tick();
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                let g = self.fade.tick();
+                *l *= g;
+                *r *= g;
             }
         }
 
         self.telemetry
             .peak_out_bits
-            .store(peak(block).to_bits(), Ordering::Relaxed);
+            .store(peak(left).max(peak(right)).to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -479,7 +489,8 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             pending_order: None,
             fade: Smoothed::new(1.0),
             rx,
-            dry: Vec::new(),
+            dry_l: Vec::new(),
+            dry_r: Vec::new(),
             telemetry: Arc::clone(&telemetry),
             tap: None,
         },

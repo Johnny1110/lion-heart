@@ -118,7 +118,7 @@ impl Session {
         };
         let runner = DuplexRunner::start(&runner_opts, move |info| {
             chain.prepare(info.sample_rate);
-            Box::new(move |block: &mut [f32]| chain.process(block))
+            Box::new(move |left: &mut [f32], right: &mut [f32]| chain.process(left, right))
         })?;
 
         let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());

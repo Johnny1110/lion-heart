@@ -8,8 +8,10 @@
 //! every path lose 60 dB in exactly `t60` seconds — the tail's decay rate is
 //! uniform and unconditionally stable (|g| < 1, H orthogonal).
 //!
-//! Mono in / mono out for now: the chain is mono end-to-end until the stereo
-//! refactor (ADR 002).
+//! Stereo (M7): the input is mono-summed into one shared FDN core; the two
+//! output channels take differently-signed tap mixes of the same eight lines
+//! (orthogonal ±1 Hadamard rows), which yields a decorrelated L/R pair —
+//! real width — without touching the feedback structure.
 
 use lh_core::{EffectDesc, ParamDesc, Range};
 
@@ -23,6 +25,10 @@ const DIFFUSION_MS: [f32; 2] = [5.1, 7.9];
 const DIFFUSION_G: f32 = 0.7;
 /// Wet tail level: Σ of 8 unit-scale lines needs pulling down.
 const WET_SCALE: f32 = 0.35;
+/// Output tap signs per channel: two orthogonal Hadamard rows, so L and R
+/// hear the same tail energy but decorrelated.
+const OUT_L: [f32; N] = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+const OUT_R: [f32; N] = [1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0];
 
 static PARAMS: [ParamDesc; 4] = [
     ParamDesc {
@@ -221,12 +227,13 @@ impl Effect for Reverb {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         if self.lines.is_empty() {
             return; // prepare() not called yet
         }
-        for x in block.iter_mut() {
-            let dry = *x;
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let (dry_l, dry_r) = (*l, *r);
+            let dry = 0.5 * (dry_l + dry_r); // the FDN core is mono-fed
 
             // Predelay: read `predelay_len` behind the write head.
             let len = self.predelay.buf.len();
@@ -242,16 +249,19 @@ impl Effect for Reverb {
             // Read tails, damp, apply decay gain; Householder feedback.
             let mut v = [0.0f32; N];
             let mut sum = 0.0;
-            let mut wet = 0.0;
-            for (((line, damp), gain), fed_back) in self
+            let mut wet_l = 0.0;
+            let mut wet_r = 0.0;
+            for (i, (((line, damp), gain), fed_back)) in self
                 .lines
                 .iter()
                 .zip(&mut self.damp_state)
                 .zip(&self.line_gains)
                 .zip(&mut v)
+                .enumerate()
             {
                 let tail = line.read();
-                wet += tail;
+                wet_l += tail * OUT_L[i];
+                wet_r += tail * OUT_R[i];
                 *damp += self.damp_coeff * (tail - *damp);
                 *fed_back = gain * *damp;
                 sum += *fed_back;
@@ -262,7 +272,8 @@ impl Effect for Reverb {
             }
 
             let mix = self.mix.tick();
-            *x = dry + mix * (wet * WET_SCALE - dry);
+            *l = dry_l + mix * (wet_l * WET_SCALE - dry_l);
+            *r = dry_r + mix * (wet_r * WET_SCALE - dry_r);
         }
     }
 }
@@ -284,15 +295,21 @@ mod tests {
         r
     }
 
-    /// Render `secs` of impulse response.
-    fn impulse_response(r: &mut Reverb, secs: f32) -> Vec<f32> {
+    /// Render `secs` of stereo impulse response.
+    fn impulse_response_stereo(r: &mut Reverb, secs: f32) -> (Vec<f32>, Vec<f32>) {
         let n = (SR as f32 * secs) as usize;
-        let mut x = vec![0.0f32; n];
-        x[0] = 1.0;
-        for block in x.chunks_mut(64) {
-            r.process(block);
+        let mut l = vec![0.0f32; n];
+        l[0] = 1.0;
+        let mut right = l.clone();
+        for (a, b) in l.chunks_mut(64).zip(right.chunks_mut(64)) {
+            r.process(a, b);
         }
-        x
+        (l, right)
+    }
+
+    /// Render `secs` of impulse response, left channel.
+    fn impulse_response(r: &mut Reverb, secs: f32) -> Vec<f32> {
+        impulse_response_stereo(r, secs).0
     }
 
     fn window_rms(x: &[f32], from_s: f32, to_s: f32) -> f32 {
@@ -359,11 +376,41 @@ mod tests {
         let mut r = prepared(2.0);
         r.set_param(3, 0.0);
         let mut warm = vec![0.1f32; SR as usize]; // let mix settle to 0
-        r.process(&mut warm);
+        let mut warm_r = warm.clone();
+        r.process(&mut warm, &mut warm_r);
         let x: Vec<f32> = (0..8_192).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
         let mut y = x.clone();
-        r.process(&mut y);
-        assert_eq!(x, y, "mix 0 must pass dry");
+        let mut yr = x.clone();
+        r.process(&mut y, &mut yr);
+        assert_eq!(x, y, "mix 0 must pass dry (L)");
+        assert_eq!(x, yr, "mix 0 must pass dry (R)");
+    }
+
+    #[test]
+    fn stereo_tails_share_energy_but_decorrelate() {
+        let mut r = prepared(2.0);
+        let (l, right) = impulse_response_stereo(&mut r, 1.0);
+        assert_finite("stereo ir L", &l);
+        assert_finite("stereo ir R", &right);
+        let tail = SR as usize / 10..; // skip the direct field
+        let (tl, tr) = (&l[tail.clone()], &right[tail]);
+        let rl = rms(tl);
+        let rr = rms(tr);
+        assert!(
+            (rl / rr).max(rr / rl) < 1.6,
+            "channel tail energy must roughly match: {rl} vs {rr}"
+        );
+        // Normalized cross-correlation at lag 0 should be well below 1.
+        let dot: f64 = tl
+            .iter()
+            .zip(tr)
+            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+            .sum();
+        let corr = dot / (f64::from(rl) * f64::from(rr) * tl.len() as f64);
+        assert!(
+            corr.abs() < 0.5,
+            "tails must decorrelate, correlation {corr:.3}"
+        );
     }
 
     #[test]
@@ -373,8 +420,12 @@ mod tests {
         assert!(rms(&ir) > 0.0);
         r.reset();
         let mut x = silence(8_192);
-        r.process(&mut x);
-        assert!(rms(&x) == 0.0, "reset must clear the tail");
+        let mut xr = silence(8_192);
+        r.process(&mut x, &mut xr);
+        assert!(
+            rms(&x) == 0.0 && rms(&xr) == 0.0,
+            "reset must clear the tail"
+        );
     }
 
     #[test]
@@ -384,10 +435,12 @@ mod tests {
             r.prepare(sr);
             for chunk in [32usize, 483, 1_024] {
                 let mut x: Vec<f32> = (0..4_096).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
-                for block in x.chunks_mut(chunk) {
-                    r.process(block);
+                let mut xr = x.clone();
+                for (a, b) in x.chunks_mut(chunk).zip(xr.chunks_mut(chunk)) {
+                    r.process(a, b);
                 }
                 assert_finite("reverb multirate", &x);
+                assert_finite("reverb multirate R", &xr);
             }
         }
     }

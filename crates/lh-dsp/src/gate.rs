@@ -120,10 +120,12 @@ impl Effect for NoiseGate {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         let thr_close = self.thr_open * CLOSE_RATIO;
-        for x in block.iter_mut() {
-            let a = x.abs();
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            // Linked detector: the louder channel drives one shared gain, so
+            // the stereo image never wobbles as the gate rides the edge.
+            let a = l.abs().max(r.abs());
             // Peak follower: instant attack, exponential decay.
             self.env = if a > self.env {
                 a
@@ -144,7 +146,8 @@ impl Effect for NoiseGate {
             if !self.open && self.gain < 1e-6 {
                 self.gain = 0.0; // fully closed; also kills denormal tails
             }
-            *x *= self.gain;
+            *l *= self.gain;
+            *r *= self.gain;
         }
     }
 }
@@ -166,7 +169,8 @@ mod tests {
     fn loud_signal_passes_after_attack() {
         let mut g = prepared();
         let mut x = sine(SR, 220.0, SR as usize / 2); // 0 dBFS, well above -50 dB
-        g.process(&mut x);
+        let mut xr = x.clone();
+        g.process(&mut x, &mut xr);
         assert_finite("gate output", &x);
         let tail = &x[SR as usize / 4..];
         assert!(
@@ -184,7 +188,8 @@ mod tests {
             .map(|s| s * db_to_lin(-70.0))
             .collect();
         let mut x = quiet.clone();
-        g.process(&mut x);
+        let mut xr = x.clone();
+        g.process(&mut x, &mut xr);
         let tail = &x[SR as usize / 4..];
         assert!(
             rms(tail) < rms(&quiet) * 0.05,
@@ -196,14 +201,16 @@ mod tests {
     fn closes_within_release_window_after_signal_stops() {
         let mut g = prepared();
         let mut burst = sine(SR, 220.0, SR as usize / 10);
-        g.process(&mut burst); // open the gate
+        let mut burst_r = burst.clone();
+        g.process(&mut burst, &mut burst_r); // open the gate
 
         // 120 ms release + 20 ms envelope decay: settle well within 5×.
         let mut tail = sine(SR, 220.0, (SR as f32 * 0.8) as usize);
         for s in tail.iter_mut() {
             *s *= db_to_lin(-90.0); // essentially silence, but nonzero
         }
-        g.process(&mut tail);
+        let mut tail_r = tail.clone();
+        g.process(&mut tail, &mut tail_r);
         let end = &tail[tail.len() - SR as usize / 10..];
         assert!(rms(end) < 1e-5, "gate must close, rms {}", rms(end));
     }
@@ -212,8 +219,9 @@ mod tests {
     fn silence_in_silence_out() {
         let mut g = prepared();
         let mut x = silence(4_096);
-        g.process(&mut x);
-        assert!(peak_is_zero(&x));
+        let mut xr = silence(4_096);
+        g.process(&mut x, &mut xr);
+        assert!(peak_is_zero(&x) && peak_is_zero(&xr));
     }
 
     fn peak_is_zero(x: &[f32]) -> bool {

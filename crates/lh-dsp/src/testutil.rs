@@ -37,11 +37,27 @@ pub fn assert_finite(name: &str, x: &[f32]) {
     }
 }
 
-/// Render `input` through `effect` in fixed-size blocks, like the engine does.
+/// Render `input` through `effect` in fixed-size blocks, like the engine
+/// does: duplicated onto both channels, returning the left one. For effects
+/// with decorrelated outputs use [`process_stereo_in_blocks`].
 pub fn process_in_blocks(effect: &mut dyn Effect, input: &[f32], block: usize) -> Vec<f32> {
-    let mut out = input.to_vec();
-    for chunk in out.chunks_mut(block.max(1)) {
-        effect.process(chunk);
+    process_stereo_in_blocks(effect, input, block).0
+}
+
+/// Stereo render harness: mono `input` duplicated onto both channels,
+/// both channel outputs returned.
+pub fn process_stereo_in_blocks(
+    effect: &mut dyn Effect,
+    input: &[f32],
+    block: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut left = input.to_vec();
+    let mut right = input.to_vec();
+    for (l, r) in left
+        .chunks_mut(block.max(1))
+        .zip(right.chunks_mut(block.max(1)))
+    {
+        effect.process(l, r);
     }
-    out
+    (left, right)
 }

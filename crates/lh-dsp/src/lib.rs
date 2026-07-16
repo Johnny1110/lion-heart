@@ -39,6 +39,8 @@ pub trait Effect: Send {
     /// smoother target; the audible change happens inside `process`.
     fn set_param(&mut self, index: usize, normalized: f32);
 
-    /// In-place mono processing of one block, any length. RT-safe.
-    fn process(&mut self, block: &mut [f32]);
+    /// In-place stereo processing of one block, any length. RT-safe.
+    /// `left` and `right` are always the same length (the engine guarantees
+    /// it); a mono source enters the chain duplicated onto both channels.
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]);
 }

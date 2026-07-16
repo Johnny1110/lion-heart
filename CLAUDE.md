@@ -14,7 +14,24 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M6 (on stage) — code landed.** MIDI foot control + live view + 32-frame headroom:
+**M7 in progress — the stereo bus landed (part 1 of plugin & release).** The chain
+is now **stereo end to end**: `Effect::process(left, right)`, the duplex runner
+duplicates the mono input onto L/R and interleaves stereo out (even device
+channels L, odd R). Per-effect stereo semantics: gate/comp/limiter use **linked
+detectors** (one gain, image stays put); drive/EQ run **dual channel state**;
+**modulation is true stereo** (two voices, right LFO in quadrature — tremolo in
+opposite phase = auto-pan); **reverb takes two decorrelated ±1 Hadamard tap
+mixes** off the shared 8-line FDN; NAM **mono-sums** (a capture is a mono amp);
+cab runs two convolvers on the same IR. ADR 002 updated. Stereo width tests:
+mod decorrelation per voice, reverb channel-energy match + cross-correlation
+< 0.5, tremolo L+R steadiness (pan compensation).
+
+Still to come in M7: nih-plug CLAP/VST3 wrap, codesign/notarization scaffolding,
+CI release workflow, v0.1.
+
+M6 recap: `lh-midi` foot control (PC→preset, CC→param/bypass via
+`~/.lion-heart/midi.json`, zero-config first port + sorted-preset PC), GUI live
+view, 32-frame headroom verified.
 
 - `lh-midi` (new crate): PC/CC parsing and a JSON mapping
   (`~/.lion-heart/midi.json`: `input` port, `channel` filter, `pc_presets` names,

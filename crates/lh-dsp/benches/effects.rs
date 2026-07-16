@@ -20,36 +20,36 @@ fn signal() -> Vec<f32> {
     lh_dsp::testutil::sine(SR, 220.0, BLOCK)
 }
 
+/// Refill both channels and run one stereo process call.
+macro_rules! bench_stereo {
+    ($group:expr, $name:expr, $effect:expr, $buf_l:expr, $buf_r:expr) => {
+        $group.bench_function($name, |b| {
+            b.iter(|| {
+                $buf_l.copy_from_slice(&signal());
+                $buf_r.copy_from_slice(&signal());
+                $effect.process(black_box(&mut $buf_l), black_box(&mut $buf_r));
+            })
+        });
+    };
+}
+
 fn bench_effects(c: &mut Criterion) {
     let mut group = c.benchmark_group("block64_48k");
 
+    let mut buf = signal();
+    let mut buf_r = signal();
+
     let mut gate = NoiseGate::new();
     gate.prepare(SR);
-    let mut buf = signal();
-    group.bench_function("gate", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            gate.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "gate", gate, buf, buf_r);
 
     let mut drive = Drive::new();
     drive.prepare(SR);
-    group.bench_function("drive_4x_oversampled", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            drive.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "drive_4x_oversampled", drive, buf, buf_r);
 
     let mut delay = Delay::new();
     delay.prepare(SR);
-    group.bench_function("delay", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            delay.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "delay", delay, buf, buf_r);
 
     // Cab with a realistic 100 ms IR (4800 taps at 48 kHz, 128-sample partitions).
     let (mut cab, mut cab_handle) = lh_dsp::cab::CabIr::new();
@@ -60,71 +60,37 @@ fn bench_effects(c: &mut Criterion) {
             ((n as f32 * 12.9898).sin() * 43_758.547).fract() * env
         })
         .collect();
-    let mut convolver = fft_convolver::FFTConvolver::<f32>::default();
-    convolver.init(128, &ir).unwrap();
+    let build = || {
+        let mut convolver = fft_convolver::FFTConvolver::<f32>::default();
+        convolver.init(128, &ir).unwrap();
+        convolver
+    };
     cab_handle
-        .install(Box::new(lh_dsp::cab::IrAsset { convolver }))
+        .install(Box::new(lh_dsp::cab::IrAsset {
+            left: build(),
+            right: build(),
+        }))
         .unwrap();
-    group.bench_function("cab_ir_100ms", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            cab.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "cab_ir_100ms", cab, buf, buf_r);
 
     let mut comp = Compressor::new();
     comp.prepare(SR);
-    group.bench_function("comp", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            comp.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "comp", comp, buf, buf_r);
 
     let mut eq = Eq::new();
     eq.prepare(SR);
-    group.bench_function("eq_3band", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            eq.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "eq_3band", eq, buf, buf_r);
 
     for (index, name) in TYPES.iter().enumerate() {
         let mut modulation = Modulation::new();
         modulation.prepare(SR);
         modulation.set_param(0, index as f32 / (TYPES.len() - 1) as f32);
-        group.bench_function(format!("mod_{name}"), |b| {
-            b.iter(|| {
-                buf.copy_from_slice(&signal());
-                modulation.process(black_box(&mut buf));
-            })
-        });
+        bench_stereo!(group, format!("mod_{name}"), modulation, buf, buf_r);
     }
 
     let mut reverb = Reverb::new();
     reverb.prepare(SR);
-    group.bench_function("reverb_fdn8", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            reverb.process(black_box(&mut buf));
-        })
-    });
-
-    let mut g2 = NoiseGate::new();
-    let mut d2 = Drive::new();
-    let mut dl2 = Delay::new();
-    g2.prepare(SR);
-    d2.prepare(SR);
-    dl2.prepare(SR);
-    group.bench_function("gate_drive_delay", |b| {
-        b.iter(|| {
-            buf.copy_from_slice(&signal());
-            g2.process(black_box(&mut buf));
-            d2.process(black_box(&mut buf));
-            dl2.process(black_box(&mut buf));
-        })
-    });
+    bench_stereo!(group, "reverb_fdn8", reverb, buf, buf_r);
 
     group.finish();
 }
@@ -159,11 +125,13 @@ fn bench_full_chain(c: &mut Criterion) {
         }
         let signal = lh_dsp::testutil::sine(SR, 220.0, block);
         let mut buf = signal.clone();
+        let mut buf_r = signal.clone();
         group.bench_function(format!("block{block}"), |b| {
             b.iter(|| {
                 buf.copy_from_slice(&signal);
+                buf_r.copy_from_slice(&signal);
                 for effect in effects.iter_mut() {
-                    effect.process(black_box(&mut buf));
+                    effect.process(black_box(&mut buf), black_box(&mut buf_r));
                 }
             })
         });

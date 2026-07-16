@@ -58,17 +58,49 @@ pub static DESC: EffectDesc = EffectDesc {
 const BIAS: f32 = 0.2;
 const DC_R: f32 = 0.995;
 
+/// Per-channel signal state; parameters and their smoothers are shared.
+struct DriveChannel {
+    os: Oversampler4x,
+    dc_x1: f32,
+    dc_y1: f32,
+    lp: f32,
+}
+
+impl DriveChannel {
+    fn new() -> Self {
+        Self {
+            os: Oversampler4x::new(),
+            dc_x1: 0.0,
+            dc_y1: 0.0,
+            lp: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.os.reset();
+        self.dc_x1 = 0.0;
+        self.dc_y1 = 0.0;
+        self.lp = 0.0;
+    }
+
+    /// DC blocker + tone lowpass for one post-shaper sample.
+    #[inline]
+    fn post(&mut self, x: f32, tone_coeff: f32) -> f32 {
+        let y = x - self.dc_x1 + DC_R * self.dc_y1;
+        self.dc_x1 = x;
+        self.dc_y1 = if y.abs() < 1e-15 { 0.0 } else { y };
+        self.lp += tone_coeff * (self.dc_y1 - self.lp);
+        self.lp
+    }
+}
+
 pub struct Drive {
     sample_rate: u32,
-    os: Oversampler4x,
+    ch: [DriveChannel; 2],
     pregain: Smoothed,
     tone_coeff: Smoothed,
     level: Smoothed,
     tone_hz: f32,
-    // filter memories
-    dc_x1: f32,
-    dc_y1: f32,
-    lp: f32,
 }
 
 impl Default for Drive {
@@ -81,14 +113,11 @@ impl Drive {
     pub fn new() -> Self {
         Self {
             sample_rate: 48_000,
-            os: Oversampler4x::new(),
+            ch: [DriveChannel::new(), DriveChannel::new()],
             pregain: Smoothed::new(db_to_lin(PARAMS[0].default)),
             tone_coeff: Smoothed::new(0.5),
             level: Smoothed::new(db_to_lin(PARAMS[2].default)),
             tone_hz: PARAMS[1].default,
-            dc_x1: 0.0,
-            dc_y1: 0.0,
-            lp: 0.0,
         }
     }
 }
@@ -126,10 +155,9 @@ impl Effect for Drive {
     }
 
     fn reset(&mut self) {
-        self.os.reset();
-        self.dc_x1 = 0.0;
-        self.dc_y1 = 0.0;
-        self.lp = 0.0;
+        for ch in &mut self.ch {
+            ch.reset();
+        }
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
@@ -149,25 +177,30 @@ impl Effect for Drive {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
-        // Input gain at the base rate (scalar gain commutes with resampling).
-        for x in block.iter_mut() {
-            *x *= self.pregain.tick();
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        // Input gain at the base rate (scalar gain commutes with resampling);
+        // smoothers tick once per sample frame and feed both channels.
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let g = self.pregain.tick();
+            *l *= g;
+            *r *= g;
         }
-        self.os.process(block, |os_block| {
+        self.ch[0].os.process(left, |os_block| {
             for s in os_block.iter_mut() {
                 *s = shape(*s);
             }
         });
-        for x in block.iter_mut() {
-            // DC blocker: y[n] = x[n] - x[n-1] + R·y[n-1]
-            let y = *x - self.dc_x1 + DC_R * self.dc_y1;
-            self.dc_x1 = *x;
-            self.dc_y1 = if y.abs() < 1e-15 { 0.0 } else { y };
-            // Tone: one-pole lowpass with a smoothed coefficient.
+        self.ch[1].os.process(right, |os_block| {
+            for s in os_block.iter_mut() {
+                *s = shape(*s);
+            }
+        });
+        let (ch_l, ch_r) = self.ch.split_at_mut(1);
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let c = self.tone_coeff.tick();
-            self.lp += c * (self.dc_y1 - self.lp);
-            *x = self.lp * self.level.tick();
+            let lv = self.level.tick();
+            *l = ch_l[0].post(*l, c) * lv;
+            *r = ch_r[0].post(*r, c) * lv;
         }
     }
 }
@@ -242,11 +275,13 @@ mod tests {
         d.set_param(0, 0.0);
         let x = sine(SR, 220.0, SR as usize / 2);
         let mut y = x.clone();
+        let mut yr = x.clone();
         let (a, b) = y.split_at_mut(SR as usize / 4);
-        d.process(a);
+        let (ar, br) = yr.split_at_mut(SR as usize / 4);
+        d.process(a, ar);
         d.set_param(0, 1.0); // slam the knob mid-stream
         d.set_param(2, 0.0);
-        d.process(b);
+        d.process(b, br);
         assert_finite("drive sweep", &y);
         let max_step = y
             .windows(2)

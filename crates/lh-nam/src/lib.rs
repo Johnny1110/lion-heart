@@ -113,10 +113,15 @@ pub static DESC: EffectDesc = EffectDesc {
 };
 
 /// The amp slot in the chain. Passes dry until a capture is installed.
+/// Per-call mono scratch: the chain slices blocks to ≤ 1024 anyway; bigger
+/// caller blocks are chunked here.
+const SCRATCH: usize = 1024;
+
 pub struct NamAmp {
     slot: AssetSlot<NamAsset>,
     gain: Smoothed,
     level: Smoothed,
+    scratch: Vec<f32>,
 }
 
 impl NamAmp {
@@ -127,6 +132,7 @@ impl NamAmp {
                 slot,
                 gain: Smoothed::new(db_to_lin(PARAMS[0].default)),
                 level: Smoothed::new(db_to_lin(PARAMS[1].default)),
+                scratch: Vec::new(),
             },
             handle,
         )
@@ -143,6 +149,7 @@ impl Effect for NamAmp {
         self.level.configure(PARAMS[1].smoothing_ms, sample_rate);
         self.gain.snap_to_target();
         self.level.snap_to_target();
+        self.scratch = vec![0.0; SCRATCH];
     }
 
     fn reset(&mut self) {
@@ -163,20 +170,29 @@ impl Effect for NamAmp {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         self.slot.tick();
-        for x in block.iter_mut() {
-            *x *= self.gain.tick();
-        }
-        let base = match self.slot.get_mut() {
-            Some(asset) => {
-                asset.model.process_buffer(block);
-                asset.base_gain
+        // A NAM capture is a mono amp: sum the bus, run the model once,
+        // send the result to both channels. Width from effects placed after
+        // the amp (the normal rig) is preserved by *their* stereo paths.
+        for (lc, rc) in left.chunks_mut(SCRATCH).zip(right.chunks_mut(SCRATCH)) {
+            let n = lc.len();
+            let scratch = &mut self.scratch[..n];
+            for (s, (l, r)) in scratch.iter_mut().zip(lc.iter().zip(rc.iter())) {
+                *s = 0.5 * (*l + *r) * self.gain.tick();
             }
-            None => 1.0,
-        };
-        for x in block.iter_mut() {
-            *x *= base * self.level.tick();
+            let base = match self.slot.get_mut() {
+                Some(asset) => {
+                    asset.model.process_buffer(scratch);
+                    asset.base_gain
+                }
+                None => 1.0,
+            };
+            for (s, (l, r)) in scratch.iter().zip(lc.iter_mut().zip(rc.iter_mut())) {
+                let y = *s * base * self.level.tick();
+                *l = y;
+                *r = y;
+            }
         }
     }
 }

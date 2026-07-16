@@ -121,10 +121,16 @@ pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), 
         return Err(AssetError::Empty { path: display });
     }
 
-    let mut convolver = FFTConvolver::<f32>::default();
-    convolver
-        .init(CONV_BLOCK, &ir)
-        .map_err(|e| AssetError::Convolver(format!("{e:?}")))?;
+    // One convolver per channel of the stereo bus, same IR.
+    let build = || -> Result<FFTConvolver<f32>, AssetError> {
+        let mut convolver = FFTConvolver::<f32>::default();
+        convolver
+            .init(CONV_BLOCK, &ir)
+            .map_err(|e| AssetError::Convolver(format!("{e:?}")))?;
+        Ok(convolver)
+    };
+    let left = build()?;
+    let right = build()?;
 
     let info = IrInfo {
         source_rate,
@@ -134,7 +140,7 @@ pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), 
         resampled,
         trimmed,
     };
-    Ok((Box::new(IrAsset { convolver }), info))
+    Ok((Box::new(IrAsset { left, right }), info))
 }
 
 /// SHA-256 of a file's contents, hex-encoded — the identity presets use to
@@ -272,7 +278,7 @@ mod tests {
             v
         };
         let mut out = vec![0.0f32; 128];
-        asset.convolver.process(&input, &mut out).unwrap();
+        asset.left.process(&input, &mut out).unwrap();
         let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!((peak - 1.0).abs() < 1e-3, "energy-normalized, got {peak}");
     }

@@ -27,9 +27,11 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
-/// A ready-to-run convolver, built and `init`-ed off the audio thread.
+/// Ready-to-run convolvers (one per channel, same IR), built and `init`-ed
+/// off the audio thread.
 pub struct IrAsset {
-    pub convolver: FFTConvolver<f32>,
+    pub left: FFTConvolver<f32>,
+    pub right: FFTConvolver<f32>,
 }
 
 const SCRATCH: usize = 1024;
@@ -67,7 +69,8 @@ impl Effect for CabIr {
 
     fn reset(&mut self) {
         if let Some(asset) = self.slot.get_mut() {
-            asset.convolver.reset();
+            asset.left.reset();
+            asset.right.reset();
         }
     }
 
@@ -78,20 +81,24 @@ impl Effect for CabIr {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         self.slot.tick();
         if let Some(asset) = self.slot.get_mut() {
-            for chunk in block.chunks_mut(SCRATCH) {
-                let dry = &mut self.scratch[..chunk.len()];
-                dry.copy_from_slice(chunk);
-                if asset.convolver.process(dry, chunk).is_err() {
-                    // Fail safe: an unusable convolver must not mute the rig.
-                    chunk.copy_from_slice(dry);
+            for (lc, rc) in left.chunks_mut(SCRATCH).zip(right.chunks_mut(SCRATCH)) {
+                for (chunk, convolver) in [(lc, &mut asset.left), (rc, &mut asset.right)] {
+                    let dry = &mut self.scratch[..chunk.len()];
+                    dry.copy_from_slice(chunk);
+                    if convolver.process(dry, chunk).is_err() {
+                        // Fail safe: an unusable convolver must not mute the rig.
+                        chunk.copy_from_slice(dry);
+                    }
                 }
             }
         }
-        for x in block.iter_mut() {
-            *x *= self.level.tick();
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let g = self.level.tick();
+            *l *= g;
+            *r *= g;
         }
     }
 }
@@ -102,9 +109,15 @@ mod tests {
     use crate::testutil::{assert_finite, impulse, peak};
 
     fn asset_from_ir(ir: &[f32]) -> Box<IrAsset> {
-        let mut convolver = FFTConvolver::<f32>::default();
-        convolver.init(128, ir).unwrap();
-        Box::new(IrAsset { convolver })
+        let build = || {
+            let mut convolver = FFTConvolver::<f32>::default();
+            convolver.init(128, ir).unwrap();
+            convolver
+        };
+        Box::new(IrAsset {
+            left: build(),
+            right: build(),
+        })
     }
 
     #[test]
@@ -113,8 +126,10 @@ mod tests {
         cab.prepare(48_000);
         let x = impulse(512, 100);
         let mut y = x.clone();
-        cab.process(&mut y);
+        let mut yr = x.clone();
+        cab.process(&mut y, &mut yr);
         assert_eq!(x, y);
+        assert_eq!(x, yr);
     }
 
     #[test]
@@ -125,7 +140,9 @@ mod tests {
 
         let x = crate::testutil::sine(48_000, 440.0, 512);
         let mut y = x.clone();
-        cab.process(&mut y);
+        let mut yr = x.clone();
+        cab.process(&mut y, &mut yr);
+        assert_eq!(y, yr, "identical channels through identical IRs");
         assert_finite("cab output", &y);
         let max_err = x
             .iter()
@@ -145,7 +162,8 @@ mod tests {
 
         let x = impulse(512, 10);
         let mut y = x.clone();
-        cab.process(&mut y);
+        let mut yr = x.clone();
+        cab.process(&mut y, &mut yr);
         let (argmax, p) = y.iter().enumerate().fold((0, 0.0f32), |(bi, bv), (i, v)| {
             if v.abs() > bv { (i, v.abs()) } else { (bi, bv) }
         });
@@ -160,7 +178,8 @@ mod tests {
         handle.install(asset_from_ir(&[1.0])).unwrap();
         cab.set_param(0, 0.0); // -12 dB
         let mut y = crate::testutil::sine(48_000, 440.0, 48_000 / 4);
-        cab.process(&mut y);
+        let mut yr = y.clone();
+        cab.process(&mut y, &mut yr);
         let tail = &y[y.len() - 1_000..];
         assert!((peak(tail) - db_to_lin(-12.0)).abs() < 0.02);
     }

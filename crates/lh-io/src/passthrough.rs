@@ -5,9 +5,10 @@
 //! plugs in. [`Passthrough`] is the identity-processor special case used by
 //! the `run` diagnostic command.
 //!
-//! The audio path is mono: one input channel is tapped and written to every
-//! output channel. Output starts with a soft-start gain ramp so a hot signal
-//! never hits the monitors instantly (white paper §3.3). In debug builds the
+//! The bus is stereo (M7): one mono input channel is tapped, duplicated onto
+//! an L/R pair for the processor, and interleaved to the output device (even
+//! channels take L, odd take R). Output starts with a soft-start gain ramp so
+//! a hot signal never hits the monitors instantly (white paper §3.3). In debug builds the
 //! processor runs under `assert_no_alloc`: any allocation on the audio thread
 //! aborts loudly (CLAUDE.md real-time rules).
 
@@ -81,10 +82,11 @@ pub struct DuplexRunner {
 impl DuplexRunner {
     /// Start streaming. `make_processor` runs once, off the audio thread,
     /// with the resolved stream info; the closure it returns runs on the
-    /// audio thread for every mono block and must obey real-time rules.
+    /// audio thread for every stereo block pair (the mono input arrives
+    /// duplicated on both channels) and must obey real-time rules.
     pub fn start<F>(opts: &RunnerOpts, make_processor: F) -> Result<Self, IoError>
     where
-        F: FnOnce(&StreamInfo) -> Box<dyn FnMut(&mut [f32]) + Send>,
+        F: FnOnce(&StreamInfo) -> Box<dyn FnMut(&mut [f32], &mut [f32]) + Send>,
     {
         let setup = stream::resolve(&DuplexSpec {
             input: opts.input.clone(),
@@ -145,7 +147,8 @@ impl DuplexRunner {
         let data_out = {
             let stats = Arc::clone(&stats);
             let mut gain = 0.0f32;
-            let mut scratch = vec![0.0f32; SCRATCH_FRAMES];
+            let mut scratch_l = vec![0.0f32; SCRATCH_FRAMES];
+            let mut scratch_r = vec![0.0f32; SCRATCH_FRAMES];
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let t0 = Instant::now();
                 stats.out_callbacks.fetch_add(1, Ordering::Relaxed);
@@ -154,27 +157,36 @@ impl DuplexRunner {
                 let mut done = 0usize;
                 while done < frames {
                     let n = (frames - done).min(SCRATCH_FRAMES);
-                    let chunk = &mut scratch[..n];
-                    for s in chunk.iter_mut() {
-                        *s = consumer.pop().unwrap_or_else(|_| {
+                    let left = &mut scratch_l[..n];
+                    let right = &mut scratch_r[..n];
+                    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                        let s = consumer.pop().unwrap_or_else(|_| {
                             missing += 1;
                             0.0
                         });
+                        // Mono guitar in, duplicated onto the stereo bus.
+                        *l = s;
+                        *r = s;
                     }
 
                     #[cfg(debug_assertions)]
-                    assert_no_alloc::assert_no_alloc(|| processor(chunk));
+                    assert_no_alloc::assert_no_alloc(|| processor(left, right));
                     #[cfg(not(debug_assertions))]
-                    processor(chunk);
+                    processor(left, right);
 
                     let out = &mut data[done * out_channels..(done + n) * out_channels];
-                    for (frame, s) in out.chunks_exact_mut(out_channels).zip(chunk.iter()) {
+                    for (frame, (l, r)) in out
+                        .chunks_exact_mut(out_channels)
+                        .zip(left.iter().zip(right.iter()))
+                    {
                         if gain < target_gain {
                             gain = (gain + ramp_step).min(target_gain);
                         }
-                        let value = s * gain;
-                        for o in frame {
-                            *o = value;
+                        // Even device channels get L, odd get R: stereo on a
+                        // normal pair, and nothing is ever silent on >2-ch
+                        // interfaces.
+                        for (ch, o) in frame.iter_mut().enumerate() {
+                            *o = if ch % 2 == 0 { l * gain } else { r * gain };
                         }
                     }
                     done += n;
@@ -225,7 +237,7 @@ pub struct Passthrough {
 
 impl Passthrough {
     pub fn start(opts: &PassthroughOpts) -> Result<Self, IoError> {
-        let inner = DuplexRunner::start(opts, |_| Box::new(|_block: &mut [f32]| {}))?;
+        let inner = DuplexRunner::start(opts, |_| Box::new(|_l: &mut [f32], _r: &mut [f32]| {}))?;
         let description = inner.description.clone();
         Ok(Self { inner, description })
     }

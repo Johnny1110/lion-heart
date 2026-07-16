@@ -24,10 +24,12 @@ fn full_chain_renders_finite_audio() {
     chain.prepare(SR);
 
     let mut x = sine(SR, 220.0, SR as usize);
-    for block in x.chunks_mut(256) {
-        chain.process(block);
+    let mut xr = x.clone();
+    for (l, r) in x.chunks_mut(256).zip(xr.chunks_mut(256)) {
+        chain.process(l, r);
     }
-    assert_finite("chain output", &x);
+    assert_finite("chain output L", &x);
+    assert_finite("chain output R", &xr);
     assert!(rms(&x[SR as usize / 2..]) > 0.05, "signal must pass");
 }
 
@@ -36,7 +38,8 @@ fn handles_blocks_larger_than_internal_chunk() {
     let (mut chain, _handle) = build_chain(pedalboard());
     chain.prepare(SR);
     let mut x = sine(SR, 220.0, 4_096); // > MAX_BLOCK, forces chunking
-    chain.process(&mut x);
+    let mut xr = x.clone();
+    chain.process(&mut x, &mut xr);
     assert_finite("big block", &x);
 }
 
@@ -48,8 +51,9 @@ fn params_travel_through_the_queue() {
     // Crank the drive via the handle; output harmonics must increase.
     let render = |chain: &mut lh_engine::Chain| {
         let mut x = sine(SR, 220.0, SR as usize / 2);
-        for block in x.chunks_mut(256) {
-            chain.process(block);
+        let mut xr = x.clone();
+        for (l, r) in x.chunks_mut(256).zip(xr.chunks_mut(256)) {
+            chain.process(l, r);
         }
         chain.reset();
         rms(&x[SR as usize / 4..])
@@ -83,17 +87,20 @@ fn bypassing_everything_becomes_a_passthrough() {
 
     // First blocks apply the messages and ride the 10 ms crossfade out.
     let mut warm = sine(SR, 220.0, SR as usize / 10);
-    for block in warm.chunks_mut(64) {
-        chain.process(block);
+    let mut warm_r = warm.clone();
+    for (l, r) in warm.chunks_mut(64).zip(warm_r.chunks_mut(64)) {
+        chain.process(l, r);
     }
 
     // Once settled, bypassed slots are skipped entirely: exact passthrough.
     let x = sine(SR, 220.0, 8_192);
     let mut y = x.clone();
-    for block in y.chunks_mut(64) {
-        chain.process(block);
+    let mut yr = x.clone();
+    for (l, r) in y.chunks_mut(64).zip(yr.chunks_mut(64)) {
+        chain.process(l, r);
     }
     assert_eq!(x, y, "settled bypass must be bit-exact passthrough");
+    assert_eq!(x, yr, "right channel too");
 }
 
 #[test]
@@ -128,8 +135,8 @@ impl Effect for AddOne {
     fn prepare(&mut self, _: u32) {}
     fn reset(&mut self) {}
     fn set_param(&mut self, _: usize, _: f32) {}
-    fn process(&mut self, block: &mut [f32]) {
-        for x in block.iter_mut() {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for x in left.iter_mut().chain(right.iter_mut()) {
             *x += 1.0;
         }
     }
@@ -143,8 +150,8 @@ impl Effect for TimesTwo {
     fn prepare(&mut self, _: u32) {}
     fn reset(&mut self) {}
     fn set_param(&mut self, _: usize, _: f32) {}
-    fn process(&mut self, block: &mut [f32]) {
-        for x in block.iter_mut() {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for x in left.iter_mut().chain(right.iter_mut()) {
             *x *= 2.0;
         }
     }
@@ -162,7 +169,9 @@ fn settled_value(chain: &mut lh_engine::Chain) -> f32 {
     for _ in 0..200 {
         // 200 × 64 ≈ 267 ms — enough for any fade to finish
         let mut block = [1.0f32; 64];
-        chain.process(&mut block);
+        let mut block_r = [1.0f32; 64];
+        chain.process(&mut block, &mut block_r);
+        assert_eq!(block, block_r, "identical inputs stay identical");
         last = block[63];
     }
     last
@@ -188,7 +197,8 @@ fn reorder_fades_through_silence_without_clicks() {
     let mut out = Vec::new();
     for _ in 0..200 {
         let mut block = [1.0f32; 64];
-        chain.process(&mut block);
+        let mut block_r = [1.0f32; 64];
+        chain.process(&mut block, &mut block_r);
         out.extend_from_slice(&block);
     }
     let dip = out.iter().fold(f32::INFINITY, |m, v| m.min(v.abs()));
@@ -245,22 +255,25 @@ fn input_tap_sees_raw_input_and_never_blocks() {
     // The tap must carry the *input* even though the chain mutates the block.
     let x = sine(SR, 220.0, 1_024);
     let mut y = x.clone();
-    for block in y.chunks_mut(64) {
-        chain.process(block);
+    let mut yr = x.clone();
+    for (l, r) in y.chunks_mut(64).zip(yr.chunks_mut(64)) {
+        chain.process(l, r);
     }
     let tapped: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
     assert_eq!(tapped, x, "tap is the pre-processing input");
 
     // Unread tap fills up: processing must go on, new samples are dropped.
     let mut z = sine(SR, 220.0, 3 * 4_096);
-    chain.process(&mut z);
+    let mut zr = z.clone();
+    chain.process(&mut z, &mut zr);
     assert_finite("output with full tap", &z);
     assert_eq!(consumer.slots(), 4_096, "ring capped, nothing blocked");
 
     // A vanished consumer (tuner closed) must not disturb the audio path.
     drop(consumer);
     let mut w = sine(SR, 220.0, 512);
-    chain.process(&mut w);
+    let mut wr = w.clone();
+    chain.process(&mut w, &mut wr);
     assert_finite("output after consumer dropped", &w);
 }
 

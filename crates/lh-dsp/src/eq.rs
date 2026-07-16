@@ -73,9 +73,9 @@ pub struct Eq {
     mid_db: Smoothed,
     mid_freq: Smoothed,
     high_db: Smoothed,
-    low: Biquad,
-    mid: Biquad,
-    high: Biquad,
+    low: [Biquad; 2],
+    mid: [Biquad; 2],
+    high: [Biquad; 2],
 }
 
 impl Default for Eq {
@@ -92,9 +92,9 @@ impl Eq {
             mid_db: Smoothed::new(PARAMS[1].default),
             mid_freq: Smoothed::new(PARAMS[2].default),
             high_db: Smoothed::new(PARAMS[3].default),
-            low: Biquad::default(),
-            mid: Biquad::default(),
-            high: Biquad::default(),
+            low: [Biquad::default(); 2],
+            mid: [Biquad::default(); 2],
+            high: [Biquad::default(); 2],
         }
     }
 
@@ -106,16 +106,16 @@ impl Eq {
             self.mid_freq.tick();
             self.high_db.tick();
         }
-        self.low
-            .set_low_shelf(self.sample_rate, LOW_SHELF_HZ, self.low_db.current());
-        self.mid.set_peaking(
-            self.sample_rate,
-            self.mid_freq.current(),
-            self.mid_db.current(),
-            MID_Q,
-        );
-        self.high
-            .set_high_shelf(self.sample_rate, HIGH_SHELF_HZ, self.high_db.current());
+        for ch in 0..2 {
+            self.low[ch].set_low_shelf(self.sample_rate, LOW_SHELF_HZ, self.low_db.current());
+            self.mid[ch].set_peaking(
+                self.sample_rate,
+                self.mid_freq.current(),
+                self.mid_db.current(),
+                MID_Q,
+            );
+            self.high[ch].set_high_shelf(self.sample_rate, HIGH_SHELF_HZ, self.high_db.current());
+        }
     }
 }
 
@@ -140,9 +140,11 @@ impl Effect for Eq {
     }
 
     fn reset(&mut self) {
-        self.low.reset();
-        self.mid.reset();
-        self.high.reset();
+        for ch in 0..2 {
+            self.low[ch].reset();
+            self.mid[ch].reset();
+            self.high[ch].reset();
+        }
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
@@ -156,13 +158,15 @@ impl Effect for Eq {
         }
     }
 
-    fn process(&mut self, block: &mut [f32]) {
-        self.update_coeffs(block.len());
-        for x in block.iter_mut() {
-            let mut y = self.low.process_sample(*x);
-            y = self.mid.process_sample(y);
-            y = self.high.process_sample(y);
-            *x = y;
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.update_coeffs(left.len());
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            let mut y = self.low[0].process_sample(*l);
+            y = self.mid[0].process_sample(y);
+            *l = self.high[0].process_sample(y);
+            let mut y = self.low[1].process_sample(*r);
+            y = self.mid[1].process_sample(y);
+            *r = self.high[1].process_sample(y);
         }
     }
 }
@@ -189,8 +193,9 @@ mod tests {
     fn gain_at(eq: &mut Eq, freq: f32) -> f32 {
         let x = sine(SR, freq, SR as usize / 2);
         let mut y = x.clone();
-        for block in y.chunks_mut(64) {
-            eq.process(block);
+        let mut yr = x.clone();
+        for (l, r) in y.chunks_mut(64).zip(yr.chunks_mut(64)) {
+            eq.process(l, r);
         }
         assert_finite("eq output", &y);
         let n = y.len();
@@ -226,8 +231,9 @@ mod tests {
         set(&mut eq, 2, 1_500.0);
         // Let the 60 ms frequency smoothing settle before measuring.
         let mut warm = sine(SR, 1_500.0, SR as usize / 2);
-        for block in warm.chunks_mut(64) {
-            eq.process(block);
+        let mut warm_r = warm.clone();
+        for (l, r) in warm.chunks_mut(64).zip(warm_r.chunks_mut(64)) {
+            eq.process(l, r);
         }
         assert!((gain_at(&mut eq, 1_500.0) - -12.0).abs() < 1.0);
         eq.reset();
@@ -249,8 +255,9 @@ mod tests {
         set(&mut eq, 0, 12.0);
         set(&mut eq, 3, -12.0);
         let mut x = silence(4_096);
-        eq.process(&mut x);
-        assert!(rms(&x) == 0.0);
+        let mut xr = silence(4_096);
+        eq.process(&mut x, &mut xr);
+        assert!(rms(&x) == 0.0 && rms(&xr) == 0.0);
     }
 
     #[test]
@@ -263,8 +270,9 @@ mod tests {
             set(&mut eq, 3, 4.0);
             for chunk in [32usize, 483, 1_024] {
                 let mut x = sine(sr, 440.0, 4_096);
-                for block in x.chunks_mut(chunk) {
-                    eq.process(block);
+                let mut xr = x.clone();
+                for (l, r) in x.chunks_mut(chunk).zip(xr.chunks_mut(chunk)) {
+                    eq.process(l, r);
                 }
                 assert_finite("eq multirate", &x);
             }
