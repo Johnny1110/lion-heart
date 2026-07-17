@@ -86,14 +86,19 @@ fn bypassing_everything_becomes_a_passthrough() {
     handle.set_active("delay", false).unwrap();
 
     // First blocks apply the messages and ride the 10 ms crossfade out.
-    let mut warm = sine(SR, 220.0, SR as usize / 10);
+    // Half scale throughout keeps the output safety ceiling (-0.3 dBFS)
+    // disengaged — an engaged limiter recovers, but not bit-exactly fast.
+    let mut warm: Vec<f32> = sine(SR, 220.0, SR as usize / 10)
+        .iter()
+        .map(|s| s * 0.5)
+        .collect();
     let mut warm_r = warm.clone();
     for (l, r) in warm.chunks_mut(64).zip(warm_r.chunks_mut(64)) {
         chain.process(l, r);
     }
 
     // Once settled, bypassed slots are skipped entirely: exact passthrough.
-    let x = sine(SR, 220.0, 8_192);
+    let x: Vec<f32> = sine(SR, 220.0, 8_192).iter().map(|s| s * 0.5).collect();
     let mut y = x.clone();
     let mut yr = x.clone();
     for (l, r) in y.chunks_mut(64).zip(yr.chunks_mut(64)) {
@@ -137,6 +142,8 @@ static MUL_FAMILY: FamilyDesc = FamilyDesc {
     pedals: &[&MUL_DESC],
 };
 
+/// Adds a 0.1 step — probe values stay under the output stage's
+/// always-on safety ceiling (-0.3 dBFS).
 struct AddOne;
 impl Effect for AddOne {
     fn family(&self) -> &'static FamilyDesc {
@@ -147,7 +154,7 @@ impl Effect for AddOne {
     fn set_param(&mut self, _: usize, _: f32) {}
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         for x in left.iter_mut().chain(right.iter_mut()) {
-            *x += 1.0;
+            *x += 0.1;
         }
     }
 }
@@ -173,13 +180,13 @@ fn probe_chain() -> (lh_engine::Chain, lh_engine::ChainHandle) {
     (chain, handle)
 }
 
-/// Feed DC 1.0 and return the settled output value.
+/// Feed DC 0.1 and return the settled output value.
 fn settled_value(chain: &mut lh_engine::Chain) -> f32 {
     let mut last = 0.0;
     for _ in 0..200 {
         // 200 × 64 ≈ 267 ms — enough for any fade to finish
-        let mut block = [1.0f32; 64];
-        let mut block_r = [1.0f32; 64];
+        let mut block = [0.1f32; 64];
+        let mut block_r = [0.1f32; 64];
         chain.process(&mut block, &mut block_r);
         assert_eq!(block, block_r, "identical inputs stay identical");
         last = block[63];
@@ -191,11 +198,11 @@ fn settled_value(chain: &mut lh_engine::Chain) -> f32 {
 fn reorder_changes_processing_order() {
     let (mut chain, mut handle) = probe_chain();
     assert_eq!(handle.order_handles(), ["add", "mul"]);
-    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3, "(1+1)*2");
+    assert!((settled_value(&mut chain) - 0.4).abs() < 1e-4, "(.1+.1)*2");
 
     handle.set_order(&["mul", "add"]).unwrap();
     assert_eq!(handle.order_handles(), ["mul", "add"]);
-    assert!((settled_value(&mut chain) - 3.0).abs() < 1e-3, "1*2+1");
+    assert!((settled_value(&mut chain) - 0.3).abs() < 1e-4, ".1*2+.1");
 }
 
 #[test]
@@ -203,25 +210,28 @@ fn install_and_remove_slots_mid_stream() {
     // PRD 002: structure edits while the stream runs — one fade, correct
     // math on the other side, retired effects die on the control thread.
     let (mut chain, mut handle) = probe_chain();
-    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3, "(1+1)*2");
+    assert!((settled_value(&mut chain) - 0.4).abs() < 1e-4, "(.1+.1)*2");
 
-    // Append a second AddOne: (1+1)*2 + 1 = 5. Duplicate family → "add2".
+    // Append a second AddOne: (.1+.1)*2 + .1 = .5. Duplicate family → "add2".
     let installed = handle.install_slot(Box::new(AddOne), usize::MAX).unwrap();
     assert_eq!(installed, "add2");
     assert_eq!(handle.order_handles(), ["add", "mul", "add2"]);
-    assert!((settled_value(&mut chain) - 5.0).abs() < 1e-3, "(1+1)*2+1");
+    assert!(
+        (settled_value(&mut chain) - 0.5).abs() < 1e-4,
+        "(.1+.1)*2+.1"
+    );
 
-    // Insert a third AddOne up front: ((1+1)+1)*2 + 1 = 7. The new first
+    // Insert a third AddOne up front: ((.1+.1)+.1)*2 + .1 = .7. The new first
     // instance takes the plain handle; the others shift ranks.
     let installed = handle.install_slot(Box::new(AddOne), 0).unwrap();
     assert_eq!(installed, "add");
     assert_eq!(handle.order_handles(), ["add", "add2", "mul", "add3"]);
-    assert!((settled_value(&mut chain) - 7.0).abs() < 1e-3);
+    assert!((settled_value(&mut chain) - 0.7).abs() < 1e-4);
 
-    // Remove the multiplier: 1+1+1+1 = 4.
+    // Remove the multiplier: .1+.1+.1+.1 = .4.
     handle.remove_slot("mul").unwrap();
     assert_eq!(handle.order_handles(), ["add", "add2", "add3"]);
-    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3);
+    assert!((settled_value(&mut chain) - 0.4).abs() < 1e-4);
     assert!(
         handle.set_param("mul", "x", 0.0).is_err(),
         "removed slots are unaddressable"
@@ -239,21 +249,21 @@ fn structure_edits_fade_through_silence() {
     handle.install_slot(Box::new(AddOne), 0).unwrap();
     let mut out = Vec::new();
     for _ in 0..200 {
-        let mut block = [1.0f32; 64];
-        let mut block_r = [1.0f32; 64];
+        let mut block = [0.1f32; 64];
+        let mut block_r = [0.1f32; 64];
         chain.process(&mut block, &mut block_r);
         out.extend_from_slice(&block);
     }
     let dip = out.iter().fold(f32::INFINITY, |m, v| m.min(v.abs()));
-    assert!(dip < 0.05, "install must pass near silence, dip {dip}");
+    assert!(dip < 0.005, "install must pass near silence, dip {dip}");
     let max_step = out
         .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_step < 0.25, "no hard switch, step {max_step}");
+    assert!(max_step < 0.025, "no hard switch, step {max_step}");
     assert!(
-        (out.last().unwrap() - 6.0).abs() < 1e-3,
-        "lands on ((1+1)+1)*2"
+        (out.last().unwrap() - 0.6).abs() < 1e-4,
+        "lands on ((.1+.1)+.1)*2"
     );
 }
 
@@ -278,20 +288,20 @@ fn reorder_fades_through_silence_without_clicks() {
     handle.set_order(&["mul", "add"]).unwrap();
     let mut out = Vec::new();
     for _ in 0..200 {
-        let mut block = [1.0f32; 64];
-        let mut block_r = [1.0f32; 64];
+        let mut block = [0.1f32; 64];
+        let mut block_r = [0.1f32; 64];
         chain.process(&mut block, &mut block_r);
         out.extend_from_slice(&block);
     }
     let dip = out.iter().fold(f32::INFINITY, |m, v| m.min(v.abs()));
-    assert!(dip < 0.05, "must pass near silence, dip {dip}");
+    assert!(dip < 0.005, "must pass near silence, dip {dip}");
     let max_step = out
         .windows(2)
         .map(|w| (w[1] - w[0]).abs())
         .fold(0.0f32, f32::max);
-    assert!(max_step < 0.2, "no hard switch, step {max_step}");
+    assert!(max_step < 0.02, "no hard switch, step {max_step}");
     assert!(
-        (out.last().unwrap() - 3.0).abs() < 1e-3,
+        (out.last().unwrap() - 0.3).abs() < 1e-4,
         "lands on new order"
     );
 }
@@ -365,8 +375,8 @@ fn preset_apply_rebuilds_structure() {
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(built, 1, "one new instance built, two claimed");
     assert_eq!(handle.order_handles(), ["mul", "add", "add2"]);
-    // DC 1: 1*2 = 2, +1, +1 = 4.
-    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3);
+    // DC .1: .1*2 = .2, +.1, +.1 = .4.
+    assert!((settled_value(&mut chain) - 0.4).abs() < 1e-4);
 }
 
 #[test]
@@ -445,6 +455,100 @@ fn input_tap_sees_raw_input_and_never_blocks() {
     let mut wr = w.clone();
     chain.process(&mut w, &mut wr);
     assert_finite("output after consumer dropped", &w);
+}
+
+#[test]
+fn output_stage_eq_and_safety_limiter() {
+    use lh_core::global_eq::{Band, BandKind};
+
+    // An empty chain is a passthrough into the output stage.
+    let (mut chain, mut handle) = build_chain(vec![]);
+    chain.prepare(SR);
+
+    let render = |chain: &mut lh_engine::Chain, amp: f32| {
+        let mut l: Vec<f32> = sine(SR, 220.0, SR as usize / 2)
+            .iter()
+            .map(|s| s * amp)
+            .collect();
+        let mut r = l.clone();
+        for (cl, cr) in l.chunks_mut(64).zip(r.chunks_mut(64)) {
+            chain.process(cl, cr);
+        }
+        l
+    };
+
+    // Transparent by default (safety only touches overs).
+    let y = render(&mut chain, 0.5);
+    assert_finite("output stage", &y);
+    let base = rms(&y[y.len() / 2..]);
+    assert!(
+        (base - 0.5 / 2f32.sqrt()).abs() < 1e-3,
+        "transparent: {base}"
+    );
+
+    // A +12 dB bell at the test frequency is audible after the messages land.
+    handle
+        .set_eq_band(
+            2,
+            Band {
+                enabled: true,
+                kind: BandKind::Bell,
+                freq: 220.0,
+                gain_db: 12.0,
+                q: 0.7,
+            },
+        )
+        .unwrap();
+    let boosted = rms(&render(&mut chain, 0.1)[SR as usize / 4..]);
+    let flat = 0.1 / 2f32.sqrt();
+    assert!(
+        boosted > 2.5 * flat,
+        "EQ boost must land: {boosted} vs flat {flat}"
+    );
+
+    // The safety limiter caps everything near -0.3 dBFS — even with the
+    // EQ still boosting +12 dB into it.
+    let hot = render(&mut chain, 2.0);
+    let peak_out = hot[hot.len() / 2..]
+        .iter()
+        .fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(peak_out <= 1.0, "safety ceiling must hold, peak {peak_out}");
+
+    // Master off: bit-transparent again after the crossfade settles (the
+    // reset clears the safety limiter's recovery from the hot render).
+    handle.set_eq_active(false).unwrap();
+    let _settle = render(&mut chain, 0.1);
+    chain.reset();
+    let x: Vec<f32> = sine(SR, 220.0, 4_096).iter().map(|s| s * 0.5).collect();
+    let mut l = x.clone();
+    let mut r = x.clone();
+    for (cl, cr) in l.chunks_mut(64).zip(r.chunks_mut(64)) {
+        chain.process(cl, cr);
+    }
+    assert_eq!(x, l, "disabled global EQ must be bit-exact");
+}
+
+#[test]
+fn output_tap_carries_the_post_stage_mono_sum() {
+    let (mut chain, _handle) = build_chain(vec![]);
+    chain.prepare(SR);
+    let (producer, mut consumer) = rtrb::RingBuffer::<f32>::new(8_192);
+    chain.set_output_tap(producer);
+
+    let x = sine(SR, 220.0, 1_024);
+    let mut l = x.clone();
+    let mut r = x.clone();
+    chain.process(&mut l, &mut r);
+    let tapped: Vec<f32> = std::iter::from_fn(|| consumer.pop().ok()).collect();
+    assert_eq!(tapped.len(), 1_024);
+    // Identical channels ⇒ the mono sum is the processed signal itself.
+    assert_eq!(tapped, l, "tap sees what leaves the output stage");
+
+    // A full tap never blocks processing.
+    let mut big = sine(SR, 220.0, 3 * 8_192);
+    let mut big_r = big.clone();
+    chain.process(&mut big, &mut big_r);
+    assert_finite("output with full tap", &big);
 }
 
 #[test]

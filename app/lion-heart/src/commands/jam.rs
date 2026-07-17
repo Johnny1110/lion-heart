@@ -47,6 +47,7 @@ pub fn run(args: JamArgs) -> Result<()> {
         // jam run (incl. the null-device smoke test under assert_no_alloc)
         // exercises the tap's real-time path.
         tuner_tap: true,
+        spectrum_tap: false,
         midi_port: args.midi.clone(),
     })?;
 

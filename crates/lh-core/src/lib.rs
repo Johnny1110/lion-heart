@@ -9,6 +9,7 @@
 //! robust against parameter reordering.
 
 pub mod drive_law;
+pub mod global_eq;
 pub mod preset;
 
 /// Decibels → linear amplitude.

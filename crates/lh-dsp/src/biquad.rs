@@ -83,6 +83,39 @@ impl Biquad {
         );
     }
 
+    /// Highpass (12 dB/oct); `q` shapes the corner (0.707 = Butterworth).
+    pub fn set_highpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let (sin_w, cos_w) = w.sin_cos();
+        let alpha = sin_w / (2.0 * q);
+        let b = (1.0 + cos_w) / 2.0;
+        self.set(b, -(1.0 + cos_w), b, 1.0 + alpha, -2.0 * cos_w, 1.0 - alpha);
+    }
+
+    /// Lowpass (12 dB/oct); `q` shapes the corner (0.707 = Butterworth).
+    pub fn set_lowpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let (sin_w, cos_w) = w.sin_cos();
+        let alpha = sin_w / (2.0 * q);
+        let b = (1.0 - cos_w) / 2.0;
+        self.set(b, 1.0 - cos_w, b, 1.0 + alpha, -2.0 * cos_w, 1.0 - alpha);
+    }
+
+    /// Magnitude response at `freq` in dB, straight from the coefficients —
+    /// what the GUI curve plots is exactly what the filter does.
+    pub fn magnitude_db(&self, sample_rate: f32, freq: f32) -> f32 {
+        let w = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let (sin_w, cos_w) = w.sin_cos();
+        let (sin_2w, cos_2w) = (2.0 * w).sin_cos();
+        let num_re = self.b0 + self.b1 * cos_w + self.b2 * cos_2w;
+        let num_im = -(self.b1 * sin_w + self.b2 * sin_2w);
+        let den_re = 1.0 + self.a1 * cos_w + self.a2 * cos_2w;
+        let den_im = -(self.a1 * sin_w + self.a2 * sin_2w);
+        let num = (num_re * num_re + num_im * num_im).max(1e-20);
+        let den = (den_re * den_re + den_im * den_im).max(1e-20);
+        10.0 * (num / den).log10()
+    }
+
     /// High shelf with corner `fc`, slope 1.
     pub fn set_high_shelf(&mut self, sample_rate: f32, fc: f32, gain_db: f32) {
         let a = 10f32.powf(gain_db / 40.0);
@@ -135,6 +168,36 @@ mod tests {
         assert!(gain_at(&mut f, 60.0).abs() < 1.0);
         f.reset();
         assert!(gain_at(&mut f, 10_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn cut_filters_slope_off_their_side() {
+        let mut hp = Biquad::default();
+        hp.set_highpass(SR, 100.0, 0.707);
+        assert!(gain_at(&mut hp, 25.0) < -20.0);
+        hp.reset();
+        assert!(gain_at(&mut hp, 1_000.0).abs() < 0.5);
+
+        let mut lp = Biquad::default();
+        lp.set_lowpass(SR, 5_000.0, 0.707);
+        assert!(gain_at(&mut lp, 18_000.0) < -18.0);
+        lp.reset();
+        assert!(gain_at(&mut lp, 500.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn magnitude_matches_rendered_gain() {
+        let mut f = Biquad::default();
+        f.set_peaking(SR, 800.0, 9.0, 0.8);
+        for freq in [100.0, 800.0, 3_000.0] {
+            let analytic = f.magnitude_db(SR, freq);
+            let rendered = gain_at(&mut f, freq);
+            f.reset();
+            assert!(
+                (analytic - rendered).abs() < 0.3,
+                "{freq} Hz: analytic {analytic} vs rendered {rendered}"
+            );
+        }
     }
 
     #[test]

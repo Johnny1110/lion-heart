@@ -14,77 +14,68 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
-**M7 (plugin & release) — code landed.** Two parts:
+**M8 (freeboard) — code landed.** Three features, specced in `docs/PRD/`
+(001–003, zh-TW) and recorded as ADRs 004–006:
 
-1. **Stereo bus** — `Effect::process(left, right)` end to end; gate/comp/limiter
-   linked detectors, drive/EQ dual channel state, modulation true stereo
-   (quadrature LFO; tremolo auto-pans), reverb dual ±1 Hadamard tap mixes off
-   the shared FDN, NAM mono-sums, cab dual convolvers; duplex runner duplicates
-   the mono input to L/R and interleaves out (even device channels L, odd R).
-   ADR 002 marked implemented.
-2. **Plugin** — `plugin/lion-heart-plugin` wraps the same chain via nih-plug
-   (git dep, **pinned rev** in the workspace `Cargo.toml`): manual
-   `unsafe impl Params` built from the effect descriptors (every param + per-slot
-   bypass host-automatable, real units, stepped params show labels), a
-   **Preset (assets)** IntParam loads NAM/IR from `~/.lion-heart/presets/` on
-   nih-plug's background thread through the same `AssetHandle` hot-swap seam.
-   Chain order fixed in the plugin (no editor yet). **Passes clap-validator
-   (16/16 applicable)**. `cargo xtask bundle lion-heart-plugin --release` makes
-   `target/bundled/Lion-Heart.{clap,vst3}`; VST3 builds are GPLv3 (crate license
-   differs from the workspace on purpose). Release pipeline:
-   `.github/workflows/release.yml` (tag `v*` → macOS build → draft release),
-   `scripts/codesign-notarize.sh` gated on Apple secrets — see `docs/release.md`.
+1. **Per-pedal params — PRD 001, ADR 004.** `FamilyDesc` in lh-core: a chain
+   slot hosts a family of pedals and **every pedal owns its faceplate**
+   (`EffectDesc`: TS9 3 knobs, evva 5 incl. its 3-band EQ, tremolo 2 —
+   its redundant mix folded into depth). Knob **memory** lives in the
+   ChainHandle's per-pedal shadow: switching sends `SelectPedal` then
+   re-sends the incoming pedal's values; effects hold no cross-pedal state.
+   Preset **schema v3** stores every pedal's values per slot; v1/v2
+   migrations keep old files sounding identical (`preset::DRIVE_PEDALS` /
+   `MOD_PEDALS` pin registry order). Virtual `slot.pedal` selector in
+   REPL/MIDI (`model`/`type` accepted as aliases). The plugin statically
+   expands all pedals' params (`drive_ts9_drive`, …) plus a stepped
+   `{slot}_pedal` selector; host state per pedal is the memory there.
+2. **Dynamic chain — PRD 002, ADR 005.** Slots are instances: same family
+   several times, addressed as `family`/`familyN` by chain rank (`drive2`).
+   Engine grew `InstallSlot` (control-side-prepared, applied silently
+   outside the audible order) and `RemoveSlot` (at the fade bottom, after
+   the pending order) plus a retire chute — untouched slots keep their
+   tails; an install cancels a racing pending removal of its index.
+   Presets define the structure: load reconciles (claim same-family
+   survivors → remove leftovers → install missing via the session's
+   `build_family_effect` factory). amp/cab stay singletons (asset mounts;
+   re-adding remounts the loaded asset). Max 12 slots; empty chain =
+   passthrough; limiter no longer pinned last. GUI chain strip is the
+   board editor (drag cards to move, ＋ pick-list to add, remove in the
+   params panel); REPL: `add`/`remove`, `order` takes handles.
+3. **Global output EQ — PRD 003, ADR 006.** Fixed output stage in `Chain`
+   after the master fade: **global EQ → safety limiter → spectrum tap**.
+   The safety limiter (−0.3 dBFS, always on, invisible) carries white
+   paper §3.3 now that the chain limiter is removable. EQ: 8 bands
+   (low/high-cut, shelves, bells; `lh_core::global_eq` state), smoothed
+   block-rate coefficient rebuilds + per-band wet crossfades,
+   bit-transparent when off. Persisted app-globally in
+   `~/.lion-heart/global_eq.json` — deliberately **not** in presets
+   (environment, not tone). GUI "eq" chip: log-freq canvas with the live
+   output spectrum (realfft on the GUI thread, 4096-pt Hann, ~30 Hz,
+   fast-attack/slow-release) under the response curve computed from the
+   same RBJ math as the audio path; drag = freq/gain, wheel = Q,
+   double-click = enable/disable; detail strip for type/readouts/flat/
+   master. `global_eq_4band` criterion bench tracks the stage cost.
 
-Pending user verification on the Mac: stereo width by ear (chorus/reverb/
-tremolo), plugin in a real host (Reaper/Bitwig/Live: insert, pick a preset,
-automate knobs), foot controller end-to-end, `--buffer 32` on hardware, RTL
-numbers into `docs/latency.md`. **v0.1 tagging is the user's call** after that
-verification (`git tag v0.1.0 && git push origin v0.1.0` drafts the release).
+Pending user verification on the Mac: pedal switching by ear (per-pedal
+values restored, faceplates correct), board editing while playing (drag/
+add/remove — tails keep ringing through the fade), a 3-drive board saved
+and reloaded, the EQ panel against real playing (spectrum sanity, drag
+feel, persistence across restarts), plugin re-check in a real host
+(drive/mod param ids changed — pre-v0.1 break; re-run clap-validator),
+plus the standing M7 items (stereo width by ear, foot controller
+end-to-end, `--buffer 32` on hardware, RTL numbers into
+`docs/latency.md`). **v0.1 tagging is the user's call** after that.
 
-- `lh-midi` (new crate): PC/CC parsing and a JSON mapping
-  (`~/.lion-heart/midi.json`: `input` port, `channel` filter, `pc_presets` names,
-  `cc` → `"slot.param"` or bare `"slot"` for bypass). Zero-config default: connect
-  the first input port, **PC n loads the n-th preset (sorted)**. midir events are
-  forwarded over `mpsc` to the control thread — the engine queue stays SPSC; MIDI
-  never touches the audio thread. Connection failure is never fatal.
-- Session drains MIDI in the control loop (`drain_midi()` → applied-action lines);
-  jam prints them, the GUI shows them in the status line and re-syncs its state.
-  `--midi <port>` overrides on both; `lion-heart devices` lists MIDI inputs too.
-- GUI **live view** ("live" chip): big preset name, prev/next preset buttons, big
-  meters, mini tuner readout, chain summary — stage mode.
-- GUI **settings panel** ("settings" chip): input/output device, input channel,
-  and buffer size at runtime. Apply restarts the stream via
-  `Session::carry_over()`/`resume()` (chain state + assets survive; on failure it
-  rolls back to the previous configuration). Applied choices persist in
-  `~/.lion-heart/config.json` and fill in whatever the CLI left unspecified —
-  explicit flags still win (`--buffer`/`--in-channel` are now optional args,
-  defaults unchanged). `devices::select` prefers exact name matches over
-  substrings so full-name GUI picks are unambiguous.
-- **Drive model registry — ADR 003.** The drive slot has a stepped `model`
-  param (`ts9`, `blues driver`, `classic`) + three pedal-style position knobs
-  0–10; each model is a `Circuit` impl (nonlinear `shape` at 4× OS rate,
-  linear `post` at base rate) registered in `lh_dsp::drive::MODELS` — append
-  a `ModelDef` (label, knob captions, builder) and the GUI dropdown + knob
-  captions ("Gain" on blues driver), REPL labels, MIDI, plugin param pick it
-  up. Preset **schema v2**: v1 drive values (dB/Hz) migrate through
-  `lh_core::drive_law` inverses onto `model=classic` — old presets sound
-  identical. Stepped params render as dropdowns in the GUI (mod type too).
-- 32-frame target verified: the 8-pedal hand-written chain is ~4 µs per 32-frame
-  block (0.6 % of the 667 µs deadline, linear scaling — see `docs/benchmarks.md`),
-  null-device run at `--buffer 32` clean under assert_no_alloc.
-
-M5 recap: ten-slot chain gate→comp→drive→amp→eq→mod→delay→reverb→cab→limiter;
-`Range::Stepped { labels }` for the mod-type param (labels work in REPL/UI);
-8-line Householder FDN reverb, **mono — ADR 002** defers stereo to the M7 bus.
-Old presets load forward-compatibly; the limiter is always moved back to last.
-
-Pending user verification on the Mac: foot controller end-to-end (PC preset
-switch, CC expression → param, CC bypass), live view at stage distance,
-`--buffer 32` xruns on real hardware, settings panel against real devices
-(switch Scarlett ↔ built-in mid-jam, buffer change, unplug rollback), drive
-models by ear (ts9 mid-hump vs blues driver openness, knob tapers, model
-switch mid-note, an old preset still sounding right), plus the standing items
-(M5 pedals by ear, tuner sanity, RTL numbers into `docs/latency.md`).
+M7 recap: stereo bus end to end (ADR 002 implemented) and the
+CLAP/VST3 plugin via nih-plug (pinned rev) with the release pipeline
+(`.github/workflows/release.yml`, `scripts/codesign-notarize.sh`,
+`docs/release.md`). M6: MIDI foot control (`lh-midi`, `~/.lion-heart/
+midi.json`, zero-config PC n → nth preset; mpsc → control thread, engine
+queue stays SPSC), GUI live view + settings panel
+(`Session::carry_over()`/`resume()`, config-persisted I/O). M5: the
+ten-slot chain and the 8-line Householder FDN reverb; the hand-written
+chain is ~4 µs per 32-frame block (`docs/benchmarks.md`).
 
 Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap the audio
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat

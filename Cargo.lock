@@ -2260,6 +2260,7 @@ dependencies = [
  "lh-io",
  "lh-midi",
  "lh-nam",
+ "realfft",
  "rtrb",
  "serde",
  "serde_json",

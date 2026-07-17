@@ -22,3 +22,5 @@ anyhow.workspace = true
 ctrlc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Spectrum analyzer FFT (GUI thread only — never on the audio path).
+realfft.workspace = true

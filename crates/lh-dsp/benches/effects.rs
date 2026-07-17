@@ -101,6 +101,18 @@ fn bench_effects(c: &mut Criterion) {
     reverb.prepare(SR);
     bench_stereo!(group, "reverb_fdn8", reverb, buf, buf_r);
 
+    // The always-on output stage EQ with a representative four bands live.
+    let mut global_eq = lh_dsp::param_eq::GlobalEq::new();
+    global_eq.prepare(SR);
+    let mut state = lh_core::global_eq::GlobalEqState::default();
+    for (i, freq) in [(0usize, 40.0), (2, 250.0), (5, 3_000.0), (7, 11_000.0)] {
+        state.bands[i].enabled = true;
+        state.bands[i].freq = freq;
+        state.bands[i].gain_db = 4.0;
+        global_eq.set_band(i, state.bands[i]);
+    }
+    bench_stereo!(group, "global_eq_4band", global_eq, buf, buf_r);
+
     group.finish();
 }
 

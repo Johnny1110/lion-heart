@@ -20,9 +20,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use std::collections::BTreeMap;
 
+use lh_core::global_eq::{BAND_COUNT, Band, GlobalEqState};
 use lh_core::preset::SlotState;
 use lh_core::{FamilyDesc, ParamDesc, ParamId, lin_to_db};
 use lh_dsp::Effect;
+use lh_dsp::limiter::Limiter;
+use lh_dsp::param_eq::GlobalEq;
 use lh_dsp::smooth::Smoothed;
 use thiserror::Error;
 
@@ -77,6 +80,13 @@ pub enum EngineMsg {
     RemoveSlot {
         index: u8,
     },
+    /// Update one global-EQ band on the output stage (PRD 003).
+    SetEqBand {
+        band: u8,
+        state: Band,
+    },
+    /// Master toggle of the output-stage global EQ (crossfaded).
+    SetEqActive(bool),
 }
 
 #[derive(Debug, Error)]
@@ -125,6 +135,74 @@ struct Slot {
     wet: Smoothed,
 }
 
+/// The always-on ceiling of the output stage. With the chain limiter now
+/// optional (PRD 002), white paper §3.3's "no patch, setting, or bug may
+/// slam the monitors" guarantee lives here — and it catches global-EQ
+/// boosts too.
+const SAFETY_CEILING_DB: f32 = -0.3;
+
+/// Fixed output stage (PRD 003): chain → global EQ → safety limiter →
+/// spectrum tap. Runs after the master fade, so structure edits are already
+/// silent by the time they reach it.
+struct OutputStage {
+    eq: GlobalEq,
+    safety: Limiter,
+    /// Post-stage mono sum for the GUI spectrum analyzer. Lock-free,
+    /// drop-on-full: an unread tap must never stall the callback.
+    tap: Option<rtrb::Producer<f32>>,
+    /// Preallocated mono-sum scratch (MAX_BLOCK; input is chunked to fit).
+    mono: Vec<f32>,
+}
+
+impl OutputStage {
+    fn new() -> Self {
+        Self {
+            eq: GlobalEq::new(),
+            safety: Limiter::new(),
+            tap: None,
+            mono: Vec::new(),
+        }
+    }
+
+    fn prepare(&mut self, sample_rate: u32) {
+        self.eq.prepare(sample_rate);
+        self.safety.prepare(sample_rate);
+        let ceiling = &lh_dsp::limiter::DESC.params[0];
+        self.safety
+            .set_param(0, ceiling.range.to_norm(SAFETY_CEILING_DB));
+        self.mono = vec![0.0; MAX_BLOCK];
+    }
+
+    fn reset(&mut self) {
+        self.eq.reset();
+        self.safety.reset();
+    }
+
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
+            self.eq.process(chunk_l, chunk_r);
+            self.safety.process(chunk_l, chunk_r);
+            if let Some(tap) = &mut self.tap {
+                let n = chunk_l.len().min(self.mono.len()).min(tap.slots());
+                if n > 0
+                    && let Ok(mut chunk) = tap.write_chunk(n)
+                {
+                    for (m, (l, r)) in self.mono[..n]
+                        .iter_mut()
+                        .zip(chunk_l.iter().zip(chunk_r.iter()))
+                    {
+                        *m = 0.5 * (l + r);
+                    }
+                    let (a, b) = chunk.as_mut_slices();
+                    a.copy_from_slice(&self.mono[..a.len()]);
+                    b.copy_from_slice(&self.mono[a.len()..a.len() + b.len()]);
+                    chunk.commit_all();
+                }
+            }
+        }
+    }
+}
+
 /// The audio-thread side. RT rules apply to [`Chain::process`] and
 /// [`Chain::reset`]; [`Chain::prepare`] allocates and runs before streams start.
 pub struct Chain {
@@ -148,6 +226,8 @@ pub struct Chain {
     sample_rate: u32,
     dry_l: Vec<f32>,
     dry_r: Vec<f32>,
+    /// Always-on output stage: global EQ → safety limiter → spectrum tap.
+    output: OutputStage,
     telemetry: Arc<Telemetry>,
     /// Optional raw-input copy for control-thread analyzers (tuner).
     tap: Option<rtrb::Producer<f32>>,
@@ -165,12 +245,20 @@ impl Chain {
         self.fade.snap_to_target();
         self.dry_l = vec![0.0; MAX_BLOCK];
         self.dry_r = vec![0.0; MAX_BLOCK];
+        self.output.prepare(sample_rate);
     }
 
     pub fn reset(&mut self) {
         for slot in self.slots.iter_mut().flatten() {
             slot.effect.reset();
         }
+        self.output.reset();
+    }
+
+    /// Install the post-output-stage tap for the GUI spectrum analyzer.
+    /// Call before the chain moves to the audio thread.
+    pub fn set_output_tap(&mut self, tap: rtrb::Producer<f32>) {
+        self.output.tap = Some(tap);
     }
 
     /// Send an effect down the chute; park it if the chute is full (retried
@@ -257,6 +345,12 @@ impl Chain {
                         self.pending_removes[index as usize] = true;
                         self.fade.set_target(0.0);
                     }
+                }
+                Ok(EngineMsg::SetEqBand { band, state }) => {
+                    self.output.eq.set_band(band as usize, state);
+                }
+                Ok(EngineMsg::SetEqActive(on)) => {
+                    self.output.eq.set_enabled(on);
                 }
                 Err(_) => break,
             }
@@ -347,6 +441,9 @@ impl Chain {
             }
         }
 
+        // Output stage (PRD 003): global EQ → safety limiter → spectrum tap.
+        self.output.process(left, right);
+
         self.telemetry
             .peak_out_bits
             .store(peak(left).max(peak(right)).to_bits(), Ordering::Relaxed);
@@ -423,6 +520,8 @@ pub struct ChainHandle {
     next_free: usize,
     /// Retired effects come back here to die on this thread.
     retired_rx: rtrb::Consumer<Box<dyn Effect>>,
+    /// Output-stage global EQ shadow (PRD 003).
+    eq: GlobalEqState,
     telemetry: Arc<Telemetry>,
 }
 
@@ -452,6 +551,48 @@ impl ChainHandle {
             n += 1;
         }
         n
+    }
+
+    /// The output-stage global EQ shadow (PRD 003).
+    pub fn eq_state(&self) -> &GlobalEqState {
+        &self.eq
+    }
+
+    /// Update one global-EQ band (values clamped into range).
+    pub fn set_eq_band(&mut self, index: usize, band: Band) -> Result<(), EngineError> {
+        if index >= BAND_COUNT {
+            return Err(EngineError::UnknownParam {
+                slot: "global eq".to_string(),
+                param: format!("band {index}"),
+            });
+        }
+        let band = band.clamped();
+        self.tx
+            .push(EngineMsg::SetEqBand {
+                band: index as u8,
+                state: band,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
+        self.eq.bands[index] = band;
+        Ok(())
+    }
+
+    /// Master toggle of the output-stage global EQ.
+    pub fn set_eq_active(&mut self, enabled: bool) -> Result<(), EngineError> {
+        self.tx
+            .push(EngineMsg::SetEqActive(enabled))
+            .map_err(|_| EngineError::QueueFull)?;
+        self.eq.enabled = enabled;
+        Ok(())
+    }
+
+    /// Apply a whole EQ state (startup load / stream resume).
+    pub fn apply_eq_state(&mut self, state: &GlobalEqState) -> Result<(), EngineError> {
+        self.set_eq_active(state.enabled)?;
+        for (index, band) in state.bands.iter().enumerate() {
+            self.set_eq_band(index, *band)?;
+        }
+        Ok(())
     }
 
     pub fn slot_count(&self) -> usize {
@@ -1059,6 +1200,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             sample_rate: 48_000,
             dry_l: Vec::new(),
             dry_r: Vec::new(),
+            output: OutputStage::new(),
             telemetry: Arc::clone(&telemetry),
             tap: None,
         },
@@ -1069,6 +1211,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             sample_rate: 48_000,
             next_free: count % MAX_SLOTS,
             retired_rx,
+            eq: GlobalEqState::default(),
             telemetry,
         },
     )

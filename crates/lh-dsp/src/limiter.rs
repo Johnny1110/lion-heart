@@ -118,7 +118,10 @@ impl Effect for Limiter {
             self.gain = if need < self.gain {
                 need
             } else {
-                self.gain + self.release_coeff * (need - self.gain)
+                let g = self.gain + self.release_coeff * (need - self.gain);
+                // Snap the last ~-120 dB of recovery: transparency after an
+                // over becomes exact instead of asymptotic.
+                if need - g < 1e-6 { need } else { g }
             };
             // Hard ceiling as the absolute guarantee.
             *l = (*l * self.gain).clamp(-self.ceiling, self.ceiling);

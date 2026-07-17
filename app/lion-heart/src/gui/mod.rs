@@ -7,8 +7,10 @@
 //! retired assets are collected on the frame tick.
 
 mod browser;
+mod eq;
 mod knob;
 mod meter;
+mod spectrum;
 mod theme;
 mod tuner;
 
@@ -26,13 +28,18 @@ use lh_io::devices::DeviceDesc;
 use crate::cli::GuiArgs;
 use crate::session::{Session, SessionOpts, list_presets, load_config};
 use browser::Browser;
+use eq::EqPanel;
+use lh_core::global_eq::{Band, BandKind};
 use meter::{Ballistics, Meters};
+use spectrum::SpectrumAnalyzer;
 use tuner::{Reading, TunerDisplay};
 
 /// Frames between retired-asset sweeps (~200 ms at 60 fps).
 const GC_FRAMES: u32 = 12;
 /// Frames between tuner estimates (~15 Hz at 60 fps).
 const TUNER_FRAMES: u32 = 4;
+/// Frames between spectrum updates (~30 Hz at 60 fps).
+const SPECTRUM_FRAMES: u32 = 2;
 /// Keep showing the last tuner reading this long after the note decays.
 const TUNER_HOLD: Duration = Duration::from_millis(800);
 const MAX_KNOBS: usize = 8;
@@ -89,6 +96,19 @@ pub enum Message {
     TogglePresets,
     ToggleTuner,
     ToggleLive,
+    ToggleEq,
+    /// Live global-EQ band edit; `commit` also persists to disk.
+    EqBand {
+        index: usize,
+        band: Band,
+        commit: bool,
+    },
+    /// Persist the EQ state (drag release).
+    EqCommit,
+    EqSelect(usize),
+    EqKind(BandKind),
+    EqMaster,
+    EqFlat,
     ToggleSettings,
     SettingsInput(DeviceChoice),
     SettingsOutput(DeviceChoice),
@@ -109,6 +129,8 @@ enum Overlay {
     Browser(Browser),
     /// Stage mode: big preset name, prev/next, big meters.
     Live,
+    /// Global output EQ editor with the live spectrum (PRD 003).
+    Eq,
     /// Audio I/O settings: devices, input channel, buffer size.
     Settings(SettingsDraft),
 }
@@ -312,6 +334,10 @@ struct Running {
     tap: Option<rtrb::Consumer<f32>>,
     tuner: Tuner,
     reading: Option<(Reading, Instant)>,
+    spectrum_tap: Option<rtrb::Consumer<f32>>,
+    analyzer: SpectrumAnalyzer,
+    eq_selected: usize,
+    eq_cache: canvas::Cache,
     slots: Vec<SlotUi>,
     selected: String,
     drag: Option<DragState>,
@@ -348,6 +374,7 @@ impl App {
             gain_db: args.gain_db,
             prefill_blocks: args.prefill_blocks,
             tuner_tap: true,
+            spectrum_tap: true,
             midi_port: args.midi.clone(),
         };
         let mut session = match Session::start(&opts) {
@@ -371,12 +398,18 @@ impl App {
 
         let tap = session.take_tuner_tap();
         let tuner = Tuner::new(session.sample_rate);
+        let spectrum_tap = session.take_spectrum_tap();
+        let analyzer = SpectrumAnalyzer::new(session.sample_rate);
         let mut running = Running {
             session,
             opts,
             tap,
             tuner,
             reading: None,
+            spectrum_tap,
+            analyzer,
+            eq_selected: 2,
+            eq_cache: canvas::Cache::new(),
             slots: Vec::new(),
             selected: String::new(),
             drag: None,
@@ -704,6 +737,72 @@ impl Running {
                     }
                 };
             }
+            Message::ToggleEq => {
+                self.overlay = match self.overlay {
+                    Overlay::Eq => Overlay::None,
+                    _ => Overlay::Eq,
+                };
+            }
+            Message::EqBand {
+                index,
+                band,
+                commit,
+            } => {
+                match self.session.set_eq_band(index, band) {
+                    Ok(()) => {
+                        self.eq_selected = index;
+                        let b = self.session.eq_state().bands[index];
+                        self.status = format!(
+                            "eq band {}: {} {:.0} Hz {:+.1} dB Q {:.2}{}",
+                            index + 1,
+                            b.kind,
+                            b.freq,
+                            b.gain_db,
+                            b.q,
+                            if b.enabled { "" } else { " (off)" },
+                        );
+                        if commit {
+                            self.session.save_global_eq();
+                        }
+                    }
+                    Err(e) => self.status = e,
+                }
+                self.eq_cache.clear();
+            }
+            Message::EqCommit => self.session.save_global_eq(),
+            Message::EqSelect(index) => {
+                self.eq_selected = index;
+                self.eq_cache.clear();
+            }
+            Message::EqKind(kind) => {
+                let mut band = self.session.eq_state().bands[self.eq_selected];
+                band.kind = kind;
+                if !kind.has_gain() {
+                    band.gain_db = 0.0;
+                }
+                match self.session.set_eq_band(self.eq_selected, band) {
+                    Ok(()) => self.session.save_global_eq(),
+                    Err(e) => self.status = e,
+                }
+                self.eq_cache.clear();
+            }
+            Message::EqMaster => {
+                let enabled = !self.session.eq_state().enabled;
+                if let Err(e) = self.session.set_eq_active(enabled) {
+                    self.status = e;
+                } else {
+                    self.status =
+                        format!("global eq {}", if enabled { "enabled" } else { "bypassed" });
+                }
+                self.eq_cache.clear();
+            }
+            Message::EqFlat => {
+                match self.session.reset_global_eq() {
+                    Ok(()) => self.status = "global eq reset to flat".into(),
+                    Err(e) => self.status = e,
+                }
+                self.eq_cache.clear();
+            }
             Message::ToggleSettings => {
                 self.overlay = match self.overlay {
                     Overlay::Settings(_) => Overlay::None,
@@ -796,6 +895,24 @@ impl Running {
             .tick(telemetry.peak_in(), telemetry.peak_out());
         self.meter_cache.clear();
         self.live_meter_cache.clear();
+
+        // Keep the spectrum window fresh even while the panel is closed
+        // (the tap is drop-on-full either way).
+        if let Some(tap) = &mut self.spectrum_tap {
+            let available = tap.slots();
+            if available > 0
+                && let Ok(chunk) = tap.read_chunk(available)
+            {
+                let (a, b) = chunk.as_slices();
+                self.analyzer.feed(a);
+                self.analyzer.feed(b);
+                chunk.commit_all();
+            }
+        }
+        if matches!(self.overlay, Overlay::Eq) && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
+            self.analyzer.update();
+            self.eq_cache.clear();
+        }
 
         self.drain_tap();
         if matches!(self.overlay, Overlay::Tuner | Overlay::Live) {
@@ -926,10 +1043,12 @@ impl Running {
             this.status = lines.last().cloned().unwrap_or_default();
         }
 
-        // New stream ⇒ new tuner tap, and possibly a new sample rate.
+        // New stream ⇒ new taps, and possibly a new sample rate.
         this.tap = session.take_tuner_tap();
         this.tuner = Tuner::new(session.sample_rate);
         this.reading = None;
+        this.spectrum_tap = session.take_spectrum_tap();
+        this.analyzer = SpectrumAnalyzer::new(session.sample_rate);
         this.session = session;
         this.refresh_slots();
         App::Running(Box::new(this))
@@ -967,6 +1086,9 @@ impl Running {
             button(text("live").size(13))
                 .on_press(Message::ToggleLive)
                 .style(theme::chip(matches!(self.overlay, Overlay::Live))),
+            button(text("eq").size(13))
+                .on_press(Message::ToggleEq)
+                .style(theme::chip(matches!(self.overlay, Overlay::Eq))),
             button(text("settings").size(13))
                 .on_press(Message::ToggleSettings)
                 .style(theme::chip(matches!(self.overlay, Overlay::Settings(_)))),
@@ -1073,9 +1195,84 @@ impl Running {
             .height(Length::Fill)
             .into(),
             Overlay::Live => self.live_view(),
+            Overlay::Eq => self.eq_view(),
             Overlay::Settings(draft) => self.settings_view(draft),
             Overlay::None => self.params_panel(),
         }
+    }
+
+    /// Global output EQ (PRD 003): the spectrum-backed band editor plus a
+    /// detail strip for the selected band.
+    fn eq_view(&self) -> Element<'_, Message> {
+        let state = self.session.eq_state();
+        let band = state.bands[self.eq_selected];
+
+        let panel = Canvas::new(EqPanel {
+            state,
+            selected: self.eq_selected,
+            spectrum: &self.analyzer.bins,
+            sample_rate: self.analyzer.sample_rate(),
+            cache: &self.eq_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let mut toggled = band;
+        toggled.enabled = !band.enabled;
+        let readout = if band.kind.has_gain() {
+            format!(
+                "{:.0} Hz  {:+.1} dB  Q {:.2}",
+                band.freq, band.gain_db, band.q
+            )
+        } else {
+            format!("{:.0} Hz  Q {:.2}", band.freq, band.q)
+        };
+        let controls = row![
+            text(format!("band {}", self.eq_selected + 1))
+                .size(13)
+                .color(theme::TEXT_BRIGHT),
+            pick_list(BandKind::ALL, Some(band.kind), Message::EqKind)
+                .style(theme::pick)
+                .menu_style(theme::menu)
+                .text_size(13),
+            button(text(if band.enabled { "ON" } else { "OFF" }).size(12))
+                .on_press(Message::EqBand {
+                    index: self.eq_selected,
+                    band: toggled,
+                    commit: true,
+                })
+                .style(theme::chip(band.enabled)),
+            text(readout)
+                .size(13)
+                .color(theme::TEXT_DIM)
+                .font(iced::Font::MONOSPACE),
+            space().width(Length::Fill),
+            text("drag: freq/gain · wheel: Q · double-click: on/off")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            button(text("flat").size(12))
+                .on_press(Message::EqFlat)
+                .style(theme::action),
+            button(
+                text(if state.enabled {
+                    "EQ ON"
+                } else {
+                    "EQ BYPASSED"
+                })
+                .size(12)
+            )
+            .on_press(Message::EqMaster)
+            .style(theme::chip(state.enabled)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        container(column![panel, controls].spacing(10))
+            .style(theme::panel)
+            .padding(10)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Audio I/O settings: pick devices/channel/buffer, apply restarts the
@@ -1523,6 +1720,7 @@ mod tests {
             gain_db: -3.0,
             prefill_blocks: 2,
             tuner_tap: true,
+            spectrum_tap: false,
             midi_port: None,
         }
     }

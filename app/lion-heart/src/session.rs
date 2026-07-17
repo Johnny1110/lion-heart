@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 /// Samples of raw input buffered for the tuner (~85 ms at 48 kHz).
 const TUNER_TAP_CAPACITY: usize = 4_096;
+/// Samples of output buffered for the spectrum analyzer (~170 ms at 48 kHz).
+const SPECTRUM_TAP_CAPACITY: usize = 8_192;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -62,6 +64,8 @@ pub struct SessionOpts {
     pub prefill_blocks: u32,
     /// Install the raw-input tap for the tuner (GUI).
     pub tuner_tap: bool,
+    /// Install the post-output tap for the spectrum analyzer (GUI).
+    pub spectrum_tap: bool,
     /// MIDI input port override (name substring or index); `None` follows
     /// `midi.json` / first available port.
     pub midi_port: Option<String>,
@@ -93,6 +97,7 @@ pub struct Session {
     pub config: AppConfig,
     runner: DuplexRunner,
     tuner_tap: Option<rtrb::Consumer<f32>>,
+    spectrum_tap: Option<rtrb::Consumer<f32>>,
     midi: Option<MidiRuntime>,
     /// Human-readable MIDI connection state for status lines.
     pub midi_status: String,
@@ -167,6 +172,13 @@ impl Session {
         } else {
             None
         };
+        let spectrum_tap = if opts.spectrum_tap {
+            let (producer, consumer) = rtrb::RingBuffer::new(SPECTRUM_TAP_CAPACITY);
+            chain.set_output_tap(producer);
+            Some(consumer)
+        } else {
+            None
+        };
 
         let runner_opts = RunnerOpts {
             input: opts.input.clone(),
@@ -183,6 +195,10 @@ impl Session {
         })?;
         // Effects installed later are prepared control-side at this rate.
         chain_handle.set_sample_rate(runner.sample_rate);
+        // Global output EQ (PRD 003): app-level, not part of presets.
+        if let Err(e) = chain_handle.apply_eq_state(&load_global_eq()) {
+            eprintln!("warning: global eq not applied: {e}");
+        }
 
         let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());
 
@@ -196,6 +212,7 @@ impl Session {
             config: load_config(),
             runner,
             tuner_tap,
+            spectrum_tap,
             midi,
             midi_status,
         })
@@ -250,6 +267,60 @@ impl Session {
     /// The tuner's raw-input consumer; the GUI takes it once at startup.
     pub fn take_tuner_tap(&mut self) -> Option<rtrb::Consumer<f32>> {
         self.tuner_tap.take()
+    }
+
+    /// The spectrum analyzer's post-output consumer (GUI, once at startup).
+    pub fn take_spectrum_tap(&mut self) -> Option<rtrb::Consumer<f32>> {
+        self.spectrum_tap.take()
+    }
+
+    // --- global output EQ (PRD 003) ---
+
+    pub fn eq_state(&self) -> &lh_core::global_eq::GlobalEqState {
+        self.chain.eq_state()
+    }
+
+    /// Live band update (no disk write — call [`Self::save_global_eq`] at
+    /// commit points: drag release, toggles, resets).
+    pub fn set_eq_band(
+        &mut self,
+        index: usize,
+        band: lh_core::global_eq::Band,
+    ) -> Result<(), String> {
+        self.chain
+            .set_eq_band(index, band)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_eq_active(&mut self, enabled: bool) -> Result<(), String> {
+        self.chain
+            .set_eq_active(enabled)
+            .map_err(|e| e.to_string())?;
+        self.save_global_eq();
+        Ok(())
+    }
+
+    /// Reset the global EQ to its transparent default layout.
+    pub fn reset_global_eq(&mut self) -> Result<(), String> {
+        self.chain
+            .apply_eq_state(&lh_core::global_eq::GlobalEqState::default())
+            .map_err(|e| e.to_string())?;
+        self.save_global_eq();
+        Ok(())
+    }
+
+    /// Persist the current EQ state to `~/.lion-heart/global_eq.json`.
+    pub fn save_global_eq(&self) {
+        let Some(path) = global_eq_path() else { return };
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, self.chain.eq_state().to_json_pretty())
+        };
+        if let Err(e) = write() {
+            eprintln!("warning: could not save global eq: {e}");
+        }
     }
 
     /// The audio thread never deallocates: retired assets and effects die
@@ -603,6 +674,28 @@ pub fn app_dir() -> Option<PathBuf> {
 
 pub fn presets_dir() -> Option<PathBuf> {
     app_dir().map(|d| d.join("presets"))
+}
+
+pub fn global_eq_path() -> Option<PathBuf> {
+    app_dir().map(|d| d.join("global_eq.json"))
+}
+
+/// Read `~/.lion-heart/global_eq.json` (transparent default when absent,
+/// warning on bad JSON).
+fn load_global_eq() -> lh_core::global_eq::GlobalEqState {
+    let Some(path) = global_eq_path() else {
+        return lh_core::global_eq::GlobalEqState::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(json) => match lh_core::global_eq::GlobalEqState::from_json(&json) {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("warning: {}: {e} — using defaults", path.display());
+                lh_core::global_eq::GlobalEqState::default()
+            }
+        },
+        Err(_) => lh_core::global_eq::GlobalEqState::default(),
+    }
 }
 
 /// Sorted preset names on disk (empty when none).

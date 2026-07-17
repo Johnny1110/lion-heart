@@ -16,6 +16,7 @@ pub mod gate;
 pub mod limiter;
 pub mod modulation;
 pub mod oversample;
+pub mod param_eq;
 pub mod reverb;
 pub mod smooth;
 pub mod swap;
