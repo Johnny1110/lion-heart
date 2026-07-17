@@ -14,8 +14,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use std::collections::BTreeMap;
+
 use lh_core::preset::SlotState;
-use lh_core::{EffectDesc, ParamId, lin_to_db};
+use lh_core::{FamilyDesc, ParamDesc, ParamId, lin_to_db};
 use lh_dsp::Effect;
 use lh_dsp::smooth::Smoothed;
 use thiserror::Error;
@@ -40,6 +42,12 @@ pub enum EngineMsg {
         id: ParamId,
         normalized: f32,
     },
+    /// Switch a slot's active pedal (PRD 001). The control side follows up
+    /// with the incoming pedal's param values from its shadow.
+    SelectPedal {
+        slot: u8,
+        pedal: u8,
+    },
     /// `active == false` bypasses the slot (crossfaded).
     SetActive {
         slot: u8,
@@ -59,10 +67,19 @@ pub enum EngineError {
     UnknownSlot(String),
     #[error("unknown param {param:?} on slot {slot:?}")]
     UnknownParam { slot: String, param: String },
+    #[error("unknown pedal {pedal:?} on slot {slot:?}")]
+    UnknownPedal { slot: String, pedal: String },
     #[error("bad chain order: {0}")]
     BadOrder(String),
     #[error("control queue full — engine not draining?")]
     QueueFull,
+}
+
+/// `slot.pedal` is the virtual param that selects a slot's pedal; `model`
+/// (drive) and `type` (mod) are accepted as pre-v3 aliases so existing
+/// `midi.json` mappings keep working.
+pub fn is_pedal_selector(param_key: &str) -> bool {
+    matches!(param_key, "pedal" | "model" | "type")
 }
 
 /// Block peaks published by the audio thread (f32 bits in atomics).
@@ -138,6 +155,11 @@ impl Chain {
                 Ok(EngineMsg::SetParam { id, normalized }) => {
                     if let Some(slot) = self.slots.get_mut(id.slot as usize) {
                         slot.effect.set_param(id.param as usize, normalized);
+                    }
+                }
+                Ok(EngineMsg::SelectPedal { slot, pedal }) => {
+                    if let Some(slot) = self.slots.get_mut(slot as usize) {
+                        slot.effect.select_pedal(pedal as usize);
                     }
                 }
                 Ok(EngineMsg::SetActive { slot, active }) => {
@@ -242,18 +264,25 @@ pub struct Applied {
 
 /// The control-thread side: validates keys, tracks a shadow of the state for
 /// display, and feeds the ring.
+///
+/// The shadow keeps values **per pedal** (PRD 001): it is the knob memory
+/// that makes pedal switches restore each pedal's own settings — the engine
+/// side only ever holds the active pedal's live values.
 pub struct ChainHandle {
     tx: rtrb::Producer<EngineMsg>,
-    descs: Vec<&'static EffectDesc>,
-    norms: Vec<Vec<f32>>,
+    families: Vec<&'static FamilyDesc>,
+    /// Active pedal per slot.
+    pedal: Vec<usize>,
+    /// slot → pedal → param norms.
+    norms: Vec<Vec<Vec<f32>>>,
     active: Vec<bool>,
     order: Vec<u8>,
     telemetry: Arc<Telemetry>,
 }
 
 impl ChainHandle {
-    pub fn descriptors(&self) -> &[&'static EffectDesc] {
-        &self.descs
+    pub fn families(&self) -> &[&'static FamilyDesc] {
+        &self.families
     }
 
     pub fn telemetry(&self) -> &Telemetry {
@@ -261,21 +290,49 @@ impl ChainHandle {
     }
 
     fn slot_index(&self, slot_key: &str) -> Result<usize, EngineError> {
-        self.descs
+        self.families
             .iter()
-            .position(|d| d.key == slot_key)
+            .position(|f| f.key == slot_key)
             .ok_or_else(|| EngineError::UnknownSlot(slot_key.to_string()))
     }
 
-    /// Set a parameter from a real-world value (clamped into range).
+    /// The active pedal's descriptor entry for `param_key`, if any.
+    /// (`None` also for the virtual `pedal` selector — check
+    /// [`is_pedal_selector`] first when both are possible.)
+    pub fn param_desc(&self, slot_key: &str, param_key: &str) -> Option<&'static ParamDesc> {
+        let slot = self.slot_index(slot_key).ok()?;
+        let desc = self.families[slot].pedals[self.pedal[slot]];
+        desc.params.get(desc.param_index(param_key)?)
+    }
+
+    /// The active pedal's key for a slot.
+    pub fn active_pedal(&self, slot_key: &str) -> Result<&'static str, EngineError> {
+        let slot = self.slot_index(slot_key)?;
+        Ok(self.families[slot].pedals[self.pedal[slot]].key)
+    }
+
+    /// Set a parameter of the slot's **active pedal** from a real-world
+    /// value (clamped into range). The virtual `pedal` key (and its
+    /// pre-v3 aliases) selects a pedal by index instead.
     pub fn set_param(
         &mut self,
         slot_key: &str,
         param_key: &str,
         real: f32,
     ) -> Result<Applied, EngineError> {
+        if is_pedal_selector(param_key) {
+            let slot = self.slot_index(slot_key)?;
+            let count = self.families[slot].pedals.len();
+            let index = (real.max(0.0).round() as usize).min(count - 1);
+            self.select_pedal_index(slot, index)?;
+            return Ok(Applied {
+                real: index as f32,
+                unit: "",
+            });
+        }
         let slot = self.slot_index(slot_key)?;
-        let desc = self.descs[slot];
+        let pedal = self.pedal[slot];
+        let desc = self.families[slot].pedals[pedal];
         let param = desc
             .param_index(param_key)
             .ok_or_else(|| EngineError::UnknownParam {
@@ -294,11 +351,77 @@ impl ChainHandle {
                 normalized,
             })
             .map_err(|_| EngineError::QueueFull)?;
-        self.norms[slot][param] = normalized;
+        self.norms[slot][pedal][param] = normalized;
         Ok(Applied {
             real: clamped,
             unit: p.unit,
         })
+    }
+
+    /// Select a pedal by key, display name, or numeric index. Returns the
+    /// selected pedal's key.
+    pub fn select_pedal(
+        &mut self,
+        slot_key: &str,
+        selector: &str,
+    ) -> Result<&'static str, EngineError> {
+        let slot = self.slot_index(slot_key)?;
+        let family = self.families[slot];
+        let index = family
+            .pedal_index(selector)
+            .or_else(|| {
+                selector
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|i| *i < family.pedals.len())
+            })
+            .ok_or_else(|| EngineError::UnknownPedal {
+                slot: slot_key.to_string(),
+                pedal: selector.to_string(),
+            })?;
+        self.select_pedal_index(slot, index)
+    }
+
+    /// Select a pedal from a normalized `0..=1` controller position
+    /// (MIDI CC mapped to `slot.pedal`).
+    pub fn select_pedal_norm(
+        &mut self,
+        slot_key: &str,
+        norm: f32,
+    ) -> Result<&'static str, EngineError> {
+        let slot = self.slot_index(slot_key)?;
+        let count = self.families[slot].pedals.len();
+        let index = (norm.clamp(0.0, 1.0) * (count - 1) as f32).round() as usize;
+        self.select_pedal_index(slot, index)
+    }
+
+    fn select_pedal_index(
+        &mut self,
+        slot: usize,
+        index: usize,
+    ) -> Result<&'static str, EngineError> {
+        self.tx
+            .push(EngineMsg::SelectPedal {
+                slot: slot as u8,
+                pedal: index as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
+        self.pedal[slot] = index;
+        // Restore the incoming pedal's knobs from the shadow — the engine
+        // never carries values across pedals (PRD 001 §5). Ring ordering
+        // guarantees these land after the switch.
+        for param in 0..self.norms[slot][index].len() {
+            self.tx
+                .push(EngineMsg::SetParam {
+                    id: ParamId {
+                        slot: slot as u8,
+                        param: param as u8,
+                    },
+                    normalized: self.norms[slot][index][param],
+                })
+                .map_err(|_| EngineError::QueueFull)?;
+        }
+        Ok(self.families[slot].pedals[index].key)
     }
 
     /// Enable (`true`) or bypass (`false`) a slot.
@@ -314,13 +437,18 @@ impl ChainHandle {
         Ok(())
     }
 
+    /// Whether a slot is currently active (not bypassed), from the shadow.
+    pub fn is_active(&self, slot_key: &str) -> Result<bool, EngineError> {
+        Ok(self.active[self.slot_index(slot_key)?])
+    }
+
     /// Reorder the chain. `keys` must name every slot exactly once; the
     /// engine fades through silence while switching.
     pub fn set_order(&mut self, keys: &[&str]) -> Result<(), EngineError> {
-        if keys.len() != self.descs.len() {
+        if keys.len() != self.families.len() {
             return Err(EngineError::BadOrder(format!(
                 "need all {} slots, got {}",
-                self.descs.len(),
+                self.families.len(),
                 keys.len()
             )));
         }
@@ -348,59 +476,126 @@ impl ChainHandle {
     pub fn order_keys(&self) -> Vec<&'static str> {
         self.order
             .iter()
-            .map(|&i| self.descs[i as usize].key)
+            .map(|&i| self.families[i as usize].key)
             .collect()
     }
 
-    /// Capture the chain (order, bypass, real param values) for a preset.
+    /// Capture the chain (order, bypass, selected pedal, and **every**
+    /// pedal's real values) for a preset — the whole knob memory survives
+    /// a save/load round trip (PRD 001 §7.3).
     pub fn snapshot_chain(&self) -> Vec<SlotState> {
         self.order
             .iter()
             .map(|&i| {
                 let i = i as usize;
-                let desc = self.descs[i];
+                let family = self.families[i];
                 SlotState {
-                    key: desc.key.to_string(),
+                    key: family.key.to_string(),
                     active: self.active[i],
-                    params: desc
-                        .params
+                    pedal: Some(family.pedals[self.pedal[i]].key.to_string()),
+                    pedals: family
+                        .pedals
                         .iter()
                         .enumerate()
-                        .map(|(j, p)| (p.key.to_string(), p.range.to_real(self.norms[i][j])))
+                        .map(|(p, desc)| {
+                            (
+                                desc.key.to_string(),
+                                desc.params
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(j, pd)| {
+                                        (pd.key.to_string(), pd.range.to_real(self.norms[i][p][j]))
+                                    })
+                                    .collect(),
+                            )
+                        })
                         .collect(),
+                    params: BTreeMap::new(),
                 }
             })
             .collect()
     }
 
-    /// Apply a preset's chain: params, bypass flags, and order. Unknown
-    /// slots/params are skipped with a warning (forward compatibility);
-    /// slots the preset doesn't mention keep playing, appended at the end.
+    /// Update one pedal's shadow values from a preset map, collecting
+    /// warnings for unknown params.
+    fn absorb_pedal_values(
+        &mut self,
+        slot: usize,
+        pedal: usize,
+        values: &BTreeMap<String, f32>,
+        warnings: &mut Vec<String>,
+    ) {
+        let desc = self.families[slot].pedals[pedal];
+        for (param_key, value) in values {
+            match desc.param_index(param_key) {
+                Some(j) => {
+                    let range = &desc.params[j].range;
+                    self.norms[slot][pedal][j] = range.to_norm(range.clamp(*value));
+                }
+                None => warnings.push(format!(
+                    "unknown param {:?} on pedal {:?} skipped",
+                    param_key, desc.key
+                )),
+            }
+        }
+    }
+
+    /// Apply a preset's chain: pedal selections, per-pedal params, bypass
+    /// flags, and order. Unknown slots/pedals/params are skipped with a
+    /// warning (forward compatibility); slots the preset doesn't mention
+    /// keep playing, appended at the end.
     pub fn apply_preset_chain(&mut self, chain: &[SlotState]) -> Result<Vec<String>, EngineError> {
         let mut warnings = Vec::new();
         let mut order_keys: Vec<&'static str> = Vec::new();
 
         for state in chain {
-            let Ok(idx) = self.slot_index(&state.key) else {
+            let Ok(slot) = self.slot_index(&state.key) else {
                 warnings.push(format!("unknown slot {:?} skipped", state.key));
                 continue;
             };
-            order_keys.push(self.descs[idx].key);
+            let family = self.families[slot];
+            order_keys.push(family.key);
             self.set_active(&state.key, state.active)?;
-            for (param_key, value) in &state.params {
-                match self.set_param(&state.key, param_key, *value) {
-                    Ok(_) => {}
-                    Err(EngineError::UnknownParam { .. }) => warnings.push(format!(
-                        "unknown param {:?} on {:?} skipped",
-                        param_key, state.key
+
+            // All pedal values land in the shadow first — values for
+            // unselected pedals only refresh the knob memory.
+            for (pedal_key, values) in &state.pedals {
+                match family.pedal_index(pedal_key) {
+                    Some(p) => self.absorb_pedal_values(slot, p, values, &mut warnings),
+                    None => warnings.push(format!(
+                        "unknown pedal {:?} on {:?} skipped",
+                        pedal_key, state.key
                     )),
-                    Err(e) => return Err(e),
                 }
             }
+
+            // Resolve the selection: explicit pedal, else the first.
+            let target = match &state.pedal {
+                Some(key) => match family.pedal_index(key) {
+                    Some(p) => p,
+                    None => {
+                        warnings.push(format!(
+                            "unknown pedal {:?} on {:?} — selection kept",
+                            key, state.key
+                        ));
+                        self.pedal[slot]
+                    }
+                },
+                None => 0,
+            };
+
+            // Pre-v3 flat params are values for the selected pedal.
+            if !state.params.is_empty() {
+                let flat = state.params.clone();
+                self.absorb_pedal_values(slot, target, &flat, &mut warnings);
+            }
+
+            // Select and push the active pedal's values to the engine.
+            self.select_pedal_index(slot, target)?;
         }
 
         for &i in &self.order.clone() {
-            let key = self.descs[i as usize].key;
+            let key = self.families[i as usize].key;
             if !order_keys.contains(&key) {
                 order_keys.push(key);
                 warnings.push(format!(
@@ -418,13 +613,14 @@ impl ChainHandle {
             .iter()
             .map(|&i| {
                 let i = i as usize;
-                let desc = self.descs[i];
+                let family = self.families[i];
+                let desc = family.pedals[self.pedal[i]];
                 let params = desc
                     .params
                     .iter()
                     .enumerate()
                     .map(|(j, p)| {
-                        let real = p.range.to_real(self.norms[i][j]);
+                        let real = p.range.to_real(self.norms[i][self.pedal[i]][j]);
                         if let Some(label) = p.range.label(real) {
                             format!("{} {}", p.key, label)
                         } else if p.unit.is_empty() {
@@ -435,9 +631,14 @@ impl ChainHandle {
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
+                let name = if family.pedals.len() > 1 {
+                    format!("{}:{}", family.key, desc.key)
+                } else {
+                    family.key.to_string()
+                };
                 format!(
-                    "{:<7} [{}]  {}",
-                    desc.key,
+                    "{:<12} [{}]  {}",
+                    name,
                     if self.active[i] { "on " } else { "off" },
                     params
                 )
@@ -467,12 +668,18 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
     let (tx, rx) = rtrb::RingBuffer::new(MSG_CAPACITY);
     let telemetry = Arc::new(Telemetry::default());
 
-    let descs: Vec<&'static EffectDesc> = effects.iter().map(|e| e.descriptor()).collect();
-    let norms = descs
+    let families: Vec<&'static FamilyDesc> = effects.iter().map(|e| e.family()).collect();
+    let pedal: Vec<usize> = effects.iter().map(|e| e.pedal_index()).collect();
+    let norms = families
         .iter()
-        .map(|d| d.params.iter().map(|p| p.default_norm()).collect())
+        .map(|f| {
+            f.pedals
+                .iter()
+                .map(|p| p.params.iter().map(|pd| pd.default_norm()).collect())
+                .collect()
+        })
         .collect();
-    let active = vec![true; descs.len()];
+    let active = vec![true; families.len()];
     let order: Vec<u8> = (0..effects.len() as u8).collect();
     let slots = effects
         .into_iter()
@@ -496,7 +703,8 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
         },
         ChainHandle {
             tx,
-            descs,
+            families,
+            pedal,
             norms,
             active,
             order,

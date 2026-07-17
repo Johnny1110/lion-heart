@@ -113,7 +113,7 @@ fn unknown_keys_are_rejected() {
 
 // --- reorder & preset machinery, probed with two distinguishable effects ---
 
-use lh_core::{EffectDesc, ParamDesc};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc};
 
 static NO_PARAMS: [ParamDesc; 0] = [];
 static ADD_DESC: EffectDesc = EffectDesc {
@@ -121,16 +121,26 @@ static ADD_DESC: EffectDesc = EffectDesc {
     name: "Add One",
     params: &NO_PARAMS,
 };
+static ADD_FAMILY: FamilyDesc = FamilyDesc {
+    key: "add",
+    name: "Add One",
+    pedals: &[&ADD_DESC],
+};
 static MUL_DESC: EffectDesc = EffectDesc {
     key: "mul",
     name: "Times Two",
     params: &NO_PARAMS,
 };
+static MUL_FAMILY: FamilyDesc = FamilyDesc {
+    key: "mul",
+    name: "Times Two",
+    pedals: &[&MUL_DESC],
+};
 
 struct AddOne;
 impl Effect for AddOne {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &ADD_DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &ADD_FAMILY
     }
     fn prepare(&mut self, _: u32) {}
     fn reset(&mut self) {}
@@ -144,8 +154,8 @@ impl Effect for AddOne {
 
 struct TimesTwo;
 impl Effect for TimesTwo {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &MUL_DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &MUL_FAMILY
     }
     fn prepare(&mut self, _: u32) {}
     fn reset(&mut self) {}
@@ -226,16 +236,18 @@ fn bad_orders_are_rejected() {
 fn preset_snapshot_applies_back_identically() {
     let (mut chain, mut handle) = build_chain(pedalboard());
     chain.prepare(SR);
-    handle.set_param("drive", "drive", 7.5).unwrap();
-    handle.set_param("drive", "model", 1.0).unwrap();
+    handle.set_param("drive", "drive", 7.5).unwrap(); // ts9 knob
+    handle.select_pedal("drive", "bd2").unwrap();
+    handle.set_param("drive", "gain", 6.0).unwrap(); // bd2 knob
     handle.set_param("delay", "time", 500.0).unwrap();
     handle.set_active("gate", false).unwrap();
     handle.set_order(&["drive", "gate", "delay"]).unwrap();
 
     let saved = handle.snapshot_chain();
     assert_eq!(saved[0].key, "drive");
-    assert_eq!(saved[0].params["drive"], 7.5);
-    assert_eq!(saved[0].params["model"], 1.0);
+    assert_eq!(saved[0].pedal.as_deref(), Some("bd2"));
+    assert_eq!(saved[0].pedals["bd2"]["gain"], 6.0);
+    assert_eq!(saved[0].pedals["ts9"]["drive"], 7.5, "knob memory saved");
     assert!(!saved[1].active);
 
     // A fresh chain of the same pedals, restored from the snapshot.
@@ -244,6 +256,51 @@ fn preset_snapshot_applies_back_identically() {
     let warnings = handle2.apply_preset_chain(&saved).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(handle2.snapshot_chain(), saved);
+}
+
+#[test]
+fn pedal_switch_restores_each_pedals_knobs() {
+    // PRD 001 acceptance: tweak ts9, switch to evva, tweak, switch back —
+    // every pedal keeps its own values.
+    let (mut chain, mut handle) = build_chain(pedalboard());
+    chain.prepare(SR);
+    handle.set_param("drive", "drive", 7.0).unwrap();
+    handle.select_pedal("drive", "evva").unwrap();
+    assert_eq!(handle.active_pedal("drive").unwrap(), "evva");
+    handle.set_param("drive", "gain", 3.0).unwrap();
+    assert!(
+        handle.set_param("drive", "drive", 1.0).is_err(),
+        "ts9's knob is not addressable while evva is selected"
+    );
+    handle.select_pedal("drive", "ts9").unwrap();
+
+    let snap = handle.snapshot_chain();
+    let drive = snap.iter().find(|s| s.key == "drive").unwrap();
+    assert_eq!(drive.pedal.as_deref(), Some("ts9"));
+    assert_eq!(drive.pedals["ts9"]["drive"], 7.0, "ts9 kept its knob");
+    assert_eq!(drive.pedals["evva"]["gain"], 3.0, "evva kept its knob");
+
+    // The engine drains the whole switch+restore burst without trouble.
+    let mut l = [0.0f32; 64];
+    let mut r = [0.0f32; 64];
+    chain.process(&mut l, &mut r);
+    assert_finite("post-switch block", &l);
+}
+
+#[test]
+fn pedal_selector_aliases_and_cc_norms() {
+    let (_chain, mut handle) = build_chain(pedalboard());
+    // `model` is the pre-v3 alias for `pedal` on any slot.
+    let applied = handle.set_param("drive", "model", 1.0).unwrap();
+    assert_eq!(applied.real, 1.0);
+    assert_eq!(handle.active_pedal("drive").unwrap(), "bd2");
+    // A CC at full deflection lands on the last pedal.
+    handle.select_pedal_norm("drive", 1.0).unwrap();
+    assert_eq!(handle.active_pedal("drive").unwrap(), "evva");
+    assert!(handle.select_pedal("drive", "wah").is_err());
+    // Display names resolve too.
+    handle.select_pedal("drive", "Blues Driver").unwrap();
+    assert_eq!(handle.active_pedal("drive").unwrap(), "bd2");
 }
 
 #[test]
@@ -288,22 +345,22 @@ fn preset_apply_is_forward_compatible() {
     chain.prepare(SR);
 
     // A preset from "the future": unknown slot, unknown param, and it
-    // doesn't mention the delay at all.
+    // doesn't mention the delay at all. Flat (pre-v3) params apply to the
+    // selected pedal.
     let chain_states = vec![
         SlotState {
             key: "drive".into(),
-            active: true,
             params: BTreeMap::from([("drive".into(), 8.0), ("sparkle".into(), 1.0)]),
+            ..Default::default()
         },
         SlotState {
             key: "wah".into(),
-            active: true,
-            params: BTreeMap::new(),
+            ..Default::default()
         },
         SlotState {
             key: "gate".into(),
             active: false,
-            params: BTreeMap::new(),
+            ..Default::default()
         },
     ];
     let warnings = handle.apply_preset_chain(&chain_states).unwrap();
@@ -311,7 +368,7 @@ fn preset_apply_is_forward_compatible() {
 
     let now = handle.snapshot_chain();
     assert_eq!(now[0].key, "drive");
-    assert_eq!(now[0].params["drive"], 8.0);
+    assert_eq!(now[0].pedals["ts9"]["drive"], 8.0);
     assert_eq!(now[1].key, "gate");
     assert_eq!(now[2].key, "delay", "unmentioned slot kept at the end");
 }

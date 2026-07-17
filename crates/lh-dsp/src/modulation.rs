@@ -1,25 +1,28 @@
-//! The modulation family: one pedal, four voices — chorus, flanger, phaser,
-//! tremolo — selected by a stepped `type` parameter (white paper puts a
-//! single `mod` position in the chain). All share one LFO and the
-//! rate/depth/feedback/mix controls:
+//! The modulation family: one slot, four pedals — chorus, flanger, phaser,
+//! tremolo — each with its own faceplate (PRD 001):
 //!
 //! - **chorus**: delay line swept 2–14 ms, gentle feedback
+//!   (rate/depth/feedback/mix)
 //! - **flanger**: delay line swept 1–5 ms, prominent feedback
+//!   (rate/depth/feedback/mix)
 //! - **phaser**: four first-order allpass stages, cutoff swept 230–2100 Hz
-//! - **tremolo**: amplitude LFO (feedback unused)
+//!   (rate/depth/feedback/mix)
+//! - **tremolo**: amplitude LFO (rate/depth) — wet-only by construction;
+//!   the v2 `mix` knob was redundant with depth (`depth' = depth × mix`,
+//!   folded by the preset migration).
+//!
+//! All four share one LFO and one pair of voices; switching pedals resets
+//! the voice state (a brief discontinuity while auditioning, never NaN);
+//! continuous params morph smoothly.
 //!
 //! Stereo (M7): two independent voices share the LFO, with the right
 //! channel's phase offset a quarter cycle for chorus/flanger/phaser (width)
-//! and half a cycle for tremolo (auto-pan). Switching type resets the voice
-//! state (a brief discontinuity while auditioning types, never NaN);
-//! continuous params morph smoothly.
+//! and half a cycle for tremolo (auto-pan).
 
-use lh_core::{EffectDesc, ParamDesc, Range};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
 use crate::smooth::Smoothed;
-
-pub static TYPES: [&str; 4] = ["chorus", "flanger", "phaser", "tremolo"];
 
 const CHORUS: usize = 0;
 const FLANGER: usize = 1;
@@ -30,15 +33,7 @@ const TREMOLO: usize = 3;
 const MAX_DELAY_MS: f32 = 20.0;
 const PHASER_STAGES: usize = 4;
 
-static PARAMS: [ParamDesc; 5] = [
-    ParamDesc {
-        key: "type",
-        name: "Type",
-        unit: "",
-        range: Range::Stepped { labels: &TYPES },
-        default: 0.0,
-        smoothing_ms: 0.0,
-    },
+const fn rate(default: f32) -> ParamDesc {
     ParamDesc {
         key: "rate",
         name: "Rate",
@@ -47,42 +42,79 @@ static PARAMS: [ParamDesc; 5] = [
             min: 0.05,
             max: 10.0,
         },
-        default: 0.8,
+        default,
         smoothing_ms: 80.0,
-    },
+    }
+}
+
+const fn depth(default: f32) -> ParamDesc {
     ParamDesc {
         key: "depth",
         name: "Depth",
         unit: "",
         range: Range::Linear { min: 0.0, max: 1.0 },
-        default: 0.5,
+        default,
         smoothing_ms: 50.0,
-    },
-    ParamDesc {
-        key: "feedback",
-        name: "Feedback",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 0.85,
-        },
-        default: 0.25,
-        smoothing_ms: 50.0,
-    },
-    ParamDesc {
-        key: "mix",
-        name: "Mix",
-        unit: "",
-        range: Range::Linear { min: 0.0, max: 1.0 },
-        default: 0.5,
-        smoothing_ms: 30.0,
-    },
-];
+    }
+}
 
-pub static DESC: EffectDesc = EffectDesc {
+const FEEDBACK: ParamDesc = ParamDesc {
+    key: "feedback",
+    name: "Feedback",
+    unit: "",
+    range: Range::Linear {
+        min: 0.0,
+        max: 0.85,
+    },
+    default: 0.25,
+    smoothing_ms: 50.0,
+};
+
+const MIX: ParamDesc = ParamDesc {
+    key: "mix",
+    name: "Mix",
+    unit: "",
+    range: Range::Linear { min: 0.0, max: 1.0 },
+    default: 0.5,
+    smoothing_ms: 30.0,
+};
+
+// chorus/flanger/phaser keep the v2 keys, ranges, and defaults, so sparse
+// v2 presets migrate without pinning; the tremolo faceplate is its own.
+static CHORUS_PARAMS: [ParamDesc; 4] = [rate(0.8), depth(0.5), FEEDBACK, MIX];
+static CHORUS_DESC: EffectDesc = EffectDesc {
+    key: "chorus",
+    name: "Chorus",
+    params: &CHORUS_PARAMS,
+};
+
+static FLANGER_PARAMS: [ParamDesc; 4] = [rate(0.8), depth(0.5), FEEDBACK, MIX];
+static FLANGER_DESC: EffectDesc = EffectDesc {
+    key: "flanger",
+    name: "Flanger",
+    params: &FLANGER_PARAMS,
+};
+
+static PHASER_PARAMS: [ParamDesc; 4] = [rate(0.8), depth(0.5), FEEDBACK, MIX];
+static PHASER_DESC: EffectDesc = EffectDesc {
+    key: "phaser",
+    name: "Phaser",
+    params: &PHASER_PARAMS,
+};
+
+static TREMOLO_PARAMS: [ParamDesc; 2] = [rate(5.0), depth(0.5)];
+static TREMOLO_DESC: EffectDesc = EffectDesc {
+    key: "tremolo",
+    name: "Tremolo",
+    params: &TREMOLO_PARAMS,
+};
+
+/// The modulation family, in menu order. Pinned to
+/// `lh_core::preset::MOD_PEDALS` (the v2 migration) by a test below.
+pub static FAMILY: FamilyDesc = FamilyDesc {
     key: "mod",
     name: "Modulation",
-    params: &PARAMS,
+    pedals: &[&CHORUS_DESC, &FLANGER_DESC, &PHASER_DESC, &TREMOLO_DESC],
 };
 
 /// One channel's voice: delay line (chorus/flanger), allpass chain (phaser),
@@ -168,7 +200,7 @@ impl Voice {
                 y
             }
             TREMOLO => x * (1.0 - depth * (0.5 + 0.5 * lfo)),
-            _ => x, // unreachable: stepped range clamps to 0..=3
+            _ => x, // unreachable: select_pedal rejects out-of-range
         }
     }
 }
@@ -194,11 +226,11 @@ impl Modulation {
     pub fn new() -> Self {
         Self {
             sample_rate: 48_000.0,
-            mode: PARAMS[0].default as usize,
-            rate: Smoothed::new(PARAMS[1].default),
-            depth: Smoothed::new(PARAMS[2].default),
-            feedback: Smoothed::new(PARAMS[3].default),
-            mix: Smoothed::new(PARAMS[4].default),
+            mode: CHORUS,
+            rate: Smoothed::new(CHORUS_PARAMS[0].default),
+            depth: Smoothed::new(CHORUS_PARAMS[1].default),
+            feedback: Smoothed::new(FEEDBACK.default),
+            mix: Smoothed::new(MIX.default),
             phase: 0.0,
             voices: [Voice::new(), Voice::new()],
         }
@@ -212,8 +244,19 @@ impl Modulation {
 }
 
 impl Effect for Modulation {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
+    }
+
+    fn pedal_index(&self) -> usize {
+        self.mode
+    }
+
+    fn select_pedal(&mut self, pedal: usize) {
+        if pedal != self.mode && pedal < FAMILY.pedals.len() {
+            self.mode = pedal;
+            self.clear_voices();
+        }
     }
 
     fn prepare(&mut self, sample_rate: u32) {
@@ -221,13 +264,14 @@ impl Effect for Modulation {
         for voice in &mut self.voices {
             voice.buf = vec![0.0; (MAX_DELAY_MS * 1e-3 * self.sample_rate) as usize + 4];
         }
-        for (smoothed, desc) in [
-            (&mut self.rate, &PARAMS[1]),
-            (&mut self.depth, &PARAMS[2]),
-            (&mut self.feedback, &PARAMS[3]),
-            (&mut self.mix, &PARAMS[4]),
+        // Smoothing times mirror the faceplate descs.
+        for (smoothed, ms) in [
+            (&mut self.rate, 80.0),
+            (&mut self.depth, 50.0),
+            (&mut self.feedback, 50.0),
+            (&mut self.mix, 30.0),
         ] {
-            smoothed.configure(desc.smoothing_ms, sample_rate);
+            smoothed.configure(ms, sample_rate);
             smoothed.snap_to_target();
         }
         self.reset();
@@ -239,19 +283,18 @@ impl Effect for Modulation {
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
-        let real = PARAMS[index].range.to_real(normalized);
+        let Some(param) = FAMILY.pedals[self.mode].params.get(index) else {
+            return;
+        };
+        let real = param.range.to_real(normalized);
+        // Rate and depth lead every faceplate; feedback/mix exist only on
+        // the delay/allpass pedals (the desc lookup above already gates
+        // tremolo's two-knob face).
         match index {
-            0 => {
-                let mode = real as usize;
-                if mode != self.mode {
-                    self.mode = mode;
-                    self.clear_voices();
-                }
-            }
-            1 => self.rate.set_target(real),
-            2 => self.depth.set_target(real),
-            3 => self.feedback.set_target(real),
-            4 => self.mix.set_target(real),
+            0 => self.rate.set_target(real),
+            1 => self.depth.set_target(real),
+            2 => self.feedback.set_target(real),
+            3 => self.mix.set_target(real),
             _ => {}
         }
     }
@@ -300,8 +343,14 @@ impl Effect for Modulation {
                 ms,
                 self.sample_rate,
             );
-            *l = dry_l + mix * (wet_l - dry_l);
-            *r = dry_r + mix * (wet_r - dry_r);
+            if self.mode == TREMOLO {
+                // Wet-only: depth alone sets the effect strength.
+                *l = wet_l;
+                *r = wet_r;
+            } else {
+                *l = dry_l + mix * (wet_l - dry_l);
+                *r = dry_r + mix * (wet_r - dry_r);
+            }
         }
     }
 }
@@ -316,19 +365,43 @@ mod tests {
     fn prepared(mode: usize) -> Modulation {
         let mut m = Modulation::new();
         m.prepare(SR);
-        m.set_param(0, PARAMS[0].range.to_norm(mode as f32));
+        m.select_pedal(mode);
         m
     }
 
+    /// Set a param by real value at the active pedal's `index`.
     fn set(m: &mut Modulation, index: usize, real: f32) {
-        m.set_param(index, PARAMS[index].range.to_norm(real));
+        let param = &FAMILY.pedals[m.pedal_index()].params[index];
+        m.set_param(index, param.range.to_norm(real));
+    }
+
+    /// `(index, name)` pedal iterator for the character loops.
+    fn pedals() -> impl Iterator<Item = (usize, &'static str)> {
+        FAMILY.pedals.iter().enumerate().map(|(i, p)| (i, p.key))
+    }
+
+    #[test]
+    fn registry_is_consistent() {
+        let keys: Vec<&str> = FAMILY.pedals.iter().map(|p| p.key).collect();
+        assert_eq!(keys, lh_core::preset::MOD_PEDALS);
+        // Tremolo's faceplate is rate/depth only — no dead knobs.
+        assert_eq!(TREMOLO_DESC.params.len(), 2);
+        assert!(TREMOLO_DESC.param_index("mix").is_none());
+        assert!(TREMOLO_DESC.param_index("feedback").is_none());
+        // The others keep the four v2 knobs (keys, ranges, defaults).
+        for pedal in [&CHORUS_DESC, &FLANGER_DESC, &PHASER_DESC] {
+            assert_eq!(pedal.params.len(), 4);
+            assert_eq!(pedal.param_index("mix"), Some(3));
+        }
     }
 
     #[test]
     fn all_modes_render_finite_bounded_audio() {
-        for (mode, name) in TYPES.iter().enumerate() {
+        for (mode, name) in pedals() {
             let mut m = prepared(mode);
-            set(&mut m, 3, 0.85); // max feedback
+            if FAMILY.pedals[mode].params.len() > 2 {
+                set(&mut m, 2, 0.85); // max feedback
+            }
             let x = sine(SR, 220.0, SR as usize);
             let (l, r) = process_stereo_in_blocks(&mut m, &x, 64);
             assert_finite(name, &l);
@@ -343,11 +416,13 @@ mod tests {
     #[test]
     fn stereo_channels_decorrelate() {
         // The quadrature LFO offset must make L and R audibly different.
-        for (mode, name) in TYPES.iter().enumerate() {
+        for (mode, name) in pedals() {
             let mut m = prepared(mode);
-            set(&mut m, 1, 2.0);
-            set(&mut m, 2, 1.0);
-            set(&mut m, 4, 1.0);
+            set(&mut m, 0, 2.0);
+            set(&mut m, 1, 1.0);
+            if FAMILY.pedals[mode].params.len() > 3 {
+                set(&mut m, 3, 1.0);
+            }
             let x = sine(SR, 220.0, SR as usize / 2);
             let (l, r) = process_stereo_in_blocks(&mut m, &x, 64);
             let diff: f32 = l
@@ -360,18 +435,24 @@ mod tests {
     }
 
     #[test]
-    fn mix_zero_is_bit_exact_dry() {
-        for (mode, name) in TYPES.iter().enumerate() {
+    fn zero_mix_or_depth_is_bit_exact_dry() {
+        for (mode, name) in pedals() {
             let mut m = prepared(mode);
-            set(&mut m, 4, 0.0);
-            // Let the 30 ms mix smoothing decay all the way to the snap
-            // threshold (~20 time constants) before comparing.
+            // Chorus/flanger/phaser: mix 0 is dry. Tremolo has no mix; its
+            // dry position is depth 0 (wet = x exactly).
+            if FAMILY.pedals[mode].params.len() > 3 {
+                set(&mut m, 3, 0.0);
+            } else {
+                set(&mut m, 1, 0.0);
+            }
+            // Let the smoothing decay all the way to the snap threshold
+            // (~20 time constants) before comparing.
             let warm = sine(SR, 220.0, SR as usize);
             let _ = process_stereo_in_blocks(&mut m, &warm, 512);
             let x = sine(SR, 220.0, 8_192);
             let (l, r) = process_stereo_in_blocks(&mut m, &x, 512);
-            assert_eq!(x, l, "{name} L must pass dry at mix 0");
-            assert_eq!(x, r, "{name} R must pass dry at mix 0");
+            assert_eq!(x, l, "{name} L must pass dry");
+            assert_eq!(x, r, "{name} R must pass dry");
         }
     }
 
@@ -379,11 +460,13 @@ mod tests {
     fn output_is_time_varying() {
         // The same input block must not produce the same output twice in a
         // row — the LFO has moved. (Tremolo included: 4 Hz over 100 ms.)
-        for (mode, name) in TYPES.iter().enumerate() {
+        for (mode, name) in pedals() {
             let mut m = prepared(mode);
-            set(&mut m, 1, 4.0);
-            set(&mut m, 2, 1.0);
-            set(&mut m, 4, 1.0);
+            set(&mut m, 0, 4.0);
+            set(&mut m, 1, 1.0);
+            if FAMILY.pedals[mode].params.len() > 3 {
+                set(&mut m, 3, 1.0);
+            }
             let x = sine(SR, 220.0, 4_800);
             let (first, _) = process_stereo_in_blocks(&mut m, &x, 4_800);
             let (second, _) = process_stereo_in_blocks(&mut m, &x, 4_800);
@@ -394,9 +477,8 @@ mod tests {
     #[test]
     fn tremolo_pumps_and_pans() {
         let mut m = prepared(TREMOLO);
-        set(&mut m, 1, 4.0);
-        set(&mut m, 2, 1.0);
-        set(&mut m, 4, 1.0);
+        set(&mut m, 0, 4.0);
+        set(&mut m, 1, 1.0);
         let x = sine(SR, 220.0, SR as usize); // 1 s = 4 LFO cycles
         let (l, r) = process_stereo_in_blocks(&mut m, &x, 64);
         // 25 ms windows: min RMS must dip far below max RMS on each channel,
@@ -425,22 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn type_switch_mid_stream_stays_finite() {
+    fn pedal_switch_mid_stream_stays_finite() {
         let mut m = prepared(CHORUS);
-        set(&mut m, 3, 0.85);
+        set(&mut m, 2, 0.85);
         let x = sine(SR, 220.0, SR as usize / 4);
         let _ = process_stereo_in_blocks(&mut m, &x, 64);
         for mode in [FLANGER, PHASER, TREMOLO, CHORUS] {
-            m.set_param(0, PARAMS[0].range.to_norm(mode as f32));
+            m.select_pedal(mode);
             let (l, r) = process_stereo_in_blocks(&mut m, &x, 64);
-            assert_finite("after type switch L", &l);
-            assert_finite("after type switch R", &r);
+            assert_finite("after pedal switch L", &l);
+            assert_finite("after pedal switch R", &r);
         }
     }
 
     #[test]
     fn silence_in_silence_out() {
-        for (mode, name) in TYPES.iter().enumerate() {
+        for (mode, name) in pedals() {
             let mut m = prepared(mode);
             let x = silence(8_192);
             let (l, r) = process_stereo_in_blocks(&mut m, &x, 512);
@@ -451,10 +533,10 @@ mod tests {
     #[test]
     fn survives_all_rates_and_block_sizes() {
         for sr in [44_100u32, 48_000, 96_000] {
-            for mode in 0..TYPES.len() {
+            for mode in 0..FAMILY.pedals.len() {
                 let mut m = Modulation::new();
                 m.prepare(sr);
-                m.set_param(0, PARAMS[0].range.to_norm(mode as f32));
+                m.select_pedal(mode);
                 for chunk in [32usize, 483, 1_024] {
                     let x = sine(sr, 440.0, 4_096);
                     let (l, r) = process_stereo_in_blocks(&mut m, &x, chunk);

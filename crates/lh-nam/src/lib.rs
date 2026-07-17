@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 use lh_dsp::Effect;
 use lh_dsp::smooth::Smoothed;
 use lh_dsp::swap::{AssetHandle, AssetSlot, asset_channel};
@@ -112,6 +112,13 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
+/// Single-pedal family: the amp stays asset-driven (PRD 001 non-goal).
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "amp",
+    name: "NAM Amp",
+    pedals: &[&DESC],
+};
+
 /// The amp slot in the chain. Passes dry until a capture is installed.
 /// Per-call mono scratch: the chain slices blocks to ≤ 1024 anyway; bigger
 /// caller blocks are chunked here.
@@ -140,8 +147,8 @@ impl NamAmp {
 }
 
 impl Effect for NamAmp {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

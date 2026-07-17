@@ -10,7 +10,7 @@ use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
 use lh_dsp::eq::Eq;
 use lh_dsp::gate::NoiseGate;
-use lh_dsp::modulation::{Modulation, TYPES};
+use lh_dsp::modulation::Modulation;
 use lh_dsp::reverb::Reverb;
 
 const SR: u32 = 48_000;
@@ -43,13 +43,13 @@ fn bench_effects(c: &mut Criterion) {
     gate.prepare(SR);
     bench_stereo!(group, "gate", gate, buf, buf_r);
 
-    for (index, def) in lh_dsp::drive::MODELS.iter().enumerate() {
+    for (index, pedal) in lh_dsp::drive::FAMILY.pedals.iter().enumerate() {
         let mut drive = Drive::new();
         drive.prepare(SR);
-        drive.set_param(0, index as f32 / (lh_dsp::drive::MODEL_COUNT - 1) as f32);
+        drive.select_pedal(index);
         bench_stereo!(
             group,
-            format!("drive_{}_4x_oversampled", def.label.replace(' ', "_")),
+            format!("drive_{}_4x_oversampled", pedal.key),
             drive,
             buf,
             buf_r
@@ -90,11 +90,11 @@ fn bench_effects(c: &mut Criterion) {
     eq.prepare(SR);
     bench_stereo!(group, "eq_3band", eq, buf, buf_r);
 
-    for (index, name) in TYPES.iter().enumerate() {
+    for (index, pedal) in lh_dsp::modulation::FAMILY.pedals.iter().enumerate() {
         let mut modulation = Modulation::new();
         modulation.prepare(SR);
-        modulation.set_param(0, index as f32 / (TYPES.len() - 1) as f32);
-        bench_stereo!(group, format!("mod_{name}"), modulation, buf, buf_r);
+        modulation.select_pedal(index);
+        bench_stereo!(group, format!("mod_{}", pedal.key), modulation, buf, buf_r);
     }
 
     let mut reverb = Reverb::new();

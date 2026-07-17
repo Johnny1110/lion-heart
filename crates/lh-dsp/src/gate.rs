@@ -2,7 +2,7 @@
 //! high-gain chain. Attack is fast and fixed (1 ms) so pick transients pass;
 //! release is the musical control.
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
 
@@ -35,6 +35,13 @@ pub static DESC: EffectDesc = EffectDesc {
     key: "gate",
     name: "Noise Gate",
     params: &PARAMS,
+};
+
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "gate",
+    name: "Noise Gate",
+    pedals: &[&DESC],
 };
 
 /// Hysteresis width: once open, the gate only closes when the envelope falls
@@ -93,8 +100,8 @@ fn one_pole(ms: f32, sample_rate: u32) -> f32 {
 }
 
 impl Effect for NoiseGate {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

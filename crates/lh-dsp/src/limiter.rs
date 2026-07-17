@@ -2,7 +2,7 @@
 //! A fast peak limiter with a hard ceiling — no patch, feedback setting, or
 //! bug may slam the monitors (or ears).
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
 
@@ -35,6 +35,13 @@ pub static DESC: EffectDesc = EffectDesc {
     key: "limiter",
     name: "Limiter",
     params: &PARAMS,
+};
+
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "limiter",
+    name: "Limiter",
+    pedals: &[&DESC],
 };
 
 pub struct Limiter {
@@ -72,8 +79,8 @@ impl Limiter {
 }
 
 impl Effect for Limiter {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

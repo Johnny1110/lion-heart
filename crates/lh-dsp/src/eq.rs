@@ -4,7 +4,7 @@
 //! samples that is a 750 Hz update rate, far above audibility of zipper
 //! noise, and it keeps transcendental math out of the per-sample loop.
 
-use lh_core::{EffectDesc, ParamDesc, Range};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
 use crate::biquad::Biquad;
@@ -67,6 +67,13 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "eq",
+    name: "EQ",
+    pedals: &[&DESC],
+};
+
 pub struct Eq {
     sample_rate: f32,
     low_db: Smoothed,
@@ -120,8 +127,8 @@ impl Eq {
 }
 
 impl Effect for Eq {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

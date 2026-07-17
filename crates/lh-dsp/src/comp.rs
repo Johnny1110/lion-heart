@@ -3,7 +3,7 @@
 //! drives a dB-domain gain computer — the classic pedal topology, so attack
 //! and release behave the way guitarists expect.
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin, lin_to_db};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin, lin_to_db};
 
 use crate::Effect;
 use crate::smooth::Smoothed;
@@ -72,6 +72,13 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "comp",
+    name: "Compressor",
+    pedals: &[&DESC],
+};
+
 pub struct Compressor {
     sample_rate: u32,
     threshold_db: f32,
@@ -118,8 +125,8 @@ fn one_pole(ms: f32, sample_rate: u32) -> f32 {
 }
 
 impl Effect for Compressor {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

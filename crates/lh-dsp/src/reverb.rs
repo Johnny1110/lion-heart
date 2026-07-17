@@ -13,7 +13,7 @@
 //! (orthogonal ±1 Hadamard rows), which yields a decorrelated L/R pair —
 //! real width — without touching the feedback structure.
 
-use lh_core::{EffectDesc, ParamDesc, Range};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
 use crate::smooth::Smoothed;
@@ -75,6 +75,13 @@ pub static DESC: EffectDesc = EffectDesc {
     key: "reverb",
     name: "Reverb",
     params: &PARAMS,
+};
+
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "reverb",
+    name: "Reverb",
+    pedals: &[&DESC],
 };
 
 /// Fixed-length circular delay.
@@ -174,8 +181,8 @@ impl Reverb {
 }
 
 impl Effect for Reverb {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

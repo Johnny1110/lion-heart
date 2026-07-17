@@ -5,7 +5,7 @@
 //! interpolation, so turning the knob produces tape-style pitch slew instead
 //! of clicks.
 
-use lh_core::{EffectDesc, ParamDesc, Range};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
 use crate::smooth::Smoothed;
@@ -44,6 +44,13 @@ pub static DESC: EffectDesc = EffectDesc {
     key: "delay",
     name: "Delay",
     params: &PARAMS,
+};
+
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "delay",
+    name: "Delay",
+    pedals: &[&DESC],
 };
 
 const MAX_SECONDS: usize = 2;
@@ -116,8 +123,8 @@ impl Delay {
 }
 
 impl Effect for Delay {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

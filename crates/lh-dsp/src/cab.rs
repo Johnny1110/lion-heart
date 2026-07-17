@@ -3,7 +3,7 @@
 //! swapped in through an [`AssetSlot`].
 
 use fft_convolver::FFTConvolver;
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
 use crate::smooth::Smoothed;
@@ -25,6 +25,13 @@ pub static DESC: EffectDesc = EffectDesc {
     key: "cab",
     name: "Cab IR",
     params: &PARAMS,
+};
+
+/// Single-pedal family: the pedal key doubles as the family key.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "cab",
+    name: "Cab IR",
+    pedals: &[&DESC],
 };
 
 /// Ready-to-run convolvers (one per channel, same IR), built and `init`-ed
@@ -57,8 +64,8 @@ impl CabIr {
 }
 
 impl Effect for CabIr {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
     }
 
     fn prepare(&mut self, sample_rate: u32) {

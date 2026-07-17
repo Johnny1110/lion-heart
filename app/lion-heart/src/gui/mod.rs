@@ -61,6 +61,11 @@ pub enum Message {
     ToggleSlot(String),
     MoveSlotLeft(String),
     MoveSlotRight(String),
+    /// Switch a slot's pedal (by key or display name).
+    SelectPedal {
+        slot: String,
+        pedal: String,
+    },
     Knob {
         slot: String,
         param: String,
@@ -259,6 +264,10 @@ struct SlotUi {
     key: String,
     name: &'static str,
     active: bool,
+    /// The family's selectable pedals (len 1 for single-pedal slots).
+    pedals: &'static [&'static lh_core::EffectDesc],
+    active_pedal: usize,
+    /// Params of the active pedal only — each pedal wears its own face.
     params: Vec<ParamUi>,
 }
 
@@ -432,36 +441,43 @@ impl App {
 impl Running {
     /// Rebuild the UI mirror of the chain from the engine-side snapshot.
     fn refresh_slots(&mut self) {
-        let descs = self.session.chain.descriptors().to_vec();
+        let families = self.session.chain.families().to_vec();
         self.slots = self
             .session
             .chain
             .snapshot_chain()
             .iter()
             .map(|slot| {
-                let desc = descs
+                let family = families
                     .iter()
-                    .find(|d| d.key == slot.key)
-                    .expect("snapshot slots have descriptors");
-                // The drive slot's knob captions follow the selected model
-                // ("Gain" on a Blues Driver) — straight from the registry.
-                let drive_model = (slot.key == "drive")
-                    .then(|| slot.params.get("model").copied().unwrap_or(0.0) as usize);
+                    .find(|f| f.key == slot.key)
+                    .expect("snapshot slots have families");
+                // Knobs come straight from the active pedal's own faceplate
+                // (PRD 001) — no shared tables, no caption remapping.
+                let active_pedal = slot
+                    .pedal
+                    .as_deref()
+                    .and_then(|key| family.pedal_index(key))
+                    .unwrap_or(0);
+                let desc = family.pedals[active_pedal];
+                let values = slot.pedals.get(desc.key);
                 SlotUi {
                     key: slot.key.clone(),
-                    name: desc.name,
+                    name: family.name,
                     active: slot.active,
+                    pedals: family.pedals,
+                    active_pedal,
                     params: desc
                         .params
                         .iter()
                         .map(|p| {
-                            let real = slot.params.get(p.key).copied().unwrap_or(p.default);
-                            let name = drive_model
-                                .and_then(|m| lh_dsp::drive::model_knob_name(m, p.key))
-                                .unwrap_or(p.name);
+                            let real = values
+                                .and_then(|m| m.get(p.key))
+                                .copied()
+                                .unwrap_or(p.default);
                             ParamUi {
                                 key: p.key,
-                                name,
+                                name: p.name,
                                 norm: p.range.to_norm(real),
                                 display: p
                                     .range
@@ -513,14 +529,20 @@ impl Running {
             }
             Message::MoveSlotLeft(key) => self.move_slot(&key, -1),
             Message::MoveSlotRight(key) => self.move_slot(&key, 1),
+            Message::SelectPedal { slot, pedal } => {
+                match self.session.chain.select_pedal(&slot, &pedal) {
+                    Ok(name) => {
+                        self.status = format!("{slot}: {name}");
+                        self.refresh_slots();
+                    }
+                    Err(e) => self.status = e.to_string(),
+                }
+            }
             Message::Knob { slot, param, norm } => {
                 let real = self
                     .session
                     .chain
-                    .descriptors()
-                    .iter()
-                    .find(|d| d.key == slot)
-                    .and_then(|d| d.params.iter().find(|p| p.key == param))
+                    .param_desc(&slot, &param)
                     .map(|p| p.range.to_real(norm));
                 if let Some(real) = real {
                     match self.session.chain.set_param(&slot, &param, real) {
@@ -892,23 +914,27 @@ impl Running {
         let mut strip = row![].spacing(8);
         for slot in &self.slots {
             let state = if slot.active { "on" } else { "bypassed" };
+            let mut card = column![text(slot.name).size(14)]
+                .spacing(2)
+                .align_x(iced::Alignment::Center);
+            if slot.pedals.len() > 1 {
+                card = card.push(
+                    text(slot.pedals[slot.active_pedal].name)
+                        .size(10)
+                        .color(theme::ACCENT),
+                );
+            }
+            card = card.push(text(state).size(10).color(if slot.active {
+                theme::METER_OK
+            } else {
+                theme::TEXT_DIM
+            }));
             strip = strip.push(
-                button(
-                    column![
-                        text(slot.name).size(14),
-                        text(state).size(10).color(if slot.active {
-                            theme::METER_OK
-                        } else {
-                            theme::TEXT_DIM
-                        }),
-                    ]
-                    .spacing(2)
-                    .align_x(iced::Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([8, 4])
-                .on_press(Message::SelectSlot(slot.key.clone()))
-                .style(theme::slot_card(slot.key == self.selected, slot.active)),
+                button(card)
+                    .width(Length::Fill)
+                    .padding([8, 4])
+                    .on_press(Message::SelectSlot(slot.key.clone()))
+                    .style(theme::slot_card(slot.key == self.selected, slot.active)),
             );
         }
         strip.into()
@@ -1123,21 +1149,44 @@ impl Running {
         let can_right =
             movable && pos + 1 < self.slots.len() && self.slots[pos + 1].key != "limiter";
 
-        let title = row![
-            text(slot.name).size(16).color(theme::TEXT_BRIGHT),
-            button(text(if slot.active { "ON" } else { "BYPASSED" }).size(12))
-                .on_press(Message::ToggleSlot(slot.key.clone()))
-                .style(theme::chip(slot.active)),
-            space().width(Length::Fill),
-            button(text("◀").size(12))
-                .on_press_maybe(can_left.then(|| Message::MoveSlotLeft(slot.key.clone())))
-                .style(theme::action),
-            button(text("▶").size(12))
-                .on_press_maybe(can_right.then(|| Message::MoveSlotRight(slot.key.clone())))
-                .style(theme::action),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
+        let mut title = row![text(slot.name).size(16).color(theme::TEXT_BRIGHT)]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+        // Multi-pedal families pick their pedal right in the panel; the
+        // knobs below re-render from the incoming pedal's own memory.
+        if slot.pedals.len() > 1 {
+            let names: Vec<&'static str> = slot.pedals.iter().map(|p| p.name).collect();
+            let selected = slot.pedals[slot.active_pedal].name;
+            let slot_key = slot.key.clone();
+            title = title.push(
+                pick_list(names, Some(selected), move |name: &'static str| {
+                    Message::SelectPedal {
+                        slot: slot_key.clone(),
+                        pedal: name.to_string(),
+                    }
+                })
+                .style(theme::pick)
+                .menu_style(theme::menu)
+                .text_size(13),
+            );
+        }
+        title = title
+            .push(
+                button(text(if slot.active { "ON" } else { "BYPASSED" }).size(12))
+                    .on_press(Message::ToggleSlot(slot.key.clone()))
+                    .style(theme::chip(slot.active)),
+            )
+            .push(space().width(Length::Fill))
+            .push(
+                button(text("◀").size(12))
+                    .on_press_maybe(can_left.then(|| Message::MoveSlotLeft(slot.key.clone())))
+                    .style(theme::action),
+            )
+            .push(
+                button(text("▶").size(12))
+                    .on_press_maybe(can_right.then(|| Message::MoveSlotRight(slot.key.clone())))
+                    .style(theme::action),
+            );
 
         // Stepped params (drive model, modulation type) pick from a
         // dropdown; the knob row below carries the continuous params.

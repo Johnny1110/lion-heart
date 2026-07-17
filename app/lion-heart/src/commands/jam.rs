@@ -24,7 +24,8 @@ commands:
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
   order <slot> <slot> ...      reorder the chain (limiter stays last)
-  set <slot>.<param> <value>   e.g. `set drive.drive 6`, `set drive.model ts9`
+  pedal <slot> <name>          switch the slot's pedal (e.g. `pedal drive ts9`)
+  set <slot>.<param> <value>   e.g. `set drive.drive 6`, `set drive.pedal evva`
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -234,24 +235,49 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             },
             None => println!("usage: {toggle} <slot>"),
         },
-        Some("set") => match (parts.next(), parts.next()) {
-            (Some(path), Some(value)) => {
+        Some("pedal") => match parts.next() {
+            Some(slot) => {
+                let name: String = parts.collect::<Vec<_>>().join(" ");
+                if name.is_empty() {
+                    println!("usage: pedal <slot> <name>");
+                } else {
+                    match session.chain.select_pedal(slot, &name) {
+                        Ok(pedal) => println!("  {slot}: {pedal}"),
+                        Err(e) => println!("  error: {e}"),
+                    }
+                }
+            }
+            None => println!("usage: pedal <slot> <name>"),
+        },
+        Some("set") => match parts.next() {
+            Some(path) => {
                 let Some((slot, param)) = path.split_once('.') else {
                     println!("usage: set <slot>.<param> <value>");
                     return true;
                 };
-                // Numbers first; otherwise stepped params accept their
-                // labels, e.g. `set mod.type flanger`.
+                // Join the rest so multi-word values work ("blues driver").
+                let value: String = parts.collect::<Vec<_>>().join(" ");
+                if value.is_empty() {
+                    println!("usage: set <slot>.<param> <value>");
+                    return true;
+                }
+                // `slot.pedal` (and the pre-v3 aliases) takes a pedal
+                // key/name/index; everything else is numeric or a stepped
+                // label.
+                if lh_engine::is_pedal_selector(param) {
+                    match session.chain.select_pedal(slot, &value) {
+                        Ok(pedal) => println!("  {slot}.pedal = {pedal}"),
+                        Err(e) => println!("  error: {e}"),
+                    }
+                    return true;
+                }
                 let v = match value.parse::<f32>() {
                     Ok(v) => v,
                     Err(_) => {
                         let by_label = session
                             .chain
-                            .descriptors()
-                            .iter()
-                            .find(|d| d.key == slot)
-                            .and_then(|d| d.params.iter().find(|p| p.key == param))
-                            .and_then(|p| p.range.index_of_label(value));
+                            .param_desc(slot, param)
+                            .and_then(|p| p.range.index_of_label(&value));
                         match by_label {
                             Some(v) => v,
                             None => {
@@ -268,7 +294,7 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     Err(e) => println!("  error: {e}"),
                 }
             }
-            _ => println!("usage: set <slot>.<param> <value>"),
+            None => println!("usage: set <slot>.<param> <value>"),
         },
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }

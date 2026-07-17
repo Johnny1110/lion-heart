@@ -139,10 +139,13 @@ impl ParamDesc {
     }
 }
 
-/// Static description of one effect kind.
+/// Static description of one concrete pedal: its machine key, display name,
+/// and its own parameter list. Since PRD 001 every pedal owns its params —
+/// nothing is shared or inherited across pedals of the same family.
 #[derive(Debug)]
 pub struct EffectDesc {
-    /// Machine name used in CLI/presets, e.g. `"drive"`.
+    /// Machine name used in CLI/presets, e.g. `"ts9"` (or the family key for
+    /// single-pedal families, e.g. `"gate"`).
     pub key: &'static str,
     pub name: &'static str,
     pub params: &'static [ParamDesc],
@@ -151,6 +154,28 @@ pub struct EffectDesc {
 impl EffectDesc {
     pub fn param_index(&self, key: &str) -> Option<usize> {
         self.params.iter().position(|p| p.key == key)
+    }
+}
+
+/// Static description of one chain-slot category: a family of selectable
+/// pedals sharing one position in the chain (PRD 001). Single-pedal families
+/// list exactly one descriptor whose key doubles as the family key.
+#[derive(Debug)]
+pub struct FamilyDesc {
+    /// Machine name used in CLI/presets/MIDI, e.g. `"drive"`.
+    pub key: &'static str,
+    pub name: &'static str,
+    /// Selectable pedals, in menu order. Append-only: presets and the v2
+    /// migration reference pedals by key, plugins by id — never reorder.
+    pub pedals: &'static [&'static EffectDesc],
+}
+
+impl FamilyDesc {
+    /// Resolve a pedal by key or display name (case-insensitive).
+    pub fn pedal_index(&self, selector: &str) -> Option<usize> {
+        self.pedals.iter().position(|p| {
+            p.key.eq_ignore_ascii_case(selector) || p.name.eq_ignore_ascii_case(selector)
+        })
     }
 }
 

@@ -1,9 +1,10 @@
-//! Drive: a family of overdrive pedals behind one chain slot. The stepped
-//! `model` param picks the pedal; the three knobs are positions `0..=10`,
+//! Drive: a family of overdrive pedals behind one chain slot. Each pedal
+//! owns its faceplate (PRD 001): its own knob set, captions, and defaults —
+//! TS9 has exactly three knobs, the evva five. Knobs are positions `0..=10`,
 //! laid out like the face of the modelled pedal so nothing has to be
 //! relearned.
 //!
-//! Registered models:
+//! Registered pedals:
 //!
 //! - **ts9** — Tube-Screamer-style. The gained path is the input high-passed
 //!   at 720 Hz (4.7 kΩ + 47 nF into the op-amp), amplified 21–41 dB
@@ -30,177 +31,160 @@
 //! smoothing is written once per chunk into trajectory buffers shared by
 //! both channels.
 //!
-//! # Adding your own model
+//! # Adding your own pedal
 //!
 //! 1. Implement [`Circuit`]: the nonlinear `shape` pass at the oversampled
 //!    rate and the linear `post` pass (tone stack, makeup) at the base rate.
-//! 2. **Append** a [`ModelDef`] to [`MODEL_DEFS`]: menu label, knob captions,
-//!    builder. Append only — presets store the model *index*.
+//! 2. Declare its faceplate: a `ParamDesc` table + `EffectDesc`, **append**
+//!    the desc to [`FAMILY`] and a matching [`ModelDef`] to [`MODELS`].
+//!    Append only — the v2 preset migration and plugin param ids reference
+//!    pedals by position and key.
 //!
 //! Everything downstream picks the entry up from the registry: the GUI
-//! dropdown and knob captions, REPL labels (`set drive.model ts9`), MIDI CC
-//! mapping, preset save/load, and the plugin's host-automatable model param.
+//! pedal dropdown and knobs, REPL labels (`set drive.pedal ts9`), MIDI CC
+//! mapping, preset save/load, and the plugin's per-pedal host params.
 
-use lh_core::{EffectDesc, ParamDesc, Range, db_to_lin, drive_law};
+use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin, drive_law};
 
 use crate::Effect;
 use crate::oversample::{CHUNK, Oversampler4x};
 use crate::smooth::Smoothed;
 
-/// One entry in the drive model registry.
+/// A pedal-style position knob `0..=10`.
+const fn knob(key: &'static str, name: &'static str, default: f32, smoothing_ms: f32) -> ParamDesc {
+    ParamDesc {
+        key,
+        name,
+        unit: "",
+        range: Range::Linear {
+            min: 0.0,
+            max: 10.0,
+        },
+        default,
+        smoothing_ms,
+    }
+}
+
+static TS9_PARAMS: [ParamDesc; 3] = [
+    knob("drive", "Drive", 5.0, 20.0),
+    knob("tone", "Tone", 5.0, 30.0),
+    knob("level", "Level", 6.0, 20.0),
+];
+static TS9_DESC: EffectDesc = EffectDesc {
+    key: "ts9",
+    name: "TS9",
+    params: &TS9_PARAMS,
+};
+
+static BD2_PARAMS: [ParamDesc; 3] = [
+    knob("gain", "Gain", 5.0, 20.0),
+    knob("tone", "Tone", 5.0, 30.0),
+    knob("level", "Level", 6.0, 20.0),
+];
+static BD2_DESC: EffectDesc = EffectDesc {
+    key: "bd2",
+    name: "Blues Driver",
+    params: &BD2_PARAMS,
+};
+
+static CLASSIC_PARAMS: [ParamDesc; 3] = [
+    knob("drive", "Drive", 5.0, 20.0),
+    knob("tone", "Tone", 5.0, 30.0),
+    knob("level", "Level", 6.0, 20.0),
+];
+static CLASSIC_DESC: EffectDesc = EffectDesc {
+    key: "classic",
+    name: "Classic",
+    params: &CLASSIC_PARAMS,
+};
+
+static CENTAUR_PARAMS: [ParamDesc; 3] = [
+    knob("gain", "Gain", 5.0, 20.0),
+    knob("treble", "Treble", 5.0, 30.0),
+    knob("output", "Output", 6.0, 20.0),
+];
+static CENTAUR_DESC: EffectDesc = EffectDesc {
+    key: "centaur",
+    name: "Centaur",
+    params: &CENTAUR_PARAMS,
+};
+
+static EVVA_PARAMS: [ParamDesc; 5] = [
+    knob("gain", "Gain", 5.0, 20.0),
+    knob("low", "Low", 5.0, 30.0),
+    knob("mid", "Mid", 5.0, 30.0),
+    knob("high", "High", 5.0, 30.0),
+    knob("level", "Level", 6.0, 20.0),
+];
+static EVVA_DESC: EffectDesc = EffectDesc {
+    key: "evva",
+    name: "Evva",
+    params: &EVVA_PARAMS,
+};
+
+/// The drive family, in menu order. Aligned with [`MODELS`] and pinned to
+/// `lh_core::preset::DRIVE_PEDALS` (the v2 migration) by tests.
+pub static FAMILY: FamilyDesc = FamilyDesc {
+    key: "drive",
+    name: "Drive",
+    pedals: &[
+        &TS9_DESC,
+        &BD2_DESC,
+        &CLASSIC_DESC,
+        &CENTAUR_DESC,
+        &EVVA_DESC,
+    ],
+};
+
+pub const MODEL_COUNT: usize = 5;
+
+/// Which internal control a pedal's param position drives.
+#[derive(Clone, Copy)]
+enum Ctl {
+    Drive,
+    Tone,
+    Level,
+    Low,
+    Mid,
+    High,
+}
+
+/// One entry in the drive pedal registry: the faceplate, the param→control
+/// routing (same length as the faceplate's params), and the circuit builder.
 pub struct ModelDef {
-    /// Menu label, lowercase like the modulation types ("ts9").
-    pub label: &'static str,
-    /// Knob captions in param order (drive, tone, level) — matching the face
-    /// of the modelled pedal ("Gain" on a Blues Driver, "Drive" on a TS9).
-    pub knobs: [&'static str; 3],
+    pub desc: &'static EffectDesc,
+    controls: &'static [Ctl],
     build: fn() -> Box<dyn Circuit>,
 }
 
-const MODEL_DEFS: [ModelDef; 5] = [
+/// The drive pedal registry, aligned with [`FAMILY`]`.pedals`.
+pub static MODELS: [ModelDef; MODEL_COUNT] = [
     ModelDef {
-        label: "ts9",
-        knobs: ["Drive", "Tone", "Level"],
+        desc: &TS9_DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(Ts9::new()),
     },
     ModelDef {
-        label: "blues driver",
-        knobs: ["Gain", "Tone", "Level"],
+        desc: &BD2_DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(BluesDriver::new()),
     },
     ModelDef {
-        label: "classic",
-        knobs: ["Drive", "Tone", "Level"],
+        desc: &CLASSIC_DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(Classic::new()),
     },
-    // Appended after classic: the preset migration pins classic at index 2.
     ModelDef {
-        label: "centaur",
-        knobs: ["Gain", "Treble", "Output"],
+        desc: &CENTAUR_DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(Centaur::new()),
     },
     ModelDef {
-        label: "evva",
-        knobs: ["Gain", "Tone", "Level"],
+        desc: &EVVA_DESC,
+        controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
         build: || Box::new(Evva::new()),
     },
 ];
-
-pub const MODEL_COUNT: usize = MODEL_DEFS.len();
-
-/// The drive model registry, in menu order.
-pub static MODELS: [ModelDef; MODEL_COUNT] = MODEL_DEFS;
-
-/// Stepped-range labels, derived from the registry at compile time.
-static MODEL_LABELS: [&str; MODEL_COUNT] = {
-    let mut labels = [""; MODEL_COUNT];
-    let mut i = 0;
-    while i < MODEL_COUNT {
-        labels[i] = MODEL_DEFS[i].label;
-        i += 1;
-    }
-    labels
-};
-
-/// Knob caption for `param_key` under `model` (the GUI asks per slot).
-/// `None` for the model selector itself and out-of-range models.
-pub fn model_knob_name(model: usize, param_key: &str) -> Option<&'static str> {
-    let knobs = &MODELS.get(model)?.knobs;
-    match param_key {
-        "drive" => Some(knobs[0]),
-        "tone" => Some(knobs[1]),
-        "level" => Some(knobs[2]),
-        "low" if model == 4 => Some("Low"),
-        "mid" if model == 4 => Some("Mid"),
-        "high" if model == 4 => Some("High"),
-        _ => None,
-    }
-}
-
-static PARAMS: [ParamDesc; 7] = [
-    ParamDesc {
-        key: "model",
-        name: "Model",
-        unit: "",
-        range: Range::Stepped {
-            labels: &MODEL_LABELS,
-        },
-        default: 0.0,
-        smoothing_ms: 0.0,
-    },
-    ParamDesc {
-        key: "drive",
-        name: "Drive",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 5.0,
-        smoothing_ms: 20.0,
-    },
-    ParamDesc {
-        key: "tone",
-        name: "Tone",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 5.0,
-        smoothing_ms: 30.0,
-    },
-    ParamDesc {
-        key: "level",
-        name: "Level",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 6.0,
-        smoothing_ms: 20.0,
-    },
-    ParamDesc {
-        key: "low",
-        name: "Low",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 5.0,
-        smoothing_ms: 30.0,
-    },
-    ParamDesc {
-        key: "mid",
-        name: "Mid",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 5.0,
-        smoothing_ms: 30.0,
-    },
-    ParamDesc {
-        key: "high",
-        name: "High",
-        unit: "",
-        range: Range::Linear {
-            min: 0.0,
-            max: 10.0,
-        },
-        default: 5.0,
-        smoothing_ms: 30.0,
-    },
-];
-
-pub static DESC: EffectDesc = EffectDesc {
-    key: "drive",
-    name: "Drive",
-    params: &PARAMS,
-};
 
 /// One channel of one drive model. Built off the audio thread
 /// ([`ModelDef::build`]); both passes run on the audio thread and must obey
@@ -484,7 +468,10 @@ impl Classic {
 impl Circuit for Classic {
     fn prepare(&mut self, base_rate: f32, _os_rate: f32) {
         self.base_rate = base_rate;
-        self.tone_c = lp_coeff(drive_law::classic_tone_hz(PARAMS[2].default), base_rate);
+        self.tone_c = lp_coeff(
+            drive_law::classic_tone_hz(CLASSIC_PARAMS[1].default),
+            base_rate,
+        );
         self.reset();
     }
 
@@ -745,15 +732,17 @@ impl Default for Drive {
 impl Drive {
     pub fn new() -> Self {
         Self {
-            model: PARAMS[0].default as usize,
+            model: 0,
             os: [Oversampler4x::new(), Oversampler4x::new()],
             circuits: MODELS.iter().map(|m| [(m.build)(), (m.build)()]).collect(),
-            drive_s: Smoothed::new(PARAMS[1].default),
-            tone_s: Smoothed::new(PARAMS[2].default),
-            level_s: Smoothed::new(PARAMS[3].default),
-            low_s: Smoothed::new(PARAMS[4].default),
-            mid_s: Smoothed::new(PARAMS[5].default),
-            high_s: Smoothed::new(PARAMS[6].default),
+            // Control defaults match every pedal's faceplate defaults for
+            // the controls it exposes (drive/gain 5, tone 5, level 6, EQ 5).
+            drive_s: Smoothed::new(5.0),
+            tone_s: Smoothed::new(5.0),
+            level_s: Smoothed::new(6.0),
+            low_s: Smoothed::new(5.0),
+            mid_s: Smoothed::new(5.0),
+            high_s: Smoothed::new(5.0),
             drive_traj: vec![0.0; 4 * CHUNK],
             tone_traj: vec![0.0; CHUNK],
             low_traj: vec![0.0; CHUNK],
@@ -764,19 +753,36 @@ impl Drive {
 }
 
 impl Effect for Drive {
-    fn descriptor(&self) -> &'static EffectDesc {
-        &DESC
+    fn family(&self) -> &'static FamilyDesc {
+        &FAMILY
+    }
+
+    fn pedal_index(&self) -> usize {
+        self.model
+    }
+
+    fn select_pedal(&mut self, pedal: usize) {
+        if pedal != self.model && pedal < self.circuits.len() {
+            self.model = pedal;
+            // Fresh filter state for the incoming pedal; the linear
+            // oversampler keeps running. Like the modulation family,
+            // switching mid-note is a brief discontinuity, never NaN.
+            for circuit in &mut self.circuits[pedal] {
+                circuit.reset();
+            }
+        }
     }
 
     fn prepare(&mut self, sample_rate: u32) {
         let base = sample_rate as f32;
-        self.drive_s
-            .configure(PARAMS[1].smoothing_ms, sample_rate * 4);
-        self.tone_s.configure(PARAMS[2].smoothing_ms, sample_rate);
-        self.level_s.configure(PARAMS[3].smoothing_ms, sample_rate);
-        self.low_s.configure(PARAMS[4].smoothing_ms, sample_rate);
-        self.mid_s.configure(PARAMS[5].smoothing_ms, sample_rate);
-        self.high_s.configure(PARAMS[6].smoothing_ms, sample_rate);
+        // Smoothing times mirror the knob descs; the drive trajectory is
+        // ticked at the 4× oversampled rate the shaper runs at.
+        self.drive_s.configure(20.0, sample_rate * 4);
+        self.tone_s.configure(30.0, sample_rate);
+        self.level_s.configure(20.0, sample_rate);
+        self.low_s.configure(30.0, sample_rate);
+        self.mid_s.configure(30.0, sample_rate);
+        self.high_s.configure(30.0, sample_rate);
         self.drive_s.snap_to_target();
         self.tone_s.snap_to_target();
         self.level_s.snap_to_target();
@@ -803,27 +809,18 @@ impl Effect for Drive {
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
-        let real = PARAMS[index].range.to_real(normalized);
-        match index {
-            0 => {
-                let model = real as usize;
-                if model != self.model && model < self.circuits.len() {
-                    self.model = model;
-                    // Fresh filter state for the incoming model; the linear
-                    // oversampler keeps running. Like the modulation family,
-                    // switching mid-note is a brief discontinuity, never NaN.
-                    for circuit in &mut self.circuits[model] {
-                        circuit.reset();
-                    }
-                }
-            }
-            1 => self.drive_s.set_target(real),
-            2 => self.tone_s.set_target(real),
-            3 => self.level_s.set_target(real),
-            4 => self.low_s.set_target(real),
-            5 => self.mid_s.set_target(real),
-            6 => self.high_s.set_target(real),
-            _ => {}
+        let def = &MODELS[self.model];
+        let (Some(ctl), Some(param)) = (def.controls.get(index), def.desc.params.get(index)) else {
+            return;
+        };
+        let real = param.range.to_real(normalized);
+        match ctl {
+            Ctl::Drive => self.drive_s.set_target(real),
+            Ctl::Tone => self.tone_s.set_target(real),
+            Ctl::Level => self.level_s.set_target(real),
+            Ctl::Low => self.low_s.set_target(real),
+            Ctl::Mid => self.mid_s.set_target(real),
+            Ctl::High => self.high_s.set_target(real),
         }
     }
 
@@ -885,12 +882,18 @@ mod tests {
     fn prepared(model: usize) -> Drive {
         let mut d = Drive::new();
         d.prepare(SR);
-        d.set_param(0, PARAMS[0].range.to_norm(model as f32));
+        d.select_pedal(model);
         d
     }
 
+    /// Set a knob by position `0..=10` at the active pedal's param `index`.
     fn set_pos(d: &mut Drive, index: usize, pos: f32) {
-        d.set_param(index, PARAMS[index].range.to_norm(pos));
+        d.set_param(index, pos / 10.0);
+    }
+
+    /// The level/output knob is the last param on every faceplate.
+    fn level_index(model: usize) -> usize {
+        MODELS[model].desc.params.len() - 1
     }
 
     /// A sine at nominal guitar level (−18 dBFS). The character tests run
@@ -928,54 +931,62 @@ mod tests {
 
     #[test]
     fn registry_is_consistent() {
-        assert_eq!(MODEL_LABELS.len(), MODELS.len());
-        for (def, label) in MODELS.iter().zip(MODEL_LABELS) {
-            assert_eq!(def.label, label);
+        assert_eq!(FAMILY.pedals.len(), MODELS.len());
+        for (def, desc) in MODELS.iter().zip(FAMILY.pedals) {
+            assert!(std::ptr::eq(def.desc, *desc), "MODELS aligned with FAMILY");
+            assert_eq!(def.controls.len(), def.desc.params.len());
         }
-        // Labels are unique (they are REPL/preset-facing identifiers).
-        for (i, a) in MODELS.iter().enumerate() {
-            for b in &MODELS[i + 1..] {
-                assert_ne!(a.label, b.label);
+        // Keys are unique (they are REPL/preset-facing identifiers).
+        for (i, a) in FAMILY.pedals.iter().enumerate() {
+            for b in &FAMILY.pedals[i + 1..] {
+                assert_ne!(a.key, b.key);
             }
         }
-        // The preset migration targets the classic model by index; pin it.
+        // The preset migrations reference pedals by index and key; pin them.
+        let keys: Vec<&str> = FAMILY.pedals.iter().map(|p| p.key).collect();
+        assert_eq!(keys, lh_core::preset::DRIVE_PEDALS);
         assert_eq!(
-            MODELS[lh_core::preset::CLASSIC_DRIVE_MODEL as usize].label,
+            FAMILY.pedals[lh_core::preset::CLASSIC_DRIVE_MODEL as usize].key,
             "classic"
         );
-        assert_eq!(model_knob_name(1, "drive"), Some("Gain"));
-        assert_eq!(model_knob_name(0, "drive"), Some("Drive"));
-        assert_eq!(model_knob_name(0, "model"), None);
-        // The centaur wears the original faceplate.
-        assert_eq!(model_knob_name(3, "drive"), Some("Gain"));
-        assert_eq!(model_knob_name(3, "tone"), Some("Treble"));
-        assert_eq!(model_knob_name(3, "level"), Some("Output"));
-        // The evva exposes its 3-band EQ knobs.
-        assert_eq!(model_knob_name(4, "drive"), Some("Gain"));
-        assert_eq!(model_knob_name(4, "low"), Some("Low"));
-        assert_eq!(model_knob_name(4, "mid"), Some("Mid"));
-        assert_eq!(model_knob_name(4, "high"), Some("High"));
-        // Non-evva models don't have per-band knobs.
-        assert_eq!(model_knob_name(0, "low"), None);
-        assert_eq!(model_knob_name(1, "low"), None);
+        // Each pedal wears its own faceplate — no inherited knobs.
+        let captions =
+            |i: usize| -> Vec<&str> { FAMILY.pedals[i].params.iter().map(|p| p.name).collect() };
+        assert_eq!(captions(0), ["Drive", "Tone", "Level"]);
+        assert_eq!(captions(1), ["Gain", "Tone", "Level"]);
+        assert_eq!(captions(2), ["Drive", "Tone", "Level"]);
+        assert_eq!(captions(3), ["Gain", "Treble", "Output"]);
+        assert_eq!(captions(4), ["Gain", "Low", "Mid", "High", "Level"]);
+        assert!(
+            FAMILY.pedals[0].param_index("low").is_none(),
+            "no EQ knobs on ts9"
+        );
+        assert!(
+            FAMILY.pedals[4].param_index("tone").is_none(),
+            "evva's dead tone knob is gone"
+        );
+        // Selection resolves by key or display name, case-insensitive.
+        assert_eq!(FAMILY.pedal_index("bd2"), Some(1));
+        assert_eq!(FAMILY.pedal_index("Blues Driver"), Some(1));
+        assert_eq!(FAMILY.pedal_index("wah"), None);
     }
 
     #[test]
     fn every_model_is_finite_bounded_and_alive_at_max_drive() {
         for (model, def) in MODELS.iter().enumerate() {
             let mut d = prepared(model);
-            set_pos(&mut d, 1, 10.0);
-            set_pos(&mut d, 3, 10.0);
+            set_pos(&mut d, 0, 10.0);
+            set_pos(&mut d, level_index(model), 10.0);
             let x = sine(SR, 220.0, SR as usize / 2);
             let y = process_in_blocks(&mut d, &x, 64);
-            assert_finite(def.label, &y);
+            assert_finite(def.desc.key, &y);
             let p = peak(&y);
             // Full-scale input with every knob maxed: clippers saturate, and
             // the centaur's never-clipping clean path may legitimately ride
             // above full scale (level tops out at +9 dB) — bounded means "no
             // runaway", not "inside 0 dBFS".
-            assert!(p < 4.5, "{}: bounded output, got peak {p}", def.label);
-            assert!(p > 0.2, "{}: signal present, got peak {p}", def.label);
+            assert!(p < 4.5, "{}: bounded output, got peak {p}", def.desc.key);
+            assert!(p > 0.2, "{}: signal present, got peak {p}", def.desc.key);
         }
     }
 
@@ -983,7 +994,7 @@ mod tests {
     fn every_model_removes_dc_and_dies_to_silence() {
         for (model, def) in MODELS.iter().enumerate() {
             let mut d = prepared(model);
-            set_pos(&mut d, 1, 9.0);
+            set_pos(&mut d, 0, 9.0);
             let x = sine(SR, 220.0, SR as usize);
             let y = process_in_blocks(&mut d, &x, 256);
             let tail = &y[SR as usize / 2..];
@@ -991,7 +1002,7 @@ mod tests {
             assert!(
                 mean.abs() < 2e-3,
                 "{}: DC must be blocked, mean {mean}",
-                def.label
+                def.desc.key
             );
 
             d.reset();
@@ -1001,7 +1012,7 @@ mod tests {
             assert!(
                 out < 1e-4,
                 "{}: silence in → silence out, got rms {out}",
-                def.label
+                def.desc.key
             );
         }
     }
@@ -1013,14 +1024,14 @@ mod tests {
         // saturated dirty path — the opposite of how the pedal is played).
         for (model, def) in MODELS.iter().enumerate() {
             let mut d = prepared(model);
-            set_pos(&mut d, 1, 7.0);
+            set_pos(&mut d, 0, 7.0);
             let x = guitar(220.0, SR as usize);
             let y = process_in_blocks(&mut d, &x, 256);
             let residual = harmonic_residual(&y, 220.0);
             assert!(
                 residual > 0.05,
                 "{}: expected >5% harmonic content, got {residual:.3}",
-                def.label
+                def.desc.key
             );
         }
     }
@@ -1030,7 +1041,7 @@ mod tests {
         // The screamer signature: the gained path is high-passed at 720 Hz,
         // so a low note stays much cleaner than a mid note at the same knob.
         let mut d = prepared(0);
-        set_pos(&mut d, 1, 6.0);
+        set_pos(&mut d, 0, 6.0);
         let lows = {
             let x = guitar(110.0, SR as usize);
             harmonic_residual(&process_in_blocks(&mut d, &x, 256), 110.0)
@@ -1052,10 +1063,10 @@ mod tests {
         // note comes out dirtier from the BD-2 than from the TS9.
         let x = guitar(110.0, SR as usize);
         let mut ts9 = prepared(0);
-        set_pos(&mut ts9, 1, 7.0);
+        set_pos(&mut ts9, 0, 7.0);
         let ts9_res = harmonic_residual(&process_in_blocks(&mut ts9, &x, 256), 110.0);
         let mut bd2 = prepared(1);
-        set_pos(&mut bd2, 1, 7.0);
+        set_pos(&mut bd2, 0, 7.0);
         let bd2_res = harmonic_residual(&process_in_blocks(&mut bd2, &x, 256), 110.0);
         assert!(
             bd2_res > 1.5 * ts9_res,
@@ -1072,11 +1083,11 @@ mod tests {
         let h2 = |y: &[f32]| tone_at(y, 440.0) / tone_at(y, 220.0);
 
         let mut bd2 = prepared(1);
-        set_pos(&mut bd2, 1, 6.0);
+        set_pos(&mut bd2, 0, 6.0);
         let bd2_h2 = h2(&process_in_blocks(&mut bd2, &x, 256));
 
         let mut ts9 = prepared(0);
-        set_pos(&mut ts9, 1, 6.0);
+        set_pos(&mut ts9, 0, 6.0);
         let ts9_h2 = h2(&process_in_blocks(&mut ts9, &x, 256));
 
         assert!(
@@ -1107,7 +1118,7 @@ mod tests {
             assert!(
                 db.abs() < 6.0,
                 "{}: default knobs should sit near unity, got {db:.1} dB",
-                MODELS[model].label
+                MODELS[model].desc.key
             );
             levels.push(db);
         }
@@ -1125,7 +1136,7 @@ mod tests {
         // — barely any harmonics, level near (or a touch above) unity.
         let x = guitar(220.0, SR as usize);
         let mut c = prepared(3);
-        set_pos(&mut c, 1, 1.5);
+        set_pos(&mut c, 0, 1.5);
         let y = process_in_blocks(&mut c, &x, 256);
         let residual = harmonic_residual(&y, 220.0);
         assert!(
@@ -1141,7 +1152,7 @@ mod tests {
 
         // And the same pedal still breaks up when pushed.
         let mut c = prepared(3);
-        set_pos(&mut c, 1, 9.0);
+        set_pos(&mut c, 0, 9.0);
         let y = process_in_blocks(&mut c, &x, 256);
         let pushed = harmonic_residual(&y, 220.0);
         assert!(
@@ -1153,13 +1164,13 @@ mod tests {
     #[test]
     fn model_switch_mid_note_stays_finite() {
         let mut d = prepared(0);
-        set_pos(&mut d, 1, 8.0);
+        set_pos(&mut d, 0, 8.0);
         let x = sine(SR, 220.0, SR as usize / 2);
         let mut left = x.clone();
         let mut right = x.clone();
         for (i, (bl, br)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
-            // Cycle through every model while the note rings.
-            d.set_param(0, PARAMS[0].range.to_norm((i % MODEL_COUNT) as f32));
+            // Cycle through every pedal while the note rings.
+            d.select_pedal(i % MODEL_COUNT);
             d.process(bl, br);
         }
         assert_finite("model switching", &left);
@@ -1170,15 +1181,15 @@ mod tests {
     fn param_changes_are_smooth() {
         for (model, def) in MODELS.iter().enumerate() {
             let mut d = prepared(model);
-            set_pos(&mut d, 1, 0.0);
+            set_pos(&mut d, 0, 0.0);
             let x = sine(SR, 220.0, SR as usize / 2);
             let mut y = x.clone();
             let mut yr = x.clone();
             let (a, b) = y.split_at_mut(SR as usize / 4);
             let (ar, br) = yr.split_at_mut(SR as usize / 4);
             d.process(a, ar);
-            d.set_param(1, 1.0); // slam the knob mid-stream
-            d.set_param(3, 0.0);
+            d.set_param(0, 1.0); // slam the knob mid-stream
+            d.set_param(level_index(model), 0.0);
             d.process(b, br);
             assert_finite("drive sweep", &y);
             let max_step = y
@@ -1189,7 +1200,7 @@ mod tests {
             assert!(
                 max_step < 0.5,
                 "{}: click detected, step {max_step}",
-                def.label
+                def.desc.key
             );
         }
     }
@@ -1200,11 +1211,11 @@ mod tests {
             for (model, def) in MODELS.iter().enumerate() {
                 let mut d = Drive::new();
                 d.prepare(sr);
-                d.set_param(0, PARAMS[0].range.to_norm(model as f32));
-                set_pos(&mut d, 1, 7.0);
+                d.select_pedal(model);
+                set_pos(&mut d, 0, 7.0);
                 let x = sine(sr, 220.0, sr as usize / 2);
                 let y = process_in_blocks(&mut d, &x, 96);
-                assert_finite(def.label, &y);
+                assert_finite(def.desc.key, &y);
                 assert!(rms(&y[y.len() / 2..]) > 1e-3);
             }
         }
@@ -1215,7 +1226,7 @@ mod tests {
         // Asymmetric knees (0.8 / 0.5) produce a healthy 2nd harmonic.
         let x = guitar(220.0, SR as usize);
         let mut d = prepared(4);
-        set_pos(&mut d, 1, 6.0);
+        set_pos(&mut d, 0, 6.0);
         let y = process_in_blocks(&mut d, &x, 256);
         let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
         assert!(h2 > 0.03, "evva even harmonics: h2/f0 = {h2:.4}");
@@ -1228,7 +1239,7 @@ mod tests {
         // Below gain 3 the evva is mostly a clean boost.
         let x = guitar(220.0, SR as usize);
         let mut d = prepared(4);
-        set_pos(&mut d, 1, 2.0);
+        set_pos(&mut d, 0, 2.0);
         let y = process_in_blocks(&mut d, &x, 256);
         let residual = harmonic_residual(&y, 220.0);
         assert!(
@@ -1243,10 +1254,10 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let measure = |low: f32, mid: f32, high: f32, freq: f32| -> f64 {
             let mut d = prepared(4);
-            set_pos(&mut d, 1, 2.0); // low gain — EQ dominates
-            set_pos(&mut d, 4, low);
-            set_pos(&mut d, 5, mid);
-            set_pos(&mut d, 6, high);
+            set_pos(&mut d, 0, 2.0); // low gain — EQ dominates
+            set_pos(&mut d, 1, low);
+            set_pos(&mut d, 2, mid);
+            set_pos(&mut d, 3, high);
             let y = process_in_blocks(&mut d, &x, 256);
             tone_at(&y, freq)
         };
@@ -1289,7 +1300,7 @@ mod tests {
         // (each band gain ≈ 1.0).
         let x = guitar(220.0, SR as usize);
         let mut d = prepared(4);
-        set_pos(&mut d, 1, 2.0);
+        set_pos(&mut d, 0, 2.0);
         let y = process_in_blocks(&mut d, &x, 256);
         // Compare the shape of the spectrum: flat EQ should not radically
         // reshape the output relative to the input.

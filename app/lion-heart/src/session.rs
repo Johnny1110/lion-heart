@@ -248,24 +248,29 @@ impl Session {
                     }
                 }
                 lh_midi::Action::SetParam { slot, param, norm } => {
-                    let real = self
-                        .chain
-                        .descriptors()
-                        .iter()
-                        .find(|d| d.key == slot)
-                        .and_then(|d| d.params.iter().find(|p| p.key == param))
-                        .map(|p| (p.range.to_real(norm), p.range.label(p.range.to_real(norm))));
-                    match real {
-                        Some((real, label)) => match self.chain.set_param(&slot, &param, real) {
-                            Ok(applied) => lines.push(match label {
-                                Some(label) => format!("midi: {slot}.{param} = {label}"),
-                                None => format!(
-                                    "midi: {slot}.{param} = {:.2} {}",
-                                    applied.real, applied.unit
-                                ),
-                            }),
+                    // `slot.pedal` (and the pre-v3 aliases) selects a pedal;
+                    // everything else lands on the active pedal's knobs.
+                    if lh_engine::is_pedal_selector(&param) {
+                        match self.chain.select_pedal_norm(&slot, norm) {
+                            Ok(pedal) => lines.push(format!("midi: {slot}.pedal = {pedal}")),
                             Err(e) => lines.push(format!("midi: {e}")),
-                        },
+                        }
+                        continue;
+                    }
+                    match self.chain.param_desc(&slot, &param) {
+                        Some(p) => {
+                            let real = p.range.to_real(norm);
+                            match self.chain.set_param(&slot, &param, real) {
+                                Ok(applied) => lines.push(match p.range.label(applied.real) {
+                                    Some(label) => format!("midi: {slot}.{param} = {label}"),
+                                    None => format!(
+                                        "midi: {slot}.{param} = {:.2} {}",
+                                        applied.real, applied.unit
+                                    ),
+                                }),
+                                Err(e) => lines.push(format!("midi: {e}")),
+                            }
+                        }
                         None => lines.push(format!("midi: unknown target {slot}.{param}")),
                     }
                 }

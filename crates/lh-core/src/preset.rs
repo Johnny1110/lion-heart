@@ -2,20 +2,33 @@
 //! by machine names, external assets referenced by path **and** content hash
 //! so files survive moves between machines.
 //!
-//! Forward compatibility rules: unknown slot/param keys are skipped with a
-//! warning by the applier; missing keys keep their defaults; a file with a
-//! newer `schema_version` than ours is rejected instead of half-loaded.
+//! Forward compatibility rules: unknown slot/pedal/param keys are skipped
+//! with a warning by the applier; missing keys keep their defaults; a file
+//! with a newer `schema_version` than ours is rejected instead of
+//! half-loaded.
+//!
+//! v3 (PRD 001): a slot stores its selected pedal plus **per-pedal** param
+//! maps — every pedal of the family keeps its own values, so switching
+//! pedals restores each one's knobs.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 2;
+pub const PRESET_SCHEMA_VERSION: u32 = 3;
 
-/// Stepped index of the "classic" model in the drive registry. The registry
+/// Stepped index of the "classic" model in the v2 drive registry, the target
+/// of the v1 migration. The v2→v3 migration then resolves indices through
+/// [`DRIVE_PEDALS`].
+pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
+
+/// v2 drive model indices → v3 pedal keys, in registry order. The registry
 /// lives in `lh-dsp` (which this crate cannot see); a test over there pins
 /// the two together so they cannot drift.
-pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
+pub const DRIVE_PEDALS: [&str; 5] = ["ts9", "bd2", "classic", "centaur", "evva"];
+
+/// v2 modulation type indices → v3 pedal keys, same pinning contract.
+pub const MOD_PEDALS: [&str; 4] = ["chorus", "flanger", "phaser", "tremolo"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -29,12 +42,42 @@ pub struct Preset {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotState {
+    /// Family key ("drive", "gate", …).
     pub key: String,
     #[serde(default = "default_true")]
     pub active: bool,
-    /// Real-world values keyed by param key (BTreeMap ⇒ stable JSON diffs).
-    #[serde(default)]
+    /// Selected pedal key; absent = the family's first pedal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pedal: Option<String>,
+    /// Per-pedal real values: pedal key → param key → value (BTreeMap ⇒
+    /// stable JSON diffs). Pedals not mentioned keep their defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pedals: BTreeMap<String, BTreeMap<String, f32>>,
+    /// v1/v2 flat params, kept as migration input; empty in v3 files.
+    /// Appliers treat a non-empty map as values for the selected pedal.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, f32>,
+}
+
+impl Default for SlotState {
+    /// Matches the serde defaults (notably `active: true`), so
+    /// `SlotState { key, ..Default::default() }` builds a live slot.
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            active: true,
+            pedal: None,
+            pedals: BTreeMap::new(),
+            params: BTreeMap::new(),
+        }
+    }
+}
+
+impl SlotState {
+    /// Convenience for tests/appliers: the value map of `pedal`.
+    pub fn pedal_params(&self, pedal: &str) -> Option<&BTreeMap<String, f32>> {
+        self.pedals.get(pedal)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -71,8 +114,11 @@ impl Preset {
         }
         if preset.schema_version < 2 {
             migrate_v1_drive_knobs(&mut preset);
-            preset.schema_version = PRESET_SCHEMA_VERSION;
         }
+        if preset.schema_version < 3 {
+            migrate_v2_pedal_slots(&mut preset);
+        }
+        preset.schema_version = PRESET_SCHEMA_VERSION;
         Ok(preset)
     }
 }
@@ -103,6 +149,89 @@ fn migrate_v1_drive_knobs(preset: &mut Preset) {
     }
 }
 
+/// v2 → v3 (PRD 001): flat shared params become per-pedal maps.
+///
+/// - drive: the `model` index picks the pedal key; shared knob keys are
+///   renamed onto the pedal's own faceplate (bd2/centaur/evva).
+/// - mod: the `type` index picks the pedal. Tremolo lost its redundant
+///   `mix` knob; v2's `dry + mix·(wet − dry)` with `wet = x·(1 − depth·…)`
+///   equals v3's wet-only output at `depth' = depth × mix` exactly, so the
+///   fold is audibly transparent. Absent params pin the v2 defaults — the
+///   v3 tremolo defaults belong to a fresh pedal.
+/// - everything else: flat params move under the family's own pedal key.
+fn migrate_v2_pedal_slots(preset: &mut Preset) {
+    for slot in &mut preset.chain {
+        if slot.params.is_empty() && slot.pedal.is_none() && slot.pedals.is_empty() {
+            continue; // nothing recorded — defaults apply either way
+        }
+        let old = std::mem::take(&mut slot.params);
+        match slot.key.as_str() {
+            "drive" => {
+                let index = old.get("model").copied().unwrap_or(0.0).round() as usize;
+                let pedal = DRIVE_PEDALS[index.min(DRIVE_PEDALS.len() - 1)];
+                let renames: &[(&str, &str)] = match pedal {
+                    "bd2" => &[("drive", "gain"), ("tone", "tone"), ("level", "level")],
+                    "centaur" => &[("drive", "gain"), ("tone", "treble"), ("level", "output")],
+                    "evva" => &[
+                        ("drive", "gain"),
+                        ("low", "low"),
+                        ("mid", "mid"),
+                        ("high", "high"),
+                        ("level", "level"),
+                    ],
+                    // ts9 / classic wear the original faceplate.
+                    _ => &[("drive", "drive"), ("tone", "tone"), ("level", "level")],
+                };
+                let mut values = BTreeMap::new();
+                for (from, to) in renames {
+                    if let Some(v) = old.get(*from) {
+                        values.insert((*to).to_string(), *v);
+                    }
+                }
+                slot.pedal = Some(pedal.to_string());
+                if !values.is_empty() {
+                    slot.pedals.insert(pedal.to_string(), values);
+                }
+            }
+            "mod" => {
+                let index = old.get("type").copied().unwrap_or(0.0).round() as usize;
+                let pedal = MOD_PEDALS[index.min(MOD_PEDALS.len() - 1)];
+                let mut values = BTreeMap::new();
+                if pedal == "tremolo" {
+                    const OLD_DEPTH: f32 = 0.5;
+                    const OLD_MIX: f32 = 0.5;
+                    const OLD_RATE: f32 = 0.8;
+                    let depth = old.get("depth").copied().unwrap_or(OLD_DEPTH);
+                    let mix = old.get("mix").copied().unwrap_or(OLD_MIX);
+                    values.insert("depth".to_string(), depth * mix);
+                    values.insert(
+                        "rate".to_string(),
+                        old.get("rate").copied().unwrap_or(OLD_RATE),
+                    );
+                } else {
+                    // chorus/flanger/phaser keep the v2 keys, ranges, and
+                    // defaults — sparse files stay sparse.
+                    for key in ["rate", "depth", "feedback", "mix"] {
+                        if let Some(v) = old.get(key) {
+                            values.insert(key.to_string(), *v);
+                        }
+                    }
+                }
+                slot.pedal = Some(pedal.to_string());
+                if !values.is_empty() {
+                    slot.pedals.insert(pedal.to_string(), values);
+                }
+            }
+            _ => {
+                // Single-pedal family: the pedal key is the family key.
+                if !old.is_empty() {
+                    slot.pedals.insert(slot.key.clone(), old);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,15 +244,22 @@ mod tests {
                 SlotState {
                     key: "gate".into(),
                     active: true,
-                    params: BTreeMap::from([
-                        ("threshold".into(), -50.0),
-                        ("release".into(), 120.0),
-                    ]),
+                    pedal: Some("gate".into()),
+                    pedals: BTreeMap::from([(
+                        "gate".into(),
+                        BTreeMap::from([("threshold".into(), -50.0), ("release".into(), 120.0)]),
+                    )]),
+                    params: BTreeMap::new(),
                 },
                 SlotState {
                     key: "drive".into(),
                     active: false,
-                    params: BTreeMap::from([("model".into(), 0.0), ("drive".into(), 6.0)]),
+                    pedal: Some("evva".into()),
+                    pedals: BTreeMap::from([
+                        ("ts9".into(), BTreeMap::from([("drive".into(), 6.0)])),
+                        ("evva".into(), BTreeMap::from([("gain".into(), 4.0)])),
+                    ]),
+                    params: BTreeMap::new(),
                 },
             ],
             assets: PresetAssets {
@@ -141,25 +277,24 @@ mod tests {
         let p = sample();
         let json = p.to_json_pretty();
         let back = Preset::from_json(&json).unwrap();
-        assert_eq!(back.name, "lead");
-        assert_eq!(back.chain.len(), 2);
-        assert_eq!(back.chain[1].key, "drive");
-        assert!(!back.chain[1].active);
-        assert_eq!(back.chain[0].params["threshold"], -50.0);
-        assert_eq!(back.assets.nam.as_ref().unwrap().sha256, "abc123");
+        assert_eq!(back, p);
+        assert_eq!(back.chain[1].pedal.as_deref(), Some("evva"));
+        assert_eq!(back.chain[1].pedals["ts9"]["drive"], 6.0);
+        assert_eq!(back.chain[1].pedals["evva"]["gain"], 4.0);
         assert!(back.assets.ir.is_none());
     }
 
     #[test]
     fn tolerates_missing_optional_fields() {
         let minimal = r#"{
-            "schema_version": 1,
+            "schema_version": 3,
             "name": "sparse",
             "chain": [{"key": "gate"}]
         }"#;
         let p = Preset::from_json(minimal).unwrap();
         assert!(p.chain[0].active, "active defaults to true");
-        assert!(p.chain[0].params.is_empty());
+        assert!(p.chain[0].pedal.is_none(), "pedal defaults to the first");
+        assert!(p.chain[0].pedals.is_empty());
         assert!(p.assets.nam.is_none());
     }
 
@@ -171,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_drive_params_migrate_to_knob_positions() {
+    fn v1_drive_params_migrate_to_classic_pedal_positions() {
         let v1 = r#"{
             "schema_version": 1,
             "name": "old",
@@ -182,38 +317,101 @@ mod tests {
         }"#;
         let p = Preset::from_json(v1).unwrap();
         assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
-        let drive = &p.chain[1].params;
-        assert_eq!(drive["model"], CLASSIC_DRIVE_MODEL);
+        let slot = &p.chain[1];
+        assert_eq!(slot.pedal.as_deref(), Some("classic"));
+        let drive = &slot.pedals["classic"];
         assert!((drive["drive"] - 4.0).abs() < 1e-4, "{}", drive["drive"]);
         assert!((drive["tone"] - 6.695).abs() < 1e-3, "{}", drive["tone"]);
         assert!((drive["level"] - 4.217).abs() < 1e-3, "{}", drive["level"]);
-        // Untouched slots pass through as-is.
-        assert_eq!(p.chain[0].params["threshold"], -50.0);
+        assert!(slot.params.is_empty(), "flat params consumed");
+        // Untouched slots wrap under their own pedal key.
+        assert_eq!(p.chain[0].pedals["gate"]["threshold"], -50.0);
     }
 
     #[test]
     fn v1_sparse_drive_slot_pins_the_old_defaults() {
-        // A v1 file that mentions drive without params meant "old defaults"
-        // (16 dB / 3200 Hz / -6 dB) — the migration must pin those, because
-        // the v2 defaults belong to a different model.
         let v1 = r#"{"schema_version": 1, "name": "sparse", "chain": [{"key": "drive"}]}"#;
         let p = Preset::from_json(v1).unwrap();
-        let drive = &p.chain[0].params;
-        assert_eq!(drive["model"], CLASSIC_DRIVE_MODEL);
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("classic"));
+        let drive = &slot.pedals["classic"];
         assert!((drive["drive"] - 4.0).abs() < 1e-4);
         assert!((drive["tone"] - 6.695).abs() < 1e-3);
         assert!((drive["level"] - 4.217).abs() < 1e-3);
     }
 
     #[test]
-    fn v2_drive_params_are_not_remapped() {
-        let v2 = r#"{
-            "schema_version": 2,
+    fn v2_drive_models_map_to_their_pedal_faceplates() {
+        let case = |model: f32| {
+            let json = format!(
+                r#"{{"schema_version": 2, "name": "m", "chain":
+                    [{{"key": "drive", "params": {{"model": {model}, "drive": 7.0,
+                       "tone": 4.0, "level": 6.5, "low": 3.0, "mid": 5.5, "high": 8.0}}}}]}}"#
+            );
+            Preset::from_json(&json).unwrap().chain.remove(0)
+        };
+
+        let ts9 = case(0.0);
+        assert_eq!(ts9.pedal.as_deref(), Some("ts9"));
+        assert_eq!(ts9.pedals["ts9"]["drive"], 7.0);
+        assert_eq!(ts9.pedals["ts9"]["tone"], 4.0);
+        assert!(!ts9.pedals["ts9"].contains_key("low"), "no EQ knobs on ts9");
+
+        let bd2 = case(1.0);
+        assert_eq!(bd2.pedal.as_deref(), Some("bd2"));
+        assert_eq!(bd2.pedals["bd2"]["gain"], 7.0, "drive renamed to gain");
+        assert!(!bd2.pedals["bd2"].contains_key("drive"));
+
+        let centaur = case(3.0);
+        assert_eq!(centaur.pedals["centaur"]["gain"], 7.0);
+        assert_eq!(centaur.pedals["centaur"]["treble"], 4.0);
+        assert_eq!(centaur.pedals["centaur"]["output"], 6.5);
+
+        let evva = case(4.0);
+        assert_eq!(evva.pedals["evva"]["gain"], 7.0);
+        assert_eq!(evva.pedals["evva"]["low"], 3.0);
+        assert_eq!(evva.pedals["evva"]["high"], 8.0);
+        assert!(
+            !evva.pedals["evva"].contains_key("tone"),
+            "evva's dead tone knob is dropped"
+        );
+    }
+
+    #[test]
+    fn v2_mod_types_map_to_pedals_and_tremolo_folds_mix() {
+        let chorus = r#"{"schema_version": 2, "name": "c", "chain":
+            [{"key": "mod", "params": {"type": 0.0, "rate": 2.0, "mix": 0.8}}]}"#;
+        let p = Preset::from_json(chorus).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("chorus"));
+        assert_eq!(p.chain[0].pedals["chorus"]["rate"], 2.0);
+        assert_eq!(p.chain[0].pedals["chorus"]["mix"], 0.8);
+
+        let trem = r#"{"schema_version": 2, "name": "t", "chain":
+            [{"key": "mod", "params": {"type": 3.0, "depth": 0.8, "mix": 0.5}}]}"#;
+        let p = Preset::from_json(trem).unwrap();
+        let values = &p.chain[0].pedals["tremolo"];
+        assert!((values["depth"] - 0.4).abs() < 1e-6, "depth × mix");
+        assert_eq!(values["rate"], 0.8, "absent rate pins the v2 default");
+        assert!(!values.contains_key("mix"));
+
+        // Sparse tremolo: v2 defaults (depth .5 × mix .5) are pinned.
+        let sparse = r#"{"schema_version": 2, "name": "s", "chain":
+            [{"key": "mod", "params": {"type": 3.0}}]}"#;
+        let p = Preset::from_json(sparse).unwrap();
+        assert!((p.chain[0].pedals["tremolo"]["depth"] - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn v3_slots_are_not_remapped() {
+        let v3 = r#"{
+            "schema_version": 3,
             "name": "new",
-            "chain": [{"key": "drive", "params": {"model": 1.0, "drive": 7.0}}]
+            "chain": [{"key": "drive", "pedal": "bd2",
+                       "pedals": {"bd2": {"gain": 7.0}, "ts9": {"drive": 3.0}}}]
         }"#;
-        let p = Preset::from_json(v2).unwrap();
-        assert_eq!(p.chain[0].params["model"], 1.0);
-        assert_eq!(p.chain[0].params["drive"], 7.0);
+        let p = Preset::from_json(v3).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("bd2"));
+        assert_eq!(p.chain[0].pedals["bd2"]["gain"], 7.0);
+        assert_eq!(p.chain[0].pedals["ts9"]["drive"], 3.0);
     }
 }

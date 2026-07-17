@@ -2,9 +2,15 @@
 //!
 //! The same stereo chain as the standalone app — gate → comp → drive → NAM
 //! amp → EQ → mod → delay → reverb → cab → limiter — hosted by nih-plug.
-//! Every effect parameter and per-slot bypass is a host parameter
+//! Every pedal parameter and per-slot bypass is a host parameter
 //! (automatable); values flow through the same lock-free `ChainHandle` ring
 //! the app uses, and the effects do their own smoothing.
+//!
+//! Per-pedal params (PRD 001): multi-pedal slots expose **every pedal's**
+//! params statically (`Drive · TS9 · Drive`, `Drive · Evva · Low`, …) plus a
+//! stepped pedal selector. Host state per pedal *is* the knob memory —
+//! params of unselected pedals rest host-side and land in the chain when
+//! their pedal is selected.
 //!
 //! v1 scope (no custom editor yet):
 //! - The chain order is fixed (the default order).
@@ -53,6 +59,7 @@ pub struct LionHeartPlugin {
     sample_rate: Arc<AtomicU32>,
     /// Last values pushed into the chain, to send only actual changes.
     last_float: Vec<f32>,
+    last_pedal: Vec<i32>,
     last_active: Vec<bool>,
     last_preset: i32,
 }
@@ -80,8 +87,9 @@ impl Default for LionHeartPlugin {
             Box::new(Limiter::new()),
         ];
         let (chain, handle) = build_chain(effects);
-        let params = Arc::new(LionParams::from_descriptors(handle.descriptors()));
+        let params = Arc::new(LionParams::from_families(handle.families()));
         let last_float = params.floats.iter().map(|sp| sp.param.value()).collect();
+        let last_pedal = params.selectors.iter().map(|s| s.param.value()).collect();
         let last_active = params.bypasses.iter().map(|sb| sb.param.value()).collect();
         Self {
             params,
@@ -93,6 +101,7 @@ impl Default for LionHeartPlugin {
             })),
             sample_rate: Arc::new(AtomicU32::new(48_000)),
             last_float,
+            last_pedal,
             last_active,
             last_preset: 0,
         }
@@ -160,11 +169,41 @@ impl Plugin for LionHeartPlugin {
     ) -> ProcessStatus {
         // Host parameters → chain messages, changes only. The effects smooth
         // internally, so unsmoothed values are what we want here.
+        //
+        // Selectors first: a pedal switch re-sends the incoming pedal's
+        // host values so the chain matches host state (the host's per-pedal
+        // params are the knob memory).
+        for (last, sel) in self.last_pedal.iter_mut().zip(&self.params.selectors) {
+            let value = sel.param.value();
+            if value != *last {
+                *last = value;
+                let _ = self.handle.set_param(sel.slot, "pedal", value as f32);
+                for sp in self
+                    .params
+                    .floats
+                    .iter()
+                    .filter(|sp| sp.slot == sel.slot && sp.pedal == value as usize)
+                {
+                    let _ = self.handle.set_param(sp.slot, sp.key, sp.param.value());
+                }
+            }
+        }
         for (last, sp) in self.last_float.iter_mut().zip(&self.params.floats) {
             let value = sp.param.value();
             if value != *last {
                 *last = value;
-                let _ = self.handle.set_param(sp.slot, sp.key, value);
+                // Only the active pedal's knobs reach the chain; the rest
+                // stay host-side until their pedal is selected.
+                let active = self
+                    .params
+                    .selectors
+                    .iter()
+                    .find(|sel| sel.slot == sp.slot)
+                    .map(|sel| sel.param.value() as usize)
+                    .unwrap_or(0);
+                if sp.pedal == active {
+                    let _ = self.handle.set_param(sp.slot, sp.key, value);
+                }
             }
         }
         for (last, sb) in self.last_active.iter_mut().zip(&self.params.bypasses) {
@@ -195,8 +234,17 @@ impl Plugin for LionHeartPlugin {
 
 struct SlotParam {
     slot: &'static str,
+    /// Which pedal of the slot's family this param belongs to.
+    pedal: usize,
+    pedal_key: &'static str,
     key: &'static str,
     param: FloatParam,
+}
+
+/// Stepped pedal selector for a multi-pedal slot.
+struct SlotSelector {
+    slot: &'static str,
+    param: IntParam,
 }
 
 struct SlotBypass {
@@ -206,25 +254,57 @@ struct SlotBypass {
 
 pub struct LionParams {
     floats: Vec<SlotParam>,
+    selectors: Vec<SlotSelector>,
     bypasses: Vec<SlotBypass>,
     preset: IntParam,
 }
 
 impl LionParams {
-    fn from_descriptors(descs: &[&'static lh_core::EffectDesc]) -> Self {
+    fn from_families(families: &[&'static lh_core::FamilyDesc]) -> Self {
         let mut floats = Vec::new();
+        let mut selectors = Vec::new();
         let mut bypasses = Vec::new();
-        for desc in descs {
-            for pd in desc.params {
-                floats.push(SlotParam {
-                    slot: desc.key,
-                    key: pd.key,
-                    param: float_param(desc, pd),
+        for family in families {
+            let multi = family.pedals.len() > 1;
+            for (pi, pedal) in family.pedals.iter().enumerate() {
+                for pd in pedal.params {
+                    floats.push(SlotParam {
+                        slot: family.key,
+                        pedal: pi,
+                        pedal_key: pedal.key,
+                        key: pd.key,
+                        param: float_param(family, pedal, multi, pd),
+                    });
+                }
+            }
+            if multi {
+                let display = *family;
+                let parse = *family;
+                selectors.push(SlotSelector {
+                    slot: family.key,
+                    param: IntParam::new(
+                        format!("{} · Pedal", family.name),
+                        0,
+                        IntRange::Linear {
+                            min: 0,
+                            max: family.pedals.len() as i32 - 1,
+                        },
+                    )
+                    .with_value_to_string(Arc::new(move |v| {
+                        display
+                            .pedals
+                            .get(v as usize)
+                            .map(|p| p.name.to_string())
+                            .unwrap_or_default()
+                    }))
+                    .with_string_to_value(Arc::new(move |s| {
+                        parse.pedal_index(s.trim()).map(|i| i as i32)
+                    })),
                 });
             }
             bypasses.push(SlotBypass {
-                slot: desc.key,
-                param: BoolParam::new(format!("{} · Active", desc.name), true),
+                slot: family.key,
+                param: BoolParam::new(format!("{} · Active", family.name), true),
             });
         }
         let preset_names = Arc::new(list_presets());
@@ -252,18 +332,28 @@ impl LionParams {
             }));
         Self {
             floats,
+            selectors,
             bypasses,
             preset,
         }
     }
 }
 
-/// Build a host parameter from an effect descriptor entry. Values are real
+/// Build a host parameter from a pedal descriptor entry. Values are real
 /// units end to end — the chain re-normalizes internally. Display rounds to
 /// two decimals so value ↔ string conversions are a fixed point (required by
 /// hosts that let users type values).
-fn float_param(desc: &lh_core::EffectDesc, pd: &'static lh_core::ParamDesc) -> FloatParam {
-    let name = format!("{} · {}", desc.name, pd.name);
+fn float_param(
+    family: &'static lh_core::FamilyDesc,
+    pedal: &'static lh_core::EffectDesc,
+    multi: bool,
+    pd: &'static lh_core::ParamDesc,
+) -> FloatParam {
+    let name = if multi {
+        format!("{} · {} · {}", family.name, pedal.name, pd.name)
+    } else {
+        format!("{} · {}", family.name, pd.name)
+    };
     let param = match pd.range {
         lh_core::Range::Linear { min, max } => {
             FloatParam::new(name, pd.default, FloatRange::Linear { min, max })
@@ -317,10 +407,21 @@ unsafe impl Params for LionParams {
     fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
         let mut map = Vec::new();
         for sp in &self.floats {
+            // Multi-pedal slots qualify the id with the pedal key; single
+            // pedal slots keep their pre-v3 ids so host automation holds.
+            let multi = self.selectors.iter().any(|s| s.slot == sp.slot);
+            let id = if multi {
+                format!("{}_{}_{}", sp.slot, sp.pedal_key, sp.key)
+            } else {
+                format!("{}_{}", sp.slot, sp.key)
+            };
+            map.push((id, sp.param.as_ptr(), group_for(sp.slot)));
+        }
+        for sel in &self.selectors {
             map.push((
-                format!("{}_{}", sp.slot, sp.key),
-                sp.param.as_ptr(),
-                group_for(sp.slot),
+                format!("{}_pedal", sel.slot),
+                sel.param.as_ptr(),
+                group_for(sel.slot),
             ));
         }
         for sb in &self.bypasses {
