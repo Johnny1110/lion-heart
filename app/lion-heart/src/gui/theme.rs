@@ -53,13 +53,26 @@ fn button_style(bg: Color, fg: Color, border: Color, hovered: bool) -> button::S
     }
 }
 
-/// A chain-strip slot card: accent frame when selected, dimmed when bypassed.
-pub fn slot_card(selected: bool, active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| {
-        let hovered = matches!(status, button::Status::Hovered);
-        let fg = if active { TEXT_BRIGHT } else { TEXT_DIM };
-        let border = if selected { ACCENT } else { TRACK };
-        button_style(if active { PANEL_HI } else { PANEL }, fg, border, hovered)
+/// A chain-strip card (the board editor): accent frame when selected, the
+/// dragged source dims, the drop target gets a thick accent frame.
+pub fn drag_card(
+    selected: bool,
+    active: bool,
+    dragging: bool,
+    target: bool,
+) -> impl Fn(&Theme) -> container::Style {
+    move |_| {
+        let border = if target || selected { ACCENT } else { TRACK };
+        container::Style {
+            background: Some(Background::Color(if active { PANEL_HI } else { PANEL })),
+            text_color: Some(if dragging || !active {
+                TEXT_DIM
+            } else {
+                TEXT_BRIGHT
+            }),
+            border: rounded(border, if target { 2.0 } else { 1.0 }),
+            ..container::Style::default()
+        }
     }
 }
 

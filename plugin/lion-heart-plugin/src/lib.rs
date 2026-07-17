@@ -87,7 +87,7 @@ impl Default for LionHeartPlugin {
             Box::new(Limiter::new()),
         ];
         let (chain, handle) = build_chain(effects);
-        let params = Arc::new(LionParams::from_families(handle.families()));
+        let params = Arc::new(LionParams::from_families(&handle.families()));
         let last_float = params.floats.iter().map(|sp| sp.param.value()).collect();
         let last_pedal = params.selectors.iter().map(|s| s.param.value()).collect();
         let last_active = params.bypasses.iter().map(|sb| sb.param.value()).collect();

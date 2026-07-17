@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use iced::widget::canvas::{self, Canvas};
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, space, text, text_input,
+    button, column, container, mouse_area, pick_list, row, scrollable, space, text, text_input,
 };
 use iced::{Element, Length, Size, Subscription, Theme, window};
 use lh_dsp::tuner::Tuner;
@@ -57,10 +57,20 @@ pub enum AssetKind {
 #[derive(Debug, Clone)]
 pub enum Message {
     Frame(Instant),
-    SelectSlot(String),
     ToggleSlot(String),
     MoveSlotLeft(String),
     MoveSlotRight(String),
+    /// Chain-strip drag editing: press starts a potential drag, entering
+    /// another card marks the drop target (leaving clears it), release
+    /// commits (same card = plain selection click).
+    CardPress(usize),
+    CardEnter(usize),
+    CardExit(usize),
+    CardRelease(usize),
+    /// Insert a new family instance at the end of the chain.
+    AddSlot(&'static str),
+    /// Remove a slot instance by handle.
+    RemoveSlot(String),
     /// Switch a slot's pedal (by key or display name).
     SelectPedal {
         slot: String,
@@ -261,6 +271,7 @@ impl SettingsDraft {
 
 /// One chain slot as the UI sees it, rebuilt from the engine snapshot.
 struct SlotUi {
+    /// Instance handle ("drive", "drive2", …) — the engine address.
     key: String,
     name: &'static str,
     active: bool,
@@ -269,6 +280,12 @@ struct SlotUi {
     active_pedal: usize,
     /// Params of the active pedal only — each pedal wears its own face.
     params: Vec<ParamUi>,
+}
+
+/// A chain-strip drag in progress.
+struct DragState {
+    from: usize,
+    over: Option<usize>,
 }
 
 struct ParamUi {
@@ -297,6 +314,7 @@ struct Running {
     reading: Option<(Reading, Instant)>,
     slots: Vec<SlotUi>,
     selected: String,
+    drag: Option<DragState>,
     overlay: Overlay,
     preset_name: String,
     presets: Vec<String>,
@@ -361,6 +379,7 @@ impl App {
             reading: None,
             slots: Vec::new(),
             selected: String::new(),
+            drag: None,
             overlay: Overlay::None,
             preset_name: active_preset.clone().unwrap_or_default(),
             presets: list_presets(),
@@ -441,17 +460,18 @@ impl App {
 impl Running {
     /// Rebuild the UI mirror of the chain from the engine-side snapshot.
     fn refresh_slots(&mut self) {
-        let families = self.session.chain.families().to_vec();
+        // families / handles / snapshot are all in chain order — one entry
+        // per instance (duplicates included, PRD 002).
+        let families = self.session.chain.families();
+        let handles = self.session.chain.order_handles();
         self.slots = self
             .session
             .chain
             .snapshot_chain()
             .iter()
-            .map(|slot| {
-                let family = families
-                    .iter()
-                    .find(|f| f.key == slot.key)
-                    .expect("snapshot slots have families");
+            .zip(families)
+            .zip(handles)
+            .map(|((slot, family), handle)| {
                 // Knobs come straight from the active pedal's own faceplate
                 // (PRD 001) — no shared tables, no caption remapping.
                 let active_pedal = slot
@@ -462,7 +482,7 @@ impl Running {
                 let desc = family.pedals[active_pedal];
                 let values = slot.pedals.get(desc.key);
                 SlotUi {
-                    key: slot.key.clone(),
+                    key: handle,
                     name: family.name,
                     active: slot.active,
                     pedals: family.pedals,
@@ -506,15 +526,74 @@ impl Running {
         }
     }
 
+    /// Select the slot at a chain position (clears knob canvases).
+    fn select_position(&mut self, position: usize) {
+        if let Some(slot) = self.slots.get(position) {
+            self.selected = slot.key.clone();
+            for cache in &self.knob_caches {
+                cache.clear();
+            }
+        }
+    }
+
     fn update(&mut self, message: Message) {
         match message {
             Message::Frame(now) => self.on_frame(now),
-            Message::SelectSlot(key) => {
-                self.selected = key;
-                for cache in &self.knob_caches {
-                    cache.clear();
+            Message::CardPress(position) => {
+                self.drag = Some(DragState {
+                    from: position,
+                    over: None,
+                });
+            }
+            Message::CardEnter(position) => {
+                if let Some(drag) = &mut self.drag {
+                    drag.over = (position != drag.from).then_some(position);
                 }
             }
+            Message::CardExit(position) => {
+                if let Some(drag) = &mut self.drag
+                    && drag.over == Some(position)
+                {
+                    drag.over = None;
+                }
+            }
+            Message::CardRelease(position) => {
+                let Some(drag) = self.drag.take() else {
+                    self.select_position(position);
+                    return;
+                };
+                if drag.from == position {
+                    self.select_position(position);
+                    return;
+                }
+                match self.session.chain.move_position(drag.from, position) {
+                    Ok(()) => {
+                        self.refresh_slots();
+                        self.select_position(position);
+                        self.status =
+                            format!("chain: {}", self.session.chain.order_handles().join(" → "));
+                    }
+                    Err(e) => self.status = e.to_string(),
+                }
+            }
+            Message::AddSlot(family) => match self.session.add_slot(family, None) {
+                Ok(lines) => {
+                    for line in &lines {
+                        eprintln!("{line}");
+                    }
+                    self.status = lines.first().cloned().unwrap_or_default();
+                    self.refresh_slots();
+                    self.select_position(self.slots.len().saturating_sub(1));
+                }
+                Err(e) => self.status = e.to_string(),
+            },
+            Message::RemoveSlot(handle) => match self.session.remove_slot(&handle) {
+                Ok(msg) => {
+                    self.status = msg;
+                    self.refresh_slots();
+                }
+                Err(e) => self.status = e.to_string(),
+            },
             Message::ToggleSlot(key) => {
                 let active = self
                     .slots
@@ -758,24 +837,18 @@ impl Running {
     }
 
     fn move_slot(&mut self, key: &str, delta: isize) {
-        if key == "limiter" {
-            return;
-        }
-        let keys: Vec<String> = self.slots.iter().map(|s| s.key.clone()).collect();
-        let Some(pos) = keys.iter().position(|k| k == key) else {
+        let Some(pos) = self.slots.iter().position(|s| s.key == key) else {
             return;
         };
         let target = pos as isize + delta;
-        if target < 0 || target as usize >= keys.len() || keys[target as usize] == "limiter" {
+        if target < 0 || target as usize >= self.slots.len() {
             return;
         }
-        let mut next = keys.clone();
-        next.swap(pos, target as usize);
-        let refs: Vec<&str> = next.iter().map(String::as_str).collect();
-        match self.session.chain.set_order(&refs) {
+        match self.session.chain.move_position(pos, target as usize) {
             Ok(()) => {
                 self.refresh_slots();
-                self.status = format!("chain: {}", next.join(" → "));
+                self.select_position(target as usize);
+                self.status = format!("chain: {}", self.session.chain.order_handles().join(" → "));
             }
             Err(e) => self.status = e.to_string(),
         }
@@ -910,9 +983,26 @@ impl Running {
         .into()
     }
 
+    /// Families the "＋" menu offers right now (amp/cab stay singletons —
+    /// they mount the loaded assets; nothing offered when the chain is full).
+    fn addable_families(&self) -> Vec<&'static str> {
+        if self.session.chain.is_full() {
+            return Vec::new();
+        }
+        crate::session::FAMILIES
+            .iter()
+            .copied()
+            .filter(|f| !(matches!(*f, "amp" | "cab") && self.session.chain.contains_family(f)))
+            .collect()
+    }
+
+    /// The chain strip *is* the board editor (PRD 002): press-and-drag a
+    /// card onto another to move it, click to select, "＋" appends a slot.
     fn chain_strip(&self) -> Element<'_, Message> {
-        let mut strip = row![].spacing(8);
-        for slot in &self.slots {
+        let mut strip = row![].spacing(8).align_y(iced::Alignment::Center);
+        let dragging = self.drag.as_ref().map(|d| d.from);
+        let target = self.drag.as_ref().and_then(|d| d.over);
+        for (position, slot) in self.slots.iter().enumerate() {
             let state = if slot.active { "on" } else { "bypassed" };
             let mut card = column![text(slot.name).size(14)]
                 .spacing(2)
@@ -930,11 +1020,36 @@ impl Running {
                 theme::TEXT_DIM
             }));
             strip = strip.push(
-                button(card)
-                    .width(Length::Fill)
-                    .padding([8, 4])
-                    .on_press(Message::SelectSlot(slot.key.clone()))
-                    .style(theme::slot_card(slot.key == self.selected, slot.active)),
+                mouse_area(container(card).width(Length::Fill).padding([8, 4]).style(
+                    theme::drag_card(
+                        slot.key == self.selected,
+                        slot.active,
+                        dragging == Some(position),
+                        target == Some(position),
+                    ),
+                ))
+                .on_press(Message::CardPress(position))
+                .on_enter(Message::CardEnter(position))
+                .on_exit(Message::CardExit(position))
+                .on_release(Message::CardRelease(position)),
+            );
+        }
+        if self.slots.is_empty() {
+            strip = strip.push(
+                text("empty chain (passthrough) — add a pedal with ＋")
+                    .size(13)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        let addable = self.addable_families();
+        if !addable.is_empty() {
+            strip = strip.push(
+                pick_list(addable, None::<&'static str>, Message::AddSlot)
+                    .placeholder("＋")
+                    .style(theme::pick)
+                    .menu_style(theme::menu)
+                    .text_size(14)
+                    .width(Length::Fixed(64.0)),
             );
         }
         strip.into()
@@ -1144,10 +1259,8 @@ impl Running {
             .iter()
             .position(|s| s.key == slot.key)
             .unwrap_or(0);
-        let movable = slot.key != "limiter";
-        let can_left = movable && pos > 0;
-        let can_right =
-            movable && pos + 1 < self.slots.len() && self.slots[pos + 1].key != "limiter";
+        let can_left = pos > 0;
+        let can_right = pos + 1 < self.slots.len();
 
         let mut title = row![text(slot.name).size(16).color(theme::TEXT_BRIGHT)]
             .spacing(10)
@@ -1185,6 +1298,11 @@ impl Running {
             .push(
                 button(text("▶").size(12))
                     .on_press_maybe(can_right.then(|| Message::MoveSlotRight(slot.key.clone())))
+                    .style(theme::action),
+            )
+            .push(
+                button(text("remove").size(12))
+                    .on_press(Message::RemoveSlot(slot.key.clone()))
                     .style(theme::action),
             );
 

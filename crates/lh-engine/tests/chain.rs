@@ -190,12 +190,84 @@ fn settled_value(chain: &mut lh_engine::Chain) -> f32 {
 #[test]
 fn reorder_changes_processing_order() {
     let (mut chain, mut handle) = probe_chain();
-    assert_eq!(handle.order_keys(), ["add", "mul"]);
+    assert_eq!(handle.order_handles(), ["add", "mul"]);
     assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3, "(1+1)*2");
 
     handle.set_order(&["mul", "add"]).unwrap();
-    assert_eq!(handle.order_keys(), ["mul", "add"]);
+    assert_eq!(handle.order_handles(), ["mul", "add"]);
     assert!((settled_value(&mut chain) - 3.0).abs() < 1e-3, "1*2+1");
+}
+
+#[test]
+fn install_and_remove_slots_mid_stream() {
+    // PRD 002: structure edits while the stream runs — one fade, correct
+    // math on the other side, retired effects die on the control thread.
+    let (mut chain, mut handle) = probe_chain();
+    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3, "(1+1)*2");
+
+    // Append a second AddOne: (1+1)*2 + 1 = 5. Duplicate family → "add2".
+    let installed = handle.install_slot(Box::new(AddOne), usize::MAX).unwrap();
+    assert_eq!(installed, "add2");
+    assert_eq!(handle.order_handles(), ["add", "mul", "add2"]);
+    assert!((settled_value(&mut chain) - 5.0).abs() < 1e-3, "(1+1)*2+1");
+
+    // Insert a third AddOne up front: ((1+1)+1)*2 + 1 = 7. The new first
+    // instance takes the plain handle; the others shift ranks.
+    let installed = handle.install_slot(Box::new(AddOne), 0).unwrap();
+    assert_eq!(installed, "add");
+    assert_eq!(handle.order_handles(), ["add", "add2", "mul", "add3"]);
+    assert!((settled_value(&mut chain) - 7.0).abs() < 1e-3);
+
+    // Remove the multiplier: 1+1+1+1 = 4.
+    handle.remove_slot("mul").unwrap();
+    assert_eq!(handle.order_handles(), ["add", "add2", "add3"]);
+    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3);
+    assert!(
+        handle.set_param("mul", "x", 0.0).is_err(),
+        "removed slots are unaddressable"
+    );
+
+    // The removed effect came back down the chute to die here.
+    assert_eq!(handle.collect_garbage(), 1);
+}
+
+#[test]
+fn structure_edits_fade_through_silence() {
+    let (mut chain, mut handle) = probe_chain();
+    settled_value(&mut chain); // steady 4.0
+
+    handle.install_slot(Box::new(AddOne), 0).unwrap();
+    let mut out = Vec::new();
+    for _ in 0..200 {
+        let mut block = [1.0f32; 64];
+        let mut block_r = [1.0f32; 64];
+        chain.process(&mut block, &mut block_r);
+        out.extend_from_slice(&block);
+    }
+    let dip = out.iter().fold(f32::INFINITY, |m, v| m.min(v.abs()));
+    assert!(dip < 0.05, "install must pass near silence, dip {dip}");
+    let max_step = out
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_step < 0.25, "no hard switch, step {max_step}");
+    assert!(
+        (out.last().unwrap() - 6.0).abs() < 1e-3,
+        "lands on ((1+1)+1)*2"
+    );
+}
+
+#[test]
+fn chain_capacity_is_enforced() {
+    let (_chain, mut handle) = probe_chain();
+    for _ in 0..(lh_engine::MAX_SLOTS - 2) {
+        handle.install_slot(Box::new(AddOne), usize::MAX).unwrap();
+    }
+    assert!(handle.is_full());
+    match handle.install_slot(Box::new(AddOne), 0) {
+        Err(lh_engine::EngineError::ChainFull) => {}
+        other => panic!("expected ChainFull, got {other:?}"),
+    }
 }
 
 #[test]
@@ -253,9 +325,48 @@ fn preset_snapshot_applies_back_identically() {
     // A fresh chain of the same pedals, restored from the snapshot.
     let (mut chain2, mut handle2) = build_chain(pedalboard());
     chain2.prepare(SR);
-    let warnings = handle2.apply_preset_chain(&saved).unwrap();
+    let warnings = handle2.apply_preset_chain(&saved, &mut |_| None).unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(handle2.snapshot_chain(), saved);
+}
+
+#[test]
+fn preset_apply_rebuilds_structure() {
+    use lh_core::preset::SlotState;
+
+    // PRD 002: the preset defines the structure — duplicates are built via
+    // the factory, leftovers are removed, survivors keep their state.
+    let (mut chain, mut handle) = probe_chain(); // add, mul
+    settled_value(&mut chain);
+
+    let states: Vec<SlotState> = vec![
+        SlotState {
+            key: "mul".into(),
+            ..Default::default()
+        },
+        SlotState {
+            key: "add".into(),
+            ..Default::default()
+        },
+        SlotState {
+            key: "add".into(),
+            ..Default::default()
+        },
+    ];
+    let mut built = 0;
+    let warnings = handle
+        .apply_preset_chain(&states, &mut |key| {
+            (key == "add").then(|| {
+                built += 1;
+                Box::new(AddOne) as Box<dyn Effect>
+            })
+        })
+        .unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(built, 1, "one new instance built, two claimed");
+    assert_eq!(handle.order_handles(), ["mul", "add", "add2"]);
+    // DC 1: 1*2 = 2, +1, +1 = 4.
+    assert!((settled_value(&mut chain) - 4.0).abs() < 1e-3);
 }
 
 #[test]
@@ -363,12 +474,14 @@ fn preset_apply_is_forward_compatible() {
             ..Default::default()
         },
     ];
-    let warnings = handle.apply_preset_chain(&chain_states).unwrap();
+    let warnings = handle
+        .apply_preset_chain(&chain_states, &mut |_| None)
+        .unwrap();
     assert_eq!(warnings.len(), 3, "{warnings:?}"); // sparkle, wah, delay
 
     let now = handle.snapshot_chain();
+    assert_eq!(now.len(), 2, "unmentioned delay is removed (PRD 002)");
     assert_eq!(now[0].key, "drive");
     assert_eq!(now[0].pedals["ts9"]["drive"], 8.0);
     assert_eq!(now[1].key, "gate");
-    assert_eq!(now[2].key, "delay", "unmentioned slot kept at the end");
 }

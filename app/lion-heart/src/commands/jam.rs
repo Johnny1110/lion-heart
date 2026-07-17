@@ -23,9 +23,11 @@ commands:
   unload nam | unload ir       remove the capture / IR
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
-  order <slot> <slot> ...      reorder the chain (limiter stays last)
+  add <family> [pos]           insert a slot (e.g. `add drive`, `add comp 0`)
+  remove <slot>                remove a slot instance (e.g. `remove drive2`)
+  order <slot> <slot> ...      reorder the chain (all handles, new order)
   pedal <slot> <name>          switch the slot's pedal (e.g. `pedal drive ts9`)
-  set <slot>.<param> <value>   e.g. `set drive.drive 6`, `set drive.pedal evva`
+  set <slot>.<param> <value>   e.g. `set drive2.drive 6`, `set drive.pedal evva`
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -57,7 +59,7 @@ pub fn run(args: JamArgs) -> Result<()> {
         println!();
     }
 
-    println!("chain: {}", session.chain.order_keys().join(" → "));
+    println!("chain: {}", session.chain.order_handles().join(" → "));
     print_state(&session);
     println!("\n{HELP}\n");
 
@@ -148,7 +150,7 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
         Some("quit") | Some("exit") | Some("q") => return false,
         Some("help") | Some("h") | Some("?") => println!("{HELP}"),
         Some("list") | Some("l") => {
-            println!("  chain: {}", session.chain.order_keys().join(" → "));
+            println!("  chain: {}", session.chain.order_handles().join(" → "));
             print_state(session);
         }
         Some("meter") | Some("m") => println!("  {}", session.chain.meter_line()),
@@ -180,21 +182,39 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             }
         }
         Some("order") => {
-            let mut keys: Vec<String> = parts.map(str::to_string).collect();
+            let keys: Vec<String> = parts.map(str::to_string).collect();
             if keys.is_empty() {
-                println!("  current: {}", session.chain.order_keys().join(" → "));
-                println!("  usage: order <slot> <slot> …   (limiter is appended last)");
+                println!("  current: {}", session.chain.order_handles().join(" → "));
+                println!("  usage: order <slot> <slot> …   (every handle, once)");
                 return true;
-            }
-            if !keys.iter().any(|k| k == "limiter") {
-                keys.push("limiter".into());
             }
             let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
             match session.chain.set_order(&refs) {
-                Ok(()) => println!("  chain: {}", session.chain.order_keys().join(" → ")),
+                Ok(()) => println!("  chain: {}", session.chain.order_handles().join(" → ")),
                 Err(e) => println!("  error: {e}"),
             }
         }
+        Some("add") => match parts.next() {
+            Some(family) => {
+                let position = parts.next().and_then(|p| p.parse::<usize>().ok());
+                match session.add_slot(family, position) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("  {line}");
+                        }
+                    }
+                    Err(e) => println!("  error: {e}"),
+                }
+            }
+            None => println!("usage: add <family> [position]"),
+        },
+        Some("remove") => match parts.next() {
+            Some(handle) => match session.remove_slot(handle) {
+                Ok(msg) => println!("  {msg}"),
+                Err(e) => println!("  error: {e}"),
+            },
+            None => println!("usage: remove <slot>"),
+        },
         Some("load") => {
             let kind = parts.next();
             let target: String = parts.collect::<Vec<_>>().join(" ");

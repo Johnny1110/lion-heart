@@ -1,15 +1,19 @@
-//! Real-time chain runner: a linear chain with runtime reordering.
+//! Real-time chain runner: a linear chain with runtime **structure editing**
+//! (PRD 002) — reorder, install, and remove slots while the stream runs.
 //!
 //! Split ownership: [`Chain`] moves onto the audio thread and is the only
 //! thing that touches effects while streams run; [`ChainHandle`] stays on the
 //! control thread. They communicate exclusively through a lock-free SPSC ring
 //! of [`EngineMsg`] and a couple of atomics — no locks, no allocation on the
-//! audio side (white paper §4.1).
+//! audio side (white paper §4.1). Retired effects travel back on a second
+//! ring (the garbage chute) to be dropped off the audio thread.
 //!
 //! Click-freeness (white paper §4.2): params are smoothed inside effects,
-//! bypass crossfades per slot, and a **reorder** — the one true topology
-//! change — rides a short master fade through silence before the new order
-//! takes effect.
+//! bypass crossfades per slot, and topology changes ride a short master fade
+//! through silence. Installs land immediately (the control side only targets
+//! indices outside the audible order, so they are silent by construction);
+//! removals and the new order apply together at the bottom of the fade —
+//! untouched slots keep their state, so delay/reverb tails survive edits.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -36,7 +40,6 @@ const ORDER_FADE_MS: f32 = 4.0;
 /// flood can never starve the audio deadline.
 const MAX_MSGS_PER_BLOCK: usize = 64;
 
-#[derive(Debug, Clone, Copy)]
 pub enum EngineMsg {
     SetParam {
         id: ParamId,
@@ -59,6 +62,21 @@ pub enum EngineMsg {
         order: [u8; MAX_SLOTS],
         len: u8,
     },
+    /// Install a control-side-prepared effect at a slot index. Applied
+    /// immediately: the control side only targets indices outside the
+    /// audible order, so the swap is silent. Replaces (and retires) any
+    /// occupant and cancels a pending removal of the same index — a
+    /// re-install supersedes the removal it raced with.
+    InstallSlot {
+        index: u8,
+        effect: Box<dyn Effect>,
+    },
+    /// Remove a slot's effect. Deferred to the bottom of the master fade
+    /// (after the pending order lands) so the occupant never vanishes from
+    /// an audible chain; the effect is retired down the chute.
+    RemoveSlot {
+        index: u8,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -71,6 +89,8 @@ pub enum EngineError {
     UnknownPedal { slot: String, pedal: String },
     #[error("bad chain order: {0}")]
     BadOrder(String),
+    #[error("chain is full ({MAX_SLOTS} slots)")]
+    ChainFull,
     #[error("control queue full — engine not draining?")]
     QueueFull,
 }
@@ -108,14 +128,24 @@ struct Slot {
 /// The audio-thread side. RT rules apply to [`Chain::process`] and
 /// [`Chain::reset`]; [`Chain::prepare`] allocates and runs before streams start.
 pub struct Chain {
-    slots: Vec<Slot>,
-    /// Processing order (indices into `slots`).
+    /// Fixed-capacity slot table (`MAX_SLOTS` entries); `None` = free index.
+    slots: Vec<Option<Slot>>,
+    /// Processing order (occupied indices into `slots`).
     order: Vec<u8>,
     /// A reorder waiting for the master fade to reach the bottom.
     pending_order: Option<([u8; MAX_SLOTS], u8)>,
-    /// Master output fade: 1.0 in normal operation, dips to ~0 across reorders.
+    /// Removals waiting for the same fade bottom (after the order lands).
+    pending_removes: [bool; MAX_SLOTS],
+    /// Master output fade: 1.0 in normal operation, dips to ~0 across
+    /// structure changes.
     fade: Smoothed,
     rx: rtrb::Consumer<EngineMsg>,
+    /// Replaced/removed effects go back to the control thread to die.
+    retired: rtrb::Producer<Box<dyn Effect>>,
+    /// Effects the full chute couldn't take yet (preallocated, bounded by
+    /// MAX_SLOTS — pushes never allocate).
+    parked: Vec<Box<dyn Effect>>,
+    sample_rate: u32,
     dry_l: Vec<f32>,
     dry_r: Vec<f32>,
     telemetry: Arc<Telemetry>,
@@ -125,7 +155,8 @@ pub struct Chain {
 
 impl Chain {
     pub fn prepare(&mut self, sample_rate: u32) {
-        for slot in &mut self.slots {
+        self.sample_rate = sample_rate;
+        for slot in self.slots.iter_mut().flatten() {
             slot.effect.prepare(sample_rate);
             slot.wet.configure(BYPASS_FADE_MS, sample_rate);
             slot.wet.snap_to_target();
@@ -137,8 +168,42 @@ impl Chain {
     }
 
     pub fn reset(&mut self) {
-        for slot in &mut self.slots {
+        for slot in self.slots.iter_mut().flatten() {
             slot.effect.reset();
+        }
+    }
+
+    /// Send an effect down the chute; park it if the chute is full (retried
+    /// each block — `parked` capacity is preallocated, never grows).
+    fn retire(&mut self, effect: Box<dyn Effect>) {
+        match self.retired.push(effect) {
+            Ok(()) => {}
+            Err(rtrb::PushError::Full(effect)) => {
+                if self.parked.len() < self.parked.capacity() {
+                    self.parked.push(effect);
+                } else {
+                    // Both chute and parking full (control thread not
+                    // collecting): leak rather than deallocate on the audio
+                    // thread. Unreachable with a live control loop.
+                    std::mem::forget(effect);
+                }
+            }
+        }
+    }
+
+    /// Install at `index` immediately (silent by protocol: the index is not
+    /// in the audible order). Cancels a racing pending removal.
+    fn install(&mut self, index: usize, effect: Box<dyn Effect>) {
+        if index >= self.slots.len() {
+            self.retire(effect);
+            return;
+        }
+        let mut wet = Smoothed::new(1.0);
+        wet.configure(BYPASS_FADE_MS, self.sample_rate);
+        wet.snap_to_target();
+        self.pending_removes[index] = false;
+        if let Some(old) = self.slots[index].replace(Slot { effect, wet }) {
+            self.retire(old.effect);
         }
     }
 
@@ -150,20 +215,33 @@ impl Chain {
 
     pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         debug_assert_eq!(left.len(), right.len());
+
+        // Finish retiring anything the chute couldn't take last block.
+        while let Some(effect) = self.parked.pop() {
+            if let Err(rtrb::PushError::Full(effect)) = self.retired.push(effect) {
+                self.parked.push(effect);
+                break;
+            }
+        }
+
         for _ in 0..MAX_MSGS_PER_BLOCK {
             match self.rx.pop() {
                 Ok(EngineMsg::SetParam { id, normalized }) => {
-                    if let Some(slot) = self.slots.get_mut(id.slot as usize) {
+                    if let Some(slot) = self
+                        .slots
+                        .get_mut(id.slot as usize)
+                        .and_then(Option::as_mut)
+                    {
                         slot.effect.set_param(id.param as usize, normalized);
                     }
                 }
                 Ok(EngineMsg::SelectPedal { slot, pedal }) => {
-                    if let Some(slot) = self.slots.get_mut(slot as usize) {
+                    if let Some(slot) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) {
                         slot.effect.select_pedal(pedal as usize);
                     }
                 }
                 Ok(EngineMsg::SetActive { slot, active }) => {
-                    if let Some(slot) = self.slots.get_mut(slot as usize) {
+                    if let Some(slot) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) {
                         slot.wet.set_target(if active { 1.0 } else { 0.0 });
                     }
                 }
@@ -171,18 +249,38 @@ impl Chain {
                     self.pending_order = Some((order, len));
                     self.fade.set_target(0.0);
                 }
+                Ok(EngineMsg::InstallSlot { index, effect }) => {
+                    self.install(index as usize, effect);
+                }
+                Ok(EngineMsg::RemoveSlot { index }) => {
+                    if (index as usize) < MAX_SLOTS {
+                        self.pending_removes[index as usize] = true;
+                        self.fade.set_target(0.0);
+                    }
+                }
                 Err(_) => break,
             }
         }
 
-        // Apply a pending reorder once the fade is inaudible (≤ -60 dB);
-        // then ride back up. Same-order messages still dip — harmless.
-        if let Some((order, len)) = self.pending_order
-            && self.fade.current() <= 1e-3
-        {
-            self.order.clear();
-            self.order.extend_from_slice(&order[..len as usize]);
-            self.pending_order = None;
+        // Apply pending structure once the fade is inaudible (≤ -60 dB):
+        // the new order first, then removals (nothing audible references
+        // them anymore); then ride back up. Same-order messages still dip —
+        // harmless.
+        let structure_pending =
+            self.pending_order.is_some() || self.pending_removes.iter().any(|&r| r);
+        if structure_pending && self.fade.current() <= 1e-3 {
+            if let Some((order, len)) = self.pending_order.take() {
+                self.order.clear();
+                self.order.extend_from_slice(&order[..len as usize]);
+            }
+            for index in 0..MAX_SLOTS {
+                if self.pending_removes[index] {
+                    self.pending_removes[index] = false;
+                    if let Some(slot) = self.slots[index].take() {
+                        self.retire(slot.effect);
+                    }
+                }
+            }
             self.fade.set_target(1.0);
         }
 
@@ -208,7 +306,11 @@ impl Chain {
 
         for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
             for i in 0..self.order.len() {
-                let Some(slot) = self.slots.get_mut(self.order[i] as usize) else {
+                let Some(slot) = self
+                    .slots
+                    .get_mut(self.order[i] as usize)
+                    .and_then(Option::as_mut)
+                else {
                     continue;
                 };
                 // A fade-out below -60 dB is inaudible: snap it so the
@@ -262,67 +364,192 @@ pub struct Applied {
     pub unit: &'static str,
 }
 
-/// The control-thread side: validates keys, tracks a shadow of the state for
-/// display, and feeds the ring.
+/// Control-side mirror of one occupied slot.
+struct SlotShadow {
+    family: &'static FamilyDesc,
+    /// Active pedal index.
+    pedal: usize,
+    /// pedal → param norms — the per-pedal knob memory (PRD 001).
+    norms: Vec<Vec<f32>>,
+    active: bool,
+}
+
+impl SlotShadow {
+    fn new(family: &'static FamilyDesc, pedal: usize) -> Self {
+        Self {
+            family,
+            pedal,
+            norms: family
+                .pedals
+                .iter()
+                .map(|p| p.params.iter().map(|pd| pd.default_norm()).collect())
+                .collect(),
+            active: true,
+        }
+    }
+}
+
+/// Split an instance handle: `"drive2"` → `("drive", 2)`, `"drive"` →
+/// `("drive", 1)`. Family keys contain no trailing digits.
+fn split_handle(handle: &str) -> (&str, usize) {
+    let base = handle.trim_end_matches(|c: char| c.is_ascii_digit());
+    if base.len() == handle.len() || base.is_empty() {
+        (handle, 1)
+    } else {
+        (base, handle[base.len()..].parse().unwrap_or(1))
+    }
+}
+
+/// The control-thread side: validates handles, tracks a shadow of the state
+/// for display, and feeds the ring.
 ///
-/// The shadow keeps values **per pedal** (PRD 001): it is the knob memory
-/// that makes pedal switches restore each pedal's own settings — the engine
-/// side only ever holds the active pedal's live values.
+/// Slots are instances (PRD 002): the same family may appear several times.
+/// Handles address them by family key and 1-based rank in chain order —
+/// `"drive"` is the first drive, `"drive2"` the second. The shadow keeps
+/// values **per pedal** (PRD 001): it is the knob memory that makes pedal
+/// switches restore each pedal's own settings — the engine side only ever
+/// holds the active pedal's live values.
 pub struct ChainHandle {
     tx: rtrb::Producer<EngineMsg>,
-    families: Vec<&'static FamilyDesc>,
-    /// Active pedal per slot.
-    pedal: Vec<usize>,
-    /// slot → pedal → param norms.
-    norms: Vec<Vec<Vec<f32>>>,
-    active: Vec<bool>,
+    /// Fixed-capacity mirror of the engine's slot table.
+    slots: Vec<Option<SlotShadow>>,
+    /// Chain order (occupied indices).
     order: Vec<u8>,
+    /// Rate used to prepare freshly installed effects (the session updates
+    /// it once the stream is up).
+    sample_rate: u32,
+    /// Round-robin cursor for free indices — avoids immediately reusing a
+    /// just-removed index whose engine-side removal may still be pending.
+    next_free: usize,
+    /// Retired effects come back here to die on this thread.
+    retired_rx: rtrb::Consumer<Box<dyn Effect>>,
     telemetry: Arc<Telemetry>,
 }
 
 impl ChainHandle {
-    pub fn families(&self) -> &[&'static FamilyDesc] {
-        &self.families
+    /// Families in chain order (one entry per instance).
+    pub fn families(&self) -> Vec<&'static FamilyDesc> {
+        self.order
+            .iter()
+            .map(|&i| self.shadow(i as usize).family)
+            .collect()
     }
 
     pub fn telemetry(&self) -> &Telemetry {
         &self.telemetry
     }
 
-    fn slot_index(&self, slot_key: &str) -> Result<usize, EngineError> {
-        self.families
+    /// The stream sample rate, used to prepare effects installed later.
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        self.sample_rate = sample_rate;
+    }
+
+    /// The audio thread never deallocates: retired effects die here. Call
+    /// periodically from the control loop / frame tick. Returns how many.
+    pub fn collect_garbage(&mut self) -> usize {
+        let mut n = 0;
+        while self.retired_rx.pop().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.order.len() >= MAX_SLOTS
+    }
+
+    /// Whether any instance of `family_key` is in the chain.
+    pub fn contains_family(&self, family_key: &str) -> bool {
+        self.order
             .iter()
-            .position(|f| f.key == slot_key)
-            .ok_or_else(|| EngineError::UnknownSlot(slot_key.to_string()))
+            .any(|&i| self.shadow(i as usize).family.key == family_key)
+    }
+
+    fn shadow(&self, index: usize) -> &SlotShadow {
+        self.slots[index]
+            .as_ref()
+            .expect("order references occupied slots")
+    }
+
+    fn shadow_mut(&mut self, index: usize) -> &mut SlotShadow {
+        self.slots[index]
+            .as_mut()
+            .expect("order references occupied slots")
+    }
+
+    /// Resolve an instance handle to its slot index.
+    fn slot_index(&self, handle: &str) -> Result<usize, EngineError> {
+        let (base, nth) = split_handle(handle);
+        let mut seen = 0;
+        for &i in &self.order {
+            if self.shadow(i as usize).family.key == base {
+                seen += 1;
+                if seen == nth {
+                    return Ok(i as usize);
+                }
+            }
+        }
+        Err(EngineError::UnknownSlot(handle.to_string()))
+    }
+
+    /// The handle of the slot at `position` in chain order.
+    fn handle_at(&self, position: usize) -> String {
+        let key = self.shadow(self.order[position] as usize).family.key;
+        let nth = self.order[..position]
+            .iter()
+            .filter(|&&i| self.shadow(i as usize).family.key == key)
+            .count()
+            + 1;
+        if nth == 1 {
+            key.to_string()
+        } else {
+            format!("{key}{nth}")
+        }
+    }
+
+    /// Instance handles in current processing order.
+    pub fn order_handles(&self) -> Vec<String> {
+        (0..self.order.len()).map(|p| self.handle_at(p)).collect()
     }
 
     /// The active pedal's descriptor entry for `param_key`, if any.
     /// (`None` also for the virtual `pedal` selector — check
     /// [`is_pedal_selector`] first when both are possible.)
-    pub fn param_desc(&self, slot_key: &str, param_key: &str) -> Option<&'static ParamDesc> {
-        let slot = self.slot_index(slot_key).ok()?;
-        let desc = self.families[slot].pedals[self.pedal[slot]];
+    pub fn param_desc(&self, handle: &str, param_key: &str) -> Option<&'static ParamDesc> {
+        let slot = self.slot_index(handle).ok()?;
+        let shadow = self.shadow(slot);
+        let desc = shadow.family.pedals[shadow.pedal];
         desc.params.get(desc.param_index(param_key)?)
     }
 
     /// The active pedal's key for a slot.
-    pub fn active_pedal(&self, slot_key: &str) -> Result<&'static str, EngineError> {
-        let slot = self.slot_index(slot_key)?;
-        Ok(self.families[slot].pedals[self.pedal[slot]].key)
+    pub fn active_pedal(&self, handle: &str) -> Result<&'static str, EngineError> {
+        let slot = self.slot_index(handle)?;
+        let shadow = self.shadow(slot);
+        Ok(shadow.family.pedals[shadow.pedal].key)
+    }
+
+    /// Whether a slot is currently active (not bypassed), from the shadow.
+    pub fn is_active(&self, handle: &str) -> Result<bool, EngineError> {
+        Ok(self.shadow(self.slot_index(handle)?).active)
     }
 
     /// Set a parameter of the slot's **active pedal** from a real-world
-    /// value (clamped into range). The virtual `pedal` key (and its
-    /// pre-v3 aliases) selects a pedal by index instead.
+    /// value (clamped into range). The virtual `pedal` key (and its pre-v3
+    /// aliases) selects a pedal by index instead.
     pub fn set_param(
         &mut self,
-        slot_key: &str,
+        handle: &str,
         param_key: &str,
         real: f32,
     ) -> Result<Applied, EngineError> {
+        let slot = self.slot_index(handle)?;
         if is_pedal_selector(param_key) {
-            let slot = self.slot_index(slot_key)?;
-            let count = self.families[slot].pedals.len();
+            let count = self.shadow(slot).family.pedals.len();
             let index = (real.max(0.0).round() as usize).min(count - 1);
             self.select_pedal_index(slot, index)?;
             return Ok(Applied {
@@ -330,13 +557,13 @@ impl ChainHandle {
                 unit: "",
             });
         }
-        let slot = self.slot_index(slot_key)?;
-        let pedal = self.pedal[slot];
-        let desc = self.families[slot].pedals[pedal];
+        let shadow = self.shadow(slot);
+        let pedal = shadow.pedal;
+        let desc = shadow.family.pedals[pedal];
         let param = desc
             .param_index(param_key)
             .ok_or_else(|| EngineError::UnknownParam {
-                slot: slot_key.to_string(),
+                slot: handle.to_string(),
                 param: param_key.to_string(),
             })?;
         let p = &desc.params[param];
@@ -351,7 +578,7 @@ impl ChainHandle {
                 normalized,
             })
             .map_err(|_| EngineError::QueueFull)?;
-        self.norms[slot][pedal][param] = normalized;
+        self.shadow_mut(slot).norms[pedal][param] = normalized;
         Ok(Applied {
             real: clamped,
             unit: p.unit,
@@ -362,11 +589,11 @@ impl ChainHandle {
     /// selected pedal's key.
     pub fn select_pedal(
         &mut self,
-        slot_key: &str,
+        handle: &str,
         selector: &str,
     ) -> Result<&'static str, EngineError> {
-        let slot = self.slot_index(slot_key)?;
-        let family = self.families[slot];
+        let slot = self.slot_index(handle)?;
+        let family = self.shadow(slot).family;
         let index = family
             .pedal_index(selector)
             .or_else(|| {
@@ -376,7 +603,7 @@ impl ChainHandle {
                     .filter(|i| *i < family.pedals.len())
             })
             .ok_or_else(|| EngineError::UnknownPedal {
-                slot: slot_key.to_string(),
+                slot: handle.to_string(),
                 pedal: selector.to_string(),
             })?;
         self.select_pedal_index(slot, index)
@@ -386,11 +613,11 @@ impl ChainHandle {
     /// (MIDI CC mapped to `slot.pedal`).
     pub fn select_pedal_norm(
         &mut self,
-        slot_key: &str,
+        handle: &str,
         norm: f32,
     ) -> Result<&'static str, EngineError> {
-        let slot = self.slot_index(slot_key)?;
-        let count = self.families[slot].pedals.len();
+        let slot = self.slot_index(handle)?;
+        let count = self.shadow(slot).family.pedals.len();
         let index = (norm.clamp(0.0, 1.0) * (count - 1) as f32).round() as usize;
         self.select_pedal_index(slot, index)
     }
@@ -406,93 +633,158 @@ impl ChainHandle {
                 pedal: index as u8,
             })
             .map_err(|_| EngineError::QueueFull)?;
-        self.pedal[slot] = index;
+        self.shadow_mut(slot).pedal = index;
         // Restore the incoming pedal's knobs from the shadow — the engine
         // never carries values across pedals (PRD 001 §5). Ring ordering
         // guarantees these land after the switch.
-        for param in 0..self.norms[slot][index].len() {
+        for param in 0..self.shadow(slot).norms[index].len() {
+            let normalized = self.shadow(slot).norms[index][param];
             self.tx
                 .push(EngineMsg::SetParam {
                     id: ParamId {
                         slot: slot as u8,
                         param: param as u8,
                     },
-                    normalized: self.norms[slot][index][param],
+                    normalized,
                 })
                 .map_err(|_| EngineError::QueueFull)?;
         }
-        Ok(self.families[slot].pedals[index].key)
+        Ok(self.shadow(slot).family.pedals[index].key)
     }
 
     /// Enable (`true`) or bypass (`false`) a slot.
-    pub fn set_active(&mut self, slot_key: &str, active: bool) -> Result<(), EngineError> {
-        let slot = self.slot_index(slot_key)?;
+    pub fn set_active(&mut self, handle: &str, active: bool) -> Result<(), EngineError> {
+        let slot = self.slot_index(handle)?;
+        self.push_active(slot, active)
+    }
+
+    fn push_active(&mut self, slot: usize, active: bool) -> Result<(), EngineError> {
         self.tx
             .push(EngineMsg::SetActive {
                 slot: slot as u8,
                 active,
             })
             .map_err(|_| EngineError::QueueFull)?;
-        self.active[slot] = active;
+        self.shadow_mut(slot).active = active;
         Ok(())
     }
 
-    /// Whether a slot is currently active (not bypassed), from the shadow.
-    pub fn is_active(&self, slot_key: &str) -> Result<bool, EngineError> {
-        Ok(self.active[self.slot_index(slot_key)?])
-    }
-
-    /// Reorder the chain. `keys` must name every slot exactly once; the
-    /// engine fades through silence while switching.
-    pub fn set_order(&mut self, keys: &[&str]) -> Result<(), EngineError> {
-        if keys.len() != self.families.len() {
-            return Err(EngineError::BadOrder(format!(
-                "need all {} slots, got {}",
-                self.families.len(),
-                keys.len()
-            )));
-        }
+    /// Send the current shadow order to the engine.
+    fn push_order(&mut self) -> Result<(), EngineError> {
         let mut order = [0u8; MAX_SLOTS];
-        let mut seen = [false; MAX_SLOTS];
-        for (i, key) in keys.iter().enumerate() {
-            let idx = self.slot_index(key)?;
-            if seen[idx] {
-                return Err(EngineError::BadOrder(format!("duplicate slot {key:?}")));
-            }
-            seen[idx] = true;
-            order[i] = idx as u8;
-        }
+        order[..self.order.len()].copy_from_slice(&self.order);
         self.tx
             .push(EngineMsg::SetOrder {
                 order,
-                len: keys.len() as u8,
+                len: self.order.len() as u8,
             })
+            .map_err(|_| EngineError::QueueFull)
+    }
+
+    /// Reorder the chain. `handles` must name every slot exactly once; the
+    /// engine fades through silence while switching.
+    pub fn set_order(&mut self, handles: &[&str]) -> Result<(), EngineError> {
+        if handles.len() != self.order.len() {
+            return Err(EngineError::BadOrder(format!(
+                "need all {} slots, got {}",
+                self.order.len(),
+                handles.len()
+            )));
+        }
+        // Handles resolve against the *current* order; verify a permutation.
+        let mut new_order: Vec<u8> = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let index = self.slot_index(handle)? as u8;
+            if new_order.contains(&index) {
+                return Err(EngineError::BadOrder(format!("duplicate slot {handle:?}")));
+            }
+            new_order.push(index);
+        }
+        self.order = new_order;
+        self.push_order()
+    }
+
+    /// Move the slot at chain position `from` to position `to`.
+    pub fn move_position(&mut self, from: usize, to: usize) -> Result<(), EngineError> {
+        if from >= self.order.len() {
+            return Err(EngineError::BadOrder(format!("no slot at position {from}")));
+        }
+        let index = self.order.remove(from);
+        let to = to.min(self.order.len());
+        self.order.insert(to, index);
+        self.push_order()
+    }
+
+    /// Install a **control-side built** effect at chain position `position`
+    /// (clamped to the end). The effect is prepared here with the stream
+    /// rate — the engine only pointer-swaps, silently (the index is not in
+    /// the audible order until the faded reorder lands). Returns the new
+    /// instance's handle.
+    pub fn install_slot(
+        &mut self,
+        mut effect: Box<dyn Effect>,
+        position: usize,
+    ) -> Result<String, EngineError> {
+        if self.is_full() {
+            return Err(EngineError::ChainFull);
+        }
+        let index = self.free_index().ok_or(EngineError::ChainFull)?;
+        effect.prepare(self.sample_rate);
+        self.slots[index] = Some(SlotShadow::new(effect.family(), effect.pedal_index()));
+        if self
+            .tx
+            .push(EngineMsg::InstallSlot {
+                index: index as u8,
+                effect,
+            })
+            .is_err()
+        {
+            self.slots[index] = None;
+            return Err(EngineError::QueueFull);
+        }
+        let position = position.min(self.order.len());
+        self.order.insert(position, index as u8);
+        self.push_order()?;
+        Ok(self.handle_at(position))
+    }
+
+    /// Remove a slot: it leaves the order now and is retired at the bottom
+    /// of the fade. Untouched slots keep their state (tails survive).
+    pub fn remove_slot(&mut self, handle: &str) -> Result<(), EngineError> {
+        let index = self.slot_index(handle)?;
+        self.order.retain(|&i| i as usize != index);
+        self.push_order()?;
+        self.tx
+            .push(EngineMsg::RemoveSlot { index: index as u8 })
             .map_err(|_| EngineError::QueueFull)?;
-        self.order = order[..keys.len()].to_vec();
+        self.slots[index] = None;
         Ok(())
     }
 
-    /// Slot keys in current processing order.
-    pub fn order_keys(&self) -> Vec<&'static str> {
-        self.order
-            .iter()
-            .map(|&i| self.families[i as usize].key)
-            .collect()
+    fn free_index(&mut self) -> Option<usize> {
+        for step in 0..MAX_SLOTS {
+            let i = (self.next_free + step) % MAX_SLOTS;
+            if self.slots[i].is_none() {
+                self.next_free = (i + 1) % MAX_SLOTS;
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Capture the chain (order, bypass, selected pedal, and **every**
-    /// pedal's real values) for a preset — the whole knob memory survives
-    /// a save/load round trip (PRD 001 §7.3).
+    /// pedal's real values) for a preset — structure and the whole knob
+    /// memory survive a save/load round trip (PRD 001 §7.3, PRD 002 §7.3).
     pub fn snapshot_chain(&self) -> Vec<SlotState> {
         self.order
             .iter()
             .map(|&i| {
-                let i = i as usize;
-                let family = self.families[i];
+                let shadow = self.shadow(i as usize);
+                let family = shadow.family;
                 SlotState {
                     key: family.key.to_string(),
-                    active: self.active[i],
-                    pedal: Some(family.pedals[self.pedal[i]].key.to_string()),
+                    active: shadow.active,
+                    pedal: Some(family.pedals[shadow.pedal].key.to_string()),
                     pedals: family
                         .pedals
                         .iter()
@@ -504,7 +796,7 @@ impl ChainHandle {
                                     .iter()
                                     .enumerate()
                                     .map(|(j, pd)| {
-                                        (pd.key.to_string(), pd.range.to_real(self.norms[i][p][j]))
+                                        (pd.key.to_string(), pd.range.to_real(shadow.norms[p][j]))
                                     })
                                     .collect(),
                             )
@@ -525,12 +817,12 @@ impl ChainHandle {
         values: &BTreeMap<String, f32>,
         warnings: &mut Vec<String>,
     ) {
-        let desc = self.families[slot].pedals[pedal];
+        let desc = self.shadow(slot).family.pedals[pedal];
         for (param_key, value) in values {
             match desc.param_index(param_key) {
                 Some(j) => {
                     let range = &desc.params[j].range;
-                    self.norms[slot][pedal][j] = range.to_norm(range.clamp(*value));
+                    self.shadow_mut(slot).norms[pedal][j] = range.to_norm(range.clamp(*value));
                 }
                 None => warnings.push(format!(
                     "unknown param {:?} on pedal {:?} skipped",
@@ -540,87 +832,151 @@ impl ChainHandle {
         }
     }
 
-    /// Apply a preset's chain: pedal selections, per-pedal params, bypass
-    /// flags, and order. Unknown slots/pedals/params are skipped with a
-    /// warning (forward compatibility); slots the preset doesn't mention
-    /// keep playing, appended at the end.
-    pub fn apply_preset_chain(&mut self, chain: &[SlotState]) -> Result<Vec<String>, EngineError> {
-        let mut warnings = Vec::new();
-        let mut order_keys: Vec<&'static str> = Vec::new();
+    /// Apply one preset slot onto an occupied index: bypass flag, per-pedal
+    /// values into the shadow, then select + push the active pedal.
+    fn apply_slot_state(
+        &mut self,
+        slot: usize,
+        state: &SlotState,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        self.push_active(slot, state.active)?;
+        let family = self.shadow(slot).family;
 
-        for state in chain {
-            let Ok(slot) = self.slot_index(&state.key) else {
-                warnings.push(format!("unknown slot {:?} skipped", state.key));
-                continue;
-            };
-            let family = self.families[slot];
-            order_keys.push(family.key);
-            self.set_active(&state.key, state.active)?;
+        // All pedal values land in the shadow first — values for unselected
+        // pedals only refresh the knob memory.
+        for (pedal_key, values) in &state.pedals {
+            match family.pedal_index(pedal_key) {
+                Some(p) => self.absorb_pedal_values(slot, p, values, warnings),
+                None => warnings.push(format!(
+                    "unknown pedal {:?} on {:?} skipped",
+                    pedal_key, state.key
+                )),
+            }
+        }
 
-            // All pedal values land in the shadow first — values for
-            // unselected pedals only refresh the knob memory.
-            for (pedal_key, values) in &state.pedals {
-                match family.pedal_index(pedal_key) {
-                    Some(p) => self.absorb_pedal_values(slot, p, values, &mut warnings),
-                    None => warnings.push(format!(
-                        "unknown pedal {:?} on {:?} skipped",
-                        pedal_key, state.key
-                    )),
+        // Resolve the selection: explicit pedal, else the first.
+        let target = match &state.pedal {
+            Some(key) => match family.pedal_index(key) {
+                Some(p) => p,
+                None => {
+                    warnings.push(format!(
+                        "unknown pedal {:?} on {:?} — selection kept",
+                        key, state.key
+                    ));
+                    self.shadow(slot).pedal
                 }
-            }
+            },
+            None => 0,
+        };
 
-            // Resolve the selection: explicit pedal, else the first.
-            let target = match &state.pedal {
-                Some(key) => match family.pedal_index(key) {
-                    Some(p) => p,
-                    None => {
-                        warnings.push(format!(
-                            "unknown pedal {:?} on {:?} — selection kept",
-                            key, state.key
-                        ));
-                        self.pedal[slot]
+        // Pre-v3 flat params are values for the selected pedal.
+        if !state.params.is_empty() {
+            let flat = state.params.clone();
+            self.absorb_pedal_values(slot, target, &flat, warnings);
+        }
+
+        self.select_pedal_index(slot, target)?;
+        Ok(())
+    }
+
+    /// Apply a preset's chain **including its structure** (PRD 002): each
+    /// preset slot claims the first unclaimed surviving instance of its
+    /// family (state and tails survive), leftovers are removed, and missing
+    /// instances are built via `build` and installed. One fade covers the
+    /// whole transition.
+    ///
+    /// `build` constructs an effect for a family key — the session owns the
+    /// concrete effect crates and the asset seams; `None` marks the family
+    /// unknown/unbuildable and skips the slot with a warning.
+    pub fn apply_preset_chain(
+        &mut self,
+        chain: &[SlotState],
+        build: &mut dyn FnMut(&str) -> Option<Box<dyn Effect>>,
+    ) -> Result<Vec<String>, EngineError> {
+        let mut warnings = Vec::new();
+
+        // Pass 1: claim surviving instances, first-come in chain order.
+        let mut available = self.order.clone();
+        let claims: Vec<Option<u8>> = chain
+            .iter()
+            .map(|state| {
+                available
+                    .iter()
+                    .position(|&i| self.shadow(i as usize).family.key == state.key)
+                    .map(|pos| available.remove(pos))
+            })
+            .collect();
+
+        // Pass 2: release unclaimed instances — the preset defines the
+        // structure. Freed indices become available for the installs below;
+        // the engine cancels a pending removal when an index is re-used.
+        for &index in &available {
+            let key = self.shadow(index as usize).family.key;
+            self.tx
+                .push(EngineMsg::RemoveSlot { index })
+                .map_err(|_| EngineError::QueueFull)?;
+            self.slots[index as usize] = None;
+            warnings.push(format!("slot {key:?} not in preset — removed"));
+        }
+
+        // Pass 3: build the new order, installing what the claims missed.
+        let mut new_order: Vec<u8> = Vec::new();
+        for (state, claim) in chain.iter().zip(&claims) {
+            let index = match claim {
+                Some(index) => *index as usize,
+                None => {
+                    if new_order.len() >= MAX_SLOTS {
+                        warnings.push(format!("chain full — slot {:?} skipped", state.key));
+                        continue;
                     }
-                },
-                None => 0,
+                    let Some(mut effect) = build(&state.key) else {
+                        warnings.push(format!("unknown slot {:?} skipped", state.key));
+                        continue;
+                    };
+                    let Some(index) = self.free_index() else {
+                        warnings.push(format!("chain full — slot {:?} skipped", state.key));
+                        continue;
+                    };
+                    effect.prepare(self.sample_rate);
+                    self.slots[index] =
+                        Some(SlotShadow::new(effect.family(), effect.pedal_index()));
+                    if self
+                        .tx
+                        .push(EngineMsg::InstallSlot {
+                            index: index as u8,
+                            effect,
+                        })
+                        .is_err()
+                    {
+                        self.slots[index] = None;
+                        return Err(EngineError::QueueFull);
+                    }
+                    index
+                }
             };
-
-            // Pre-v3 flat params are values for the selected pedal.
-            if !state.params.is_empty() {
-                let flat = state.params.clone();
-                self.absorb_pedal_values(slot, target, &flat, &mut warnings);
-            }
-
-            // Select and push the active pedal's values to the engine.
-            self.select_pedal_index(slot, target)?;
+            new_order.push(index as u8);
+            self.apply_slot_state(index, state, &mut warnings)?;
         }
 
-        for &i in &self.order.clone() {
-            let key = self.families[i as usize].key;
-            if !order_keys.contains(&key) {
-                order_keys.push(key);
-                warnings.push(format!(
-                    "slot {key:?} missing from preset — kept at the end"
-                ));
-            }
-        }
-        self.set_order(&order_keys)?;
+        self.order = new_order;
+        self.push_order()?;
         Ok(warnings)
     }
 
     /// Human-readable state of every slot and parameter, in processing order.
     pub fn state_lines(&self) -> Vec<String> {
-        self.order
-            .iter()
-            .map(|&i| {
-                let i = i as usize;
-                let family = self.families[i];
-                let desc = family.pedals[self.pedal[i]];
+        (0..self.order.len())
+            .map(|position| {
+                let handle = self.handle_at(position);
+                let shadow = self.shadow(self.order[position] as usize);
+                let desc = shadow.family.pedals[shadow.pedal];
                 let params = desc
                     .params
                     .iter()
                     .enumerate()
                     .map(|(j, p)| {
-                        let real = p.range.to_real(self.norms[i][self.pedal[i]][j]);
+                        let real = p.range.to_real(shadow.norms[shadow.pedal][j]);
                         if let Some(label) = p.range.label(real) {
                             format!("{} {}", p.key, label)
                         } else if p.unit.is_empty() {
@@ -631,15 +987,15 @@ impl ChainHandle {
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
-                let name = if family.pedals.len() > 1 {
-                    format!("{}:{}", family.key, desc.key)
+                let name = if shadow.family.pedals.len() > 1 {
+                    format!("{handle}:{}", desc.key)
                 } else {
-                    family.key.to_string()
+                    handle
                 };
                 format!(
                     "{:<12} [{}]  {}",
                     name,
-                    if self.active[i] { "on " } else { "off" },
+                    if shadow.active { "on " } else { "off" },
                     params
                 )
             })
@@ -656,8 +1012,13 @@ impl ChainHandle {
     }
 }
 
+/// How many retired effects the chute holds before the audio thread parks
+/// them (a whole chain replacement plus headroom).
+const RETIRE_CAPACITY: usize = 2 * MAX_SLOTS + 8;
+
 /// Wire up a chain and its control handle. Call [`Chain::prepare`] with the
-/// stream's sample rate before processing.
+/// stream's sample rate before processing (and mirror it into the handle via
+/// [`ChainHandle::set_sample_rate`] for later installs).
 pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
     assert!(
         effects.len() <= MAX_SLOTS,
@@ -666,36 +1027,36 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
         MAX_SLOTS
     );
     let (tx, rx) = rtrb::RingBuffer::new(MSG_CAPACITY);
+    let (retired, retired_rx) = rtrb::RingBuffer::new(RETIRE_CAPACITY);
     let telemetry = Arc::new(Telemetry::default());
 
-    let families: Vec<&'static FamilyDesc> = effects.iter().map(|e| e.family()).collect();
-    let pedal: Vec<usize> = effects.iter().map(|e| e.pedal_index()).collect();
-    let norms = families
-        .iter()
-        .map(|f| {
-            f.pedals
-                .iter()
-                .map(|p| p.params.iter().map(|pd| pd.default_norm()).collect())
-                .collect()
-        })
-        .collect();
-    let active = vec![true; families.len()];
-    let order: Vec<u8> = (0..effects.len() as u8).collect();
-    let slots = effects
-        .into_iter()
-        .map(|effect| Slot {
+    let count = effects.len();
+    let mut shadows: Vec<Option<SlotShadow>> = Vec::with_capacity(MAX_SLOTS);
+    let mut slots: Vec<Option<Slot>> = Vec::with_capacity(MAX_SLOTS);
+    for effect in effects {
+        shadows.push(Some(SlotShadow::new(effect.family(), effect.pedal_index())));
+        slots.push(Some(Slot {
             effect,
             wet: Smoothed::new(1.0),
-        })
-        .collect();
+        }));
+    }
+    while slots.len() < MAX_SLOTS {
+        shadows.push(None);
+        slots.push(None);
+    }
+    let order: Vec<u8> = (0..count as u8).collect();
 
     (
         Chain {
             slots,
             order: order.clone(),
             pending_order: None,
+            pending_removes: [false; MAX_SLOTS],
             fade: Smoothed::new(1.0),
             rx,
+            retired,
+            parked: Vec::with_capacity(MAX_SLOTS),
+            sample_rate: 48_000,
             dry_l: Vec::new(),
             dry_r: Vec::new(),
             telemetry: Arc::clone(&telemetry),
@@ -703,11 +1064,11 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
         },
         ChainHandle {
             tx,
-            families,
-            pedal,
-            norms,
-            active,
+            slots: shadows,
             order,
+            sample_rate: 48_000,
+            next_free: count % MAX_SLOTS,
+            retired_rx,
             telemetry,
         },
     )

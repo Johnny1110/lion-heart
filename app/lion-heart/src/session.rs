@@ -98,6 +98,47 @@ pub struct Session {
     pub midi_status: String,
 }
 
+/// Every chain family, in the default-chain order. The GUI's add menu and
+/// the REPL validate against this list; `Session::add_slot` builds from it.
+pub const FAMILIES: [&str; 10] = [
+    "gate", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
+];
+
+/// Build a fresh effect for a family key (PRD 002's factory seam — the
+/// session owns the concrete effect crates). `amp`/`cab` rewire the
+/// session's asset handles onto the new instance and flag it, so the caller
+/// re-applies the loaded asset afterwards.
+fn build_family_effect(
+    nam: &mut AssetHandle<NamAsset>,
+    cab: &mut AssetHandle<IrAsset>,
+    rebuilt: &mut (bool, bool),
+    key: &str,
+) -> Option<Box<dyn Effect>> {
+    match key {
+        "gate" => Some(Box::new(NoiseGate::new())),
+        "comp" => Some(Box::new(Compressor::new())),
+        "drive" => Some(Box::new(Drive::new())),
+        "amp" => {
+            let (amp, handle) = NamAmp::new();
+            *nam = handle;
+            rebuilt.0 = true;
+            Some(Box::new(amp))
+        }
+        "eq" => Some(Box::new(Eq::new())),
+        "mod" => Some(Box::new(Modulation::new())),
+        "delay" => Some(Box::new(Delay::new())),
+        "reverb" => Some(Box::new(Reverb::new())),
+        "cab" => {
+            let (cab_fx, handle) = CabIr::new();
+            *cab = handle;
+            rebuilt.1 = true;
+            Some(Box::new(cab_fx))
+        }
+        "limiter" => Some(Box::new(Limiter::new())),
+        _ => None,
+    }
+}
+
 impl Session {
     /// Build the full pedalboard —
     /// gate → comp → drive → amp → eq → mod → delay → reverb → cab → limiter
@@ -117,7 +158,7 @@ impl Session {
             Box::new(cab),
             Box::new(Limiter::new()),
         ];
-        let (mut chain, chain_handle) = build_chain(effects);
+        let (mut chain, mut chain_handle) = build_chain(effects);
 
         let tuner_tap = if opts.tuner_tap {
             let (producer, consumer) = rtrb::RingBuffer::new(TUNER_TAP_CAPACITY);
@@ -140,6 +181,8 @@ impl Session {
             chain.prepare(info.sample_rate);
             Box::new(move |left: &mut [f32], right: &mut [f32]| chain.process(left, right))
         })?;
+        // Effects installed later are prepared control-side at this rate.
+        chain_handle.set_sample_rate(runner.sample_rate);
 
         let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());
 
@@ -178,7 +221,7 @@ impl Session {
     ) -> Result<(Self, Vec<String>), lh_io::IoError> {
         let mut session = Self::start(opts)?;
         let mut lines = Vec::new();
-        match session.chain.apply_preset_chain(&carry.chain) {
+        match session.apply_chain_states(&carry.chain) {
             Ok(warnings) => lines.extend(warnings.into_iter().map(|w| format!("warning: {w}"))),
             Err(e) => lines.push(format!("warning: chain state not restored: {e}")),
         }
@@ -209,11 +252,84 @@ impl Session {
         self.tuner_tap.take()
     }
 
-    /// The audio thread never deallocates: retired assets die here.
-    /// Call periodically from the control loop / frame tick.
+    /// The audio thread never deallocates: retired assets and effects die
+    /// here. Call periodically from the control loop / frame tick.
     pub fn collect_garbage(&mut self) {
         self.nam.collect_garbage();
         self.cab.collect_garbage();
+        self.chain.collect_garbage();
+    }
+
+    /// Apply preset chain states **including structure** (PRD 002): the
+    /// session provides the effect factory; a rebuilt amp/cab gets the
+    /// session's loaded asset re-applied by the caller (`load_preset` and
+    /// `resume` both re-apply assets right after).
+    fn apply_chain_states(
+        &mut self,
+        states: &[lh_core::preset::SlotState],
+    ) -> Result<Vec<String>, String> {
+        let mut rebuilt = (false, false);
+        let Session {
+            chain, nam, cab, ..
+        } = &mut *self;
+        chain
+            .apply_preset_chain(states, &mut |key| {
+                build_family_effect(nam, cab, &mut rebuilt, key)
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Add a `family_key` instance at `position` (`None` = end). Returns
+    /// user-facing lines: the new handle plus any asset reloads.
+    pub fn add_slot(
+        &mut self,
+        family_key: &str,
+        position: Option<usize>,
+    ) -> Result<Vec<String>, String> {
+        if !FAMILIES.contains(&family_key) {
+            return Err(format!(
+                "unknown family {family_key:?} — one of: {}",
+                FAMILIES.join(", ")
+            ));
+        }
+        if matches!(family_key, "amp" | "cab") && self.chain.contains_family(family_key) {
+            return Err(format!(
+                "only one {family_key} per chain (it mounts the loaded asset)"
+            ));
+        }
+        let mut rebuilt = (false, false);
+        let effect = {
+            let Session { nam, cab, .. } = &mut *self;
+            build_family_effect(nam, cab, &mut rebuilt, family_key).expect("validated family")
+        };
+        let handle = self
+            .chain
+            .install_slot(effect, position.unwrap_or(usize::MAX))
+            .map_err(|e| e.to_string())?;
+        let mut lines = vec![format!(
+            "added {handle} — chain: {}",
+            self.chain.order_handles().join(" → ")
+        )];
+        // A fresh amp/cab mounts nothing yet: re-apply the session's assets.
+        let fallback = presets_dir().unwrap_or_default();
+        if rebuilt.0 {
+            let nam_ref = self.nam_ref.clone();
+            self.apply_asset(nam_ref.as_ref(), &fallback, AssetKind::Nam, &mut lines);
+        }
+        if rebuilt.1 {
+            let ir_ref = self.ir_ref.clone();
+            self.apply_asset(ir_ref.as_ref(), &fallback, AssetKind::Ir, &mut lines);
+        }
+        Ok(lines)
+    }
+
+    /// Remove a slot instance by handle.
+    pub fn remove_slot(&mut self, handle: &str) -> Result<String, String> {
+        self.chain.remove_slot(handle).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "removed {handle} — chain: {}",
+            self.chain.order_handles().join(" → ")
+        ))
     }
 
     /// Apply everything the foot controller sent since the last call.
@@ -426,35 +542,17 @@ impl Session {
         let preset = Preset::from_json(&json).map_err(|e| e.to_string())?;
 
         let mut lines = Vec::new();
-        let warnings = self
-            .chain
-            .apply_preset_chain(&preset.chain)
-            .map_err(|e| e.to_string())?;
+        // The preset defines the chain structure (PRD 002): survivors keep
+        // their state, missing instances are built, leftovers removed.
+        let warnings = self.apply_chain_states(&preset.chain)?;
         lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
-
-        // Presets from older chains don't mention newer slots, which the
-        // forward-compat rule appends at the end — after the limiter. The
-        // limiter is the safety net and always runs last.
-        let keys = self.chain.order_keys();
-        if keys.contains(&"limiter") && keys.last() != Some(&"limiter") {
-            let reordered: Vec<&str> = keys
-                .iter()
-                .copied()
-                .filter(|k| *k != "limiter")
-                .chain(std::iter::once("limiter"))
-                .collect();
-            self.chain
-                .set_order(&reordered)
-                .map_err(|e| e.to_string())?;
-            lines.push("limiter moved back to the end of the chain".into());
-        }
 
         self.apply_asset(preset.assets.nam.as_ref(), &dir, AssetKind::Nam, &mut lines);
         self.apply_asset(preset.assets.ir.as_ref(), &dir, AssetKind::Ir, &mut lines);
 
         lines.push(format!(
             "preset {name:?} loaded — chain: {}",
-            self.chain.order_keys().join(" → ")
+            self.chain.order_handles().join(" → ")
         ));
         self.remember_preset(name);
         Ok(lines)
