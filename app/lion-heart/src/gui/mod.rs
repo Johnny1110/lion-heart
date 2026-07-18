@@ -58,7 +58,7 @@ pub fn run(args: GuiArgs) -> anyhow::Result<()> {
         .subscription(App::subscription)
         .theme(App::theme)
         .antialiasing(true)
-        .window_size(Size::new(960.0, 640.0))
+        .window_size(Size::new(1120.0, 700.0))
         .title("Lion-Heart")
         .run()?;
     Ok(())
@@ -309,6 +309,8 @@ struct SlotUi {
     key: String,
     name: &'static str,
     active: bool,
+    /// The active pedal's identity color (chain card, faceplate, knobs).
+    color: iced::Color,
     /// The family's selectable pedals (len 1 for single-pedal slots).
     pedals: &'static [&'static lh_core::EffectDesc],
     active_pedal: usize,
@@ -326,6 +328,8 @@ struct ParamUi {
     key: &'static str,
     name: &'static str,
     norm: f32,
+    /// The faceplate default, normalized — knob double-click returns here.
+    default_norm: f32,
     display: String,
     /// `Some((labels, current index))` for stepped params — rendered as a
     /// dropdown instead of a knob (drive model, modulation type).
@@ -530,6 +534,7 @@ impl Running {
                     key: handle,
                     name: family.name,
                     active: slot.active,
+                    color: theme::pedal_color(family.key, desc.key),
                     pedals: family.pedals,
                     active_pedal,
                     params: desc
@@ -544,6 +549,7 @@ impl Running {
                                 key: p.key,
                                 name: p.name,
                                 norm: p.range.to_norm(real),
+                                default_norm: p.default_norm(),
                                 display: p
                                     .range
                                     .label(real)
@@ -1139,35 +1145,46 @@ impl Running {
             .into()
     }
 
-    /// Logo, the view tabs, and — set apart on the right, utility-corner
-    /// style — settings and the meters.
+    /// Wordmark, the view tabs as one grouped segmented control, and — set
+    /// apart on the right, utility-corner style — settings and the meters.
     fn header(&self) -> Element<'_, Message> {
         let tab = |label: &'static str, panel: Panel, lit: bool| {
             button(text(label).size(13))
+                .padding([5, 13])
                 .on_press(Message::ShowPanel(panel))
                 .style(theme::chip(lit))
         };
-        row![
-            text("LION-HEART").size(18).color(theme::ACCENT),
+        let tabs = container(
             row![
                 tab("board", Panel::Board, matches!(self.view, View::Board)),
                 tab("tuner", Panel::Tuner, matches!(self.view, View::Tuner)),
                 tab("eq", Panel::Eq, matches!(self.view, View::Eq)),
                 tab("live", Panel::Live, matches!(self.view, View::Live)),
             ]
-            .spacing(6),
+            .spacing(2),
+        )
+        .padding(3)
+        .style(theme::tab_group);
+        row![
+            row![
+                text("LION").size(19).color(theme::TEXT_BRIGHT),
+                text("-HEART").size(19).color(theme::ACCENT),
+            ],
+            tabs,
             space().width(Length::Fill),
             button(text("settings").size(13))
+                .padding([5, 13])
                 .on_press(Message::ToggleSettings)
                 .style(theme::chip(matches!(self.view, View::Settings(_)))),
             Canvas::new(Meters {
                 norms: self.ballistics.norms(),
+                holds: self.ballistics.holds(),
                 cache: &self.meter_cache,
             })
-            .width(240)
+            .width(250)
             .height(40),
         ]
-        .spacing(14)
+        .spacing(16)
         .align_y(iced::Alignment::Center)
         .into()
     }
@@ -1178,36 +1195,43 @@ impl Running {
     fn preset_bar(&self) -> Element<'_, Message> {
         let step = |label: &'static str, target: Option<String>| {
             button(text(label).size(12))
+                .padding([4, 10])
                 .on_press_maybe(target.map(Message::LoadPreset))
                 .style(theme::action)
         };
-        row![
-            text("preset").size(12).color(theme::TEXT_DIM),
-            step("◀", self.preset_neighbor(-1)),
-            pick_list(
-                self.presets.clone(),
-                self.active_preset.clone(),
-                Message::LoadPreset,
-            )
-            .placeholder("— none saved —")
-            .style(theme::pick)
-            .menu_style(theme::menu)
-            .text_size(13)
-            .width(Length::Fixed(220.0)),
-            step("▶", self.preset_neighbor(1)),
-            space().width(Length::Fixed(16.0)),
-            text_input("save as…", &self.preset_name)
-                .on_input(Message::PresetNameChanged)
-                .on_submit(Message::SavePreset)
-                .style(theme::input)
-                .width(Length::Fixed(180.0)),
-            button(text("save").size(12))
-                .on_press(Message::SavePreset)
-                .style(theme::action),
-            space().width(Length::Fill),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
+        container(
+            row![
+                text("PRESET").size(11).color(theme::TEXT_DIM),
+                step("◀", self.preset_neighbor(-1)),
+                pick_list(
+                    self.presets.clone(),
+                    self.active_preset.clone(),
+                    Message::LoadPreset,
+                )
+                .placeholder("— none saved —")
+                .style(theme::pick)
+                .menu_style(theme::menu)
+                .text_size(13)
+                .width(Length::Fixed(230.0)),
+                step("▶", self.preset_neighbor(1)),
+                space().width(Length::Fill),
+                text_input("save as…", &self.preset_name)
+                    .on_input(Message::PresetNameChanged)
+                    .on_submit(Message::SavePreset)
+                    .style(theme::input)
+                    .size(13)
+                    .width(Length::Fixed(190.0)),
+                button(text("save").size(12))
+                    .padding([4, 14])
+                    .on_press(Message::SavePreset)
+                    .style(theme::primary),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(theme::panel)
         .into()
     }
 
@@ -1226,30 +1250,56 @@ impl Running {
 
     /// The chain strip *is* the board editor (PRD 002): press-and-drag a
     /// card onto another to move it, click to select, "＋" appends a slot.
+    /// Cards wear their pedal's identity color (stripe + pedal name); the
+    /// LED dot is the bypass state; chevrons mark the signal flow.
     fn chain_strip(&self) -> Element<'_, Message> {
-        let mut strip = row![].spacing(8).align_y(iced::Alignment::Center);
+        let mut strip = row![].spacing(5).align_y(iced::Alignment::Center);
         let dragging = self.drag.as_ref().map(|d| d.from);
         let target = self.drag.as_ref().and_then(|d| d.over);
         for (position, slot) in self.slots.iter().enumerate() {
-            let state = if slot.active { "on" } else { "bypassed" };
-            let mut card = column![text(slot.name).size(14)]
-                .spacing(2)
-                .align_x(iced::Alignment::Center);
-            if slot.pedals.len() > 1 {
-                card = card.push(
-                    text(slot.pedals[slot.active_pedal].name)
-                        .size(10)
-                        .color(theme::ACCENT),
+            if position > 0 {
+                strip = strip.push(
+                    text("›")
+                        .size(15)
+                        .color(theme::dim(theme::TEXT_DIM, 0.65)),
                 );
             }
-            card = card.push(text(state).size(10).color(if slot.active {
+            let led = if slot.active {
                 theme::METER_OK
             } else {
-                theme::TEXT_DIM
-            }));
+                theme::dim(theme::TEXT_DIM, 0.6)
+            };
+            let stripe = if slot.active {
+                slot.color
+            } else {
+                theme::dim(slot.color, 0.35)
+            };
+            let mut card = column![
+                container(space().width(Length::Fill).height(Length::Fixed(3.0)))
+                    .style(theme::identity_rule(stripe)),
+                row![text("●").size(8).color(led), text(slot.name).size(13)]
+                    .spacing(5)
+                    .align_y(iced::Alignment::Center),
+            ]
+            .spacing(4)
+            .align_x(iced::Alignment::Center);
+            card = card.push(if slot.pedals.len() > 1 {
+                text(slot.pedals[slot.active_pedal].name)
+                    .size(10)
+                    .color(if slot.active {
+                        slot.color
+                    } else {
+                        theme::TEXT_DIM
+                    })
+            } else {
+                text(if slot.active { "on" } else { "bypassed" })
+                    .size(10)
+                    .color(theme::TEXT_DIM)
+            });
             strip = strip.push(
-                mouse_area(container(card).width(Length::Fill).padding([8, 4]).style(
+                mouse_area(container(card).width(Length::Fill).padding([6, 5]).style(
                     theme::drag_card(
+                        slot.color,
                         slot.key == self.selected,
                         slot.active,
                         dragging == Some(position),
@@ -1264,7 +1314,7 @@ impl Running {
         }
         if self.slots.is_empty() {
             strip = strip.push(
-                text("empty chain (passthrough) — add a pedal with ＋")
+                text("empty board (passthrough) — add a pedal with ＋")
                     .size(13)
                     .color(theme::TEXT_DIM),
             );
@@ -1518,7 +1568,8 @@ impl Running {
 
         container(
             column![
-                text(preset).size(54).color(theme::ACCENT),
+                text("NOW PLAYING").size(12).color(theme::TEXT_DIM),
+                text(preset).size(60).color(theme::ACCENT),
                 row![
                     big_button("◀ prev", neighbor(-1).map(Message::LoadPreset)),
                     big_button("next ▶", neighbor(1).map(Message::LoadPreset)),
@@ -1526,14 +1577,15 @@ impl Running {
                 .spacing(24),
                 Canvas::new(Meters {
                     norms: self.ballistics.norms(),
+                    holds: self.ballistics.holds(),
                     cache: &self.live_meter_cache,
                 })
-                .width(Length::Fixed(420.0))
+                .width(Length::Fixed(460.0))
                 .height(70),
                 text(tuner_line).size(22).color(theme::METER_OK),
                 text(chain_line).size(13).color(theme::TEXT_DIM),
             ]
-            .spacing(22)
+            .spacing(20)
             .align_x(iced::Alignment::Center),
         )
         .center(Length::Fill)
@@ -1543,12 +1595,19 @@ impl Running {
 
     fn params_panel(&self) -> Element<'_, Message> {
         let Some(slot) = self.slots.iter().find(|s| s.key == self.selected) else {
-            return container(text("no slot selected").color(theme::TEXT_DIM))
-                .style(theme::panel)
-                .padding(14)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
+            return container(
+                column![
+                    text("empty board").size(16).color(theme::TEXT_DIM),
+                    text("add a pedal from the ＋ menu in the chain strip")
+                        .size(13)
+                        .color(theme::dim(theme::TEXT_DIM, 0.8)),
+                ]
+                .spacing(8)
+                .align_x(iced::Alignment::Center),
+            )
+            .center(Length::Fill)
+            .style(theme::panel)
+            .into();
         };
         let pos = self
             .slots
@@ -1558,7 +1617,7 @@ impl Running {
         let can_left = pos > 0;
         let can_right = pos + 1 < self.slots.len();
 
-        let mut title = row![text(slot.name).size(16).color(theme::TEXT_BRIGHT)]
+        let mut title = row![text(slot.name).size(17).color(theme::TEXT_BRIGHT)]
             .spacing(10)
             .align_y(iced::Alignment::Center);
         // Multi-pedal families pick their pedal right in the panel; the
@@ -1581,25 +1640,29 @@ impl Running {
         }
         title = title
             .push(
-                button(text(if slot.active { "ON" } else { "BYPASSED" }).size(12))
+                button(text(if slot.active { "● ON" } else { "○ BYPASSED" }).size(12))
+                    .padding([4, 12])
                     .on_press(Message::ToggleSlot(slot.key.clone()))
-                    .style(theme::chip(slot.active)),
+                    .style(theme::power(slot.active)),
             )
             .push(space().width(Length::Fill))
             .push(
                 button(text("◀").size(12))
+                    .padding([4, 10])
                     .on_press_maybe(can_left.then(|| Message::MoveSlotLeft(slot.key.clone())))
                     .style(theme::action),
             )
             .push(
                 button(text("▶").size(12))
+                    .padding([4, 10])
                     .on_press_maybe(can_right.then(|| Message::MoveSlotRight(slot.key.clone())))
                     .style(theme::action),
             )
             .push(
                 button(text("remove").size(12))
+                    .padding([4, 10])
                     .on_press(Message::RemoveSlot(slot.key.clone()))
-                    .style(theme::action),
+                    .style(theme::danger),
             );
 
         // Stepped params (drive model, modulation type) pick from a
@@ -1653,6 +1716,8 @@ impl Running {
                     name: param.name,
                     value: param.display.clone(),
                     norm: param.norm,
+                    default_norm: param.default_norm,
+                    accent: slot.color,
                     cache: &self.knob_caches[i],
                 })
                 .width(knob::WIDTH)
@@ -1660,21 +1725,36 @@ impl Running {
             );
         }
 
-        let mut body = column![title].spacing(14);
+        // The pedal's identity rule separates its header from the controls.
+        let rule = container(space().width(Length::Fill).height(Length::Fixed(2.0)))
+            .style(theme::identity_rule(slot.color));
+
+        let mut body = column![title, rule].spacing(12);
         if has_selector {
             body = body.push(selectors);
         }
         body = body.push(knobs);
+        body = body.push(
+            text("drag: set · wheel: nudge · double-click: default")
+                .size(11)
+                .color(theme::dim(theme::TEXT_DIM, 0.8)),
+        );
         if let Some(kind) = crate::session::asset_kind(&slot.key) {
             let (nam_name, ir_name) = self.session.asset_names();
             let (label, file) = match kind {
-                AssetKind::Nam => ("capture", nam_name),
-                AssetKind::Ir => ("impulse", ir_name),
+                AssetKind::Nam => ("CAPTURE", nam_name),
+                AssetKind::Ir => ("IMPULSE", ir_name),
             };
             let loaded = file != "-";
             body = body.push(
-                row![
-                    text(format!("{label}: {file}"))
+                container(
+                    row![
+                        text(label).size(10).color(theme::TEXT_DIM),
+                        text(if loaded {
+                            file
+                        } else {
+                            "— nothing loaded —".to_string()
+                        })
                         .size(13)
                         .color(if loaded {
                             theme::TEXT_BRIGHT
@@ -1682,21 +1762,28 @@ impl Running {
                             theme::TEXT_DIM
                         })
                         .font(iced::Font::MONOSPACE),
-                    button(text("load…").size(12))
-                        .on_press(Message::OpenBrowser(kind))
-                        .style(theme::action),
-                    button(text("unload").size(12))
-                        .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
-                        .style(theme::action),
-                ]
-                .spacing(10)
-                .align_y(iced::Alignment::Center),
+                        space().width(Length::Fill),
+                        button(text("load…").size(12))
+                            .padding([3, 10])
+                            .on_press(Message::OpenBrowser(kind))
+                            .style(theme::action),
+                        button(text("unload").size(12))
+                            .padding([3, 10])
+                            .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
+                            .style(theme::danger),
+                    ]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([8, 12])
+                .width(Length::Fill)
+                .style(theme::inset),
             );
         }
 
         container(body)
             .style(theme::panel)
-            .padding(14)
+            .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1705,16 +1792,25 @@ impl Running {
     fn footer(&self) -> Element<'_, Message> {
         let stats = self.session.stats();
         let fps = 1.0 / self.frame_secs.max(1e-4);
+        let xruns = stats.underrun_events + stats.overrun_events;
         row![
             text(self.status.clone()).size(12).color(theme::TEXT_DIM),
             space().width(Length::Fill),
+            // xruns only demand attention when they exist.
+            text(format!("xruns {xruns}"))
+                .size(12)
+                .color(if xruns > 0 {
+                    theme::METER_HOT
+                } else {
+                    theme::dim(theme::TEXT_DIM, 0.7)
+                })
+                .font(iced::Font::MONOSPACE),
             text(format!(
-                "{fps:.0} fps · xruns {} · max cb {:.2} ms",
-                stats.underrun_events + stats.overrun_events,
+                "{fps:.0} fps · max cb {:.2} ms",
                 stats.max_callback_millis(),
             ))
             .size(12)
-            .color(theme::TEXT_DIM)
+            .color(theme::dim(theme::TEXT_DIM, 0.7))
             .font(iced::Font::MONOSPACE),
         ]
         .spacing(10)
