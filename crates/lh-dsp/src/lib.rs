@@ -5,22 +5,27 @@
 //! audio thread. Real-time rules apply to `reset`, `set_param`, and `process`
 //! (no allocation, no locks, no syscalls); `prepare` is the one place allowed
 //! to allocate.
+//!
+//! Effects are grouped by category, one module per kind so each family has
+//! an obvious home to grow in:
+//!
+//! - [`dynamics`] — noise gate, compressor, safety limiter
+//! - [`drive`] — the overdrive/distortion pedal family (one file per pedal)
+//! - [`eq`] — the in-chain tone EQ and the global output EQ
+//! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
+//! - [`time`] — delay, reverb
+//! - [`cab`] — cabinet IR convolution
+//! - [`tuner`] — pitch analysis (not an effect; feeds the GUI)
+//! - [`blocks`] — shared building blocks the effects are made of
 
-pub mod biquad;
+pub mod blocks;
 pub mod cab;
-pub mod comp;
-pub mod delay;
 pub mod drive;
+pub mod dynamics;
 pub mod eq;
-pub mod gate;
-pub mod limiter;
 pub mod modulation;
-pub mod oversample;
-pub mod param_eq;
-pub mod reverb;
-pub mod smooth;
-pub mod swap;
 pub mod testutil;
+pub mod time;
 pub mod tuner;
 
 use lh_core::{EffectDesc, FamilyDesc};

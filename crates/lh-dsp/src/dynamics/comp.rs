@@ -6,7 +6,7 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin, lin_to_db};
 
 use crate::Effect;
-use crate::smooth::Smoothed;
+use crate::blocks::smooth::Smoothed;
 
 static PARAMS: [ParamDesc; 5] = [
     ParamDesc {

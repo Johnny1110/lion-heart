@@ -24,9 +24,9 @@ use lh_core::global_eq::{BAND_COUNT, Band, GlobalEqState};
 use lh_core::preset::SlotState;
 use lh_core::{FamilyDesc, ParamDesc, ParamId, lin_to_db};
 use lh_dsp::Effect;
-use lh_dsp::limiter::Limiter;
-use lh_dsp::param_eq::GlobalEq;
-use lh_dsp::smooth::Smoothed;
+use lh_dsp::blocks::smooth::Smoothed;
+use lh_dsp::dynamics::Limiter;
+use lh_dsp::eq::global::GlobalEq;
 use thiserror::Error;
 
 /// Engine-internal processing granularity. Device callbacks may hand us
@@ -167,7 +167,7 @@ impl OutputStage {
     fn prepare(&mut self, sample_rate: u32) {
         self.eq.prepare(sample_rate);
         self.safety.prepare(sample_rate);
-        let ceiling = &lh_dsp::limiter::DESC.params[0];
+        let ceiling = &lh_dsp::dynamics::limiter::DESC.params[0];
         self.safety
             .set_param(0, ceiling.range.to_norm(SAFETY_CEILING_DB));
         self.mono = vec![0.0; MAX_BLOCK];

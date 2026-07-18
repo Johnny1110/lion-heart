@@ -57,15 +57,66 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    double-click = enable/disable; detail strip for type/readouts/flat/
    master. `global_eq_4band` criterion bench tracks the stage cost.
 
+**Post-M8 polish — code landed (uncommitted):**
+
+1. **lh-dsp category layout.** Effects grouped one module per kind:
+   `dynamics/` (gate/comp/limiter), `drive/` (**one pedal, one file** —
+   registry + `Circuit` + shared `OnePole`/`Ramp` in `drive/mod.rs`),
+   `eq/` (`chain.rs` = the 3-band pedal, `global.rs` = the output-stage
+   EQ, ex-`param_eq`), `time/` (delay/reverb), `blocks/` (biquad,
+   oversample, smooth, swap); `modulation`/`cab`/`tuner` stay root-level
+   categories. Public paths moved (e.g. `lh_dsp::dynamics::NoiseGate`,
+   `lh_dsp::eq::global::GlobalEq`) — all call sites updated, including
+   the `spikes/` workspace, which was also repaired to the stereo/M8
+   engine API (it had bit-rotted; its gates are green again).
+2. **red-charlie drive pedal** (Marshall JCM800 2203-style; born
+   "jcm800", renamed before ever shipping — no preset shim): cascaded
+   stages — warm asymmetric stage 1, cathode-network low trim (~8 dB
+   below 100 Hz) + 120 Hz interstage coupling for the tight low end,
+   gain-dependent bright cap (strongest at low gain), cold-clipper
+   stage 2 (0.4/1.0 knees) — FMV-voiced Bass/Middle/Treble
+   (100/650/3300 Hz) via the `eq()` hook, Master on the shared level
+   law. Gain pot +8..+56 dB — the top ~12 dB beyond a stock 2203 is the
+   "screamer in front" solo reach the user asked for after playing it;
+   the audio taper keeps 0..4 in stock crunch territory (MAKEUP
+   re-trimmed 0.22→0.18 to keep noon in the family's unity window).
+   ~10.3 µs per 64-frame stereo block. EQ-band tests probe with
+   real multi-tone inputs (`tones()` helper — projecting onto absent
+   frequencies read the noise floor; evva's test upgraded to match).
+2b. **monster5150 drive pedal** (EVH 5150-style high gain): three-stage
+   cascade ending in a *very* cold clipper (0.35/0.9), pre gain
+   +12..+60 dB — **no clean floor**; tightness carved pre-gain (low trim
+   below 120 Hz + a second 180 Hz coupling), Low knob restores lows
+   post-distortion (resonance-style, 80 Hz), fixed bright pre-emphasis,
+   ~6.8 kHz post fizz lowpass; Pre/Low/Mid/High/Post faceplate
+   (mid 550 Hz, high 3 kHz). Character pinned by a **sustain test**
+   (−38 dBFS tail stays ≥1.4× louder than red-charlie's — residuals
+   plateau at the square-wave ceiling, compression is the honest
+   high-gain metric). ~13.3 µs per block. `DRIVE_PEDALS` is now 7,
+   append-only respected; plugin params expand automatically.
+3. **GUI v2.** Header = view tabs (board · tuner · eq · live) with
+   settings set apart top-right; a **persistent preset bar** (◀ picker ▶,
+   save-as field — replaces the presets overlay, rescans the dir ~1 Hz);
+   window 960×640. Bug fixed: clicking/dragging a chain card now always
+   returns to the board view with that slot's faceplate open
+   (`select_position` sets `View::Board`) — it used to do nothing while
+   tuner/eq/live/settings was up.
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
-values restored, faceplates correct), board editing while playing (drag/
+values restored, faceplates correct), **red-charlie by ear** (crunch vs
+the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
+**monster5150 by ear** (chug tightness, sustain, fizz level, Low-knob
+post-distortion thickness, no-clean floor acceptable),
+the reworked GUI (tabs, preset bar prev/next/save, chain-click landing
+on the board from every view), board editing while playing (drag/
 add/remove — tails keep ringing through the fade), a 3-drive board saved
 and reloaded, the EQ panel against real playing (spectrum sanity, drag
 feel, persistence across restarts), plugin re-check in a real host
-(drive/mod param ids changed — pre-v0.1 break; re-run clap-validator),
-plus the standing M7 items (stereo width by ear, foot controller
-end-to-end, `--buffer 32` on hardware, RTL numbers into
-`docs/latency.md`). **v0.1 tagging is the user's call** after that.
+(drive/mod param ids changed and red-charlie/monster5150 params
+appeared — pre-v0.1 break; re-run clap-validator), plus the standing M7 items (stereo width
+by ear, foot controller end-to-end, `--buffer 32` on hardware, RTL
+numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
+after that.
 
 M7 recap: stereo bus end to end (ADR 002 implemented) and the
 CLAP/VST3 plugin via nih-plug (pinned rev) with the release pipeline
@@ -119,7 +170,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |
 | `lh-core`        | Param IDs & ranges, chain model, preset schema. No I/O, no threads | —             |
-| `lh-dsp`         | Effects (gate, drive, delay, …). Offline-testable, RT-safe        | `lh-core`     |
+| `lh-dsp`         | Effects, one module per category (dynamics, drive, eq, modulation, time, cab) over shared `blocks/`. Offline-testable, RT-safe | `lh-core`     |
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |

@@ -8,8 +8,8 @@ use std::path::Path;
 
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 use lh_dsp::Effect;
-use lh_dsp::smooth::Smoothed;
-use lh_dsp::swap::{AssetHandle, AssetSlot, asset_channel};
+use lh_dsp::blocks::smooth::Smoothed;
+use lh_dsp::blocks::swap::{AssetHandle, AssetSlot, asset_channel};
 use thiserror::Error;
 
 /// Captures are normalized so different models land at a comparable loudness

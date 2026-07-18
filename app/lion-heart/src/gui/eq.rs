@@ -255,7 +255,7 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 for i in 0..CURVE_POINTS {
                     let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
                     let freq = freq_of_x(w, x);
-                    let db = lh_dsp::param_eq::response_db(self.state, self.sample_rate, freq);
+                    let db = lh_dsp::eq::global::response_db(self.state, self.sample_rate, freq);
                     let p = Point::new(x, y_of_gain(h, db.clamp(-GAIN_DB_MAX, GAIN_DB_MAX)));
                     if i == 0 {
                         b.move_to(p);

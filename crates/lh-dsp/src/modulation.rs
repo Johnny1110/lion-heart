@@ -22,7 +22,7 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
-use crate::smooth::Smoothed;
+use crate::blocks::smooth::Smoothed;
 
 const CHORUS: usize = 0;
 const FLANGER: usize = 1;

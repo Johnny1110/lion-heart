@@ -22,10 +22,19 @@ pub const PRESET_SCHEMA_VERSION: u32 = 3;
 /// [`DRIVE_PEDALS`].
 pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
 
-/// v2 drive model indices → v3 pedal keys, in registry order. The registry
-/// lives in `lh-dsp` (which this crate cannot see); a test over there pins
-/// the two together so they cannot drift.
-pub const DRIVE_PEDALS: [&str; 5] = ["ts9", "bd2", "classic", "centaur", "evva"];
+/// v2 drive model indices → v3 pedal keys, in registry order (append-only;
+/// pedals past index 4 postdate v2 and are unreachable from the migration).
+/// The registry lives in `lh-dsp` (which this crate cannot see); a test over
+/// there pins the two together so they cannot drift.
+pub const DRIVE_PEDALS: [&str; 7] = [
+    "ts9",
+    "bd2",
+    "classic",
+    "centaur",
+    "evva",
+    "red-charlie",
+    "monster5150",
+];
 
 /// v2 modulation type indices → v3 pedal keys, same pinning contract.
 pub const MOD_PEDALS: [&str; 4] = ["chorus", "flanger", "phaser", "tremolo"];

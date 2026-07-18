@@ -12,8 +12,8 @@
 
 use lh_core::global_eq::{Band, BandKind, GlobalEqState, Q_MIN};
 
-use crate::biquad::Biquad;
-use crate::smooth::Smoothed;
+use crate::blocks::biquad::Biquad;
+use crate::blocks::smooth::Smoothed;
 
 /// Engage/disengage crossfade per band and for the master toggle.
 const WET_MS: f32 = 15.0;

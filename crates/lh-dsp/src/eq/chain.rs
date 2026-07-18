@@ -7,8 +7,8 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
-use crate::biquad::Biquad;
-use crate::smooth::Smoothed;
+use crate::blocks::biquad::Biquad;
+use crate::blocks::smooth::Smoothed;
 
 const LOW_SHELF_HZ: f32 = 120.0;
 const HIGH_SHELF_HZ: f32 = 3_200.0;

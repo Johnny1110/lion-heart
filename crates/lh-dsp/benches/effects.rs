@@ -5,13 +5,13 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use lh_dsp::Effect;
-use lh_dsp::comp::Compressor;
-use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
+use lh_dsp::dynamics::Compressor;
+use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
-use lh_dsp::gate::NoiseGate;
 use lh_dsp::modulation::Modulation;
-use lh_dsp::reverb::Reverb;
+use lh_dsp::time::Delay;
+use lh_dsp::time::Reverb;
 
 const SR: u32 = 48_000;
 const BLOCK: usize = 64;
@@ -102,7 +102,7 @@ fn bench_effects(c: &mut Criterion) {
     bench_stereo!(group, "reverb_fdn8", reverb, buf, buf_r);
 
     // The always-on output stage EQ with a representative four bands live.
-    let mut global_eq = lh_dsp::param_eq::GlobalEq::new();
+    let mut global_eq = lh_dsp::eq::global::GlobalEq::new();
     global_eq.prepare(SR);
     let mut state = lh_core::global_eq::GlobalEqState::default();
     for (i, freq) in [(0usize, 40.0), (2, 250.0), (5, 3_000.0), (7, 11_000.0)] {
@@ -129,7 +129,7 @@ fn bench_full_chain(c: &mut Criterion) {
         let mut modulation = Modulation::new();
         let mut delay = Delay::new();
         let mut reverb = Reverb::new();
-        let mut limiter = lh_dsp::limiter::Limiter::new();
+        let mut limiter = lh_dsp::dynamics::Limiter::new();
         let effects: [&mut dyn Effect; 8] = [
             &mut gate,
             &mut comp,

@@ -16,7 +16,7 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 
 use crate::Effect;
-use crate::smooth::Smoothed;
+use crate::blocks::smooth::Smoothed;
 
 const N: usize = 8;
 /// Line lengths in ms — spread, mutually incommensurate, longest < 80 ms.

@@ -6,8 +6,8 @@ use fft_convolver::FFTConvolver;
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
-use crate::smooth::Smoothed;
-use crate::swap::{AssetHandle, AssetSlot, asset_channel};
+use crate::blocks::smooth::Smoothed;
+use crate::blocks::swap::{AssetHandle, AssetSlot, asset_channel};
 
 static PARAMS: [ParamDesc; 1] = [ParamDesc {
     key: "level",

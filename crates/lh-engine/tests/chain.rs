@@ -2,10 +2,10 @@
 //! the same message queue the CLI uses.
 
 use lh_dsp::Effect;
-use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
-use lh_dsp::gate::NoiseGate;
+use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::testutil::{assert_finite, rms, sine};
+use lh_dsp::time::Delay;
 use lh_engine::build_chain;
 
 const SR: u32 = 48_000;
@@ -417,7 +417,7 @@ fn pedal_selector_aliases_and_cc_norms() {
     assert_eq!(handle.active_pedal("drive").unwrap(), "bd2");
     // A CC at full deflection lands on the last pedal.
     handle.select_pedal_norm("drive", 1.0).unwrap();
-    assert_eq!(handle.active_pedal("drive").unwrap(), "evva");
+    assert_eq!(handle.active_pedal("drive").unwrap(), "monster5150");
     assert!(handle.select_pedal("drive", "wah").is_err());
     // Display names resolve too.
     handle.select_pedal("drive", "Blues Driver").unwrap();

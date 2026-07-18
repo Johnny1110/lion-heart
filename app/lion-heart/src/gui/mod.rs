@@ -1,5 +1,11 @@
 //! The Lion-Heart GUI (M4 "the face"): run the pedalboard without a terminal.
 //!
+//! Layout: a header with the view tabs (board · tuner · eq · live) and the
+//! settings chip, a persistent preset bar (prev/next, picker, save — presets
+//! are a first-class control, not a buried overlay), the chain strip (always
+//! visible; clicking a card jumps back to the board view with that pedal's
+//! panel open), the active view, and the status footer.
+//!
 //! Threading contract (CLAUDE.md rules): this UI thread owns the [`Session`]
 //! — `ChainHandle` for lock-free param/bypass/order messages, asset handles
 //! for hot-swaps — and polls `Telemetry` atomics plus the tuner tap on every
@@ -40,6 +46,8 @@ const GC_FRAMES: u32 = 12;
 const TUNER_FRAMES: u32 = 4;
 /// Frames between spectrum updates (~30 Hz at 60 fps).
 const SPECTRUM_FRAMES: u32 = 2;
+/// Frames between preset-directory rescans (~1 Hz at 60 fps).
+const PRESET_SCAN_FRAMES: u32 = 60;
 /// Keep showing the last tuner reading this long after the note decays.
 const TUNER_HOLD: Duration = Duration::from_millis(800);
 const MAX_KNOBS: usize = 8;
@@ -49,7 +57,7 @@ pub fn run(args: GuiArgs) -> anyhow::Result<()> {
         .subscription(App::subscription)
         .theme(App::theme)
         .antialiasing(true)
-        .window_size(Size::new(960.0, 580.0))
+        .window_size(Size::new(960.0, 640.0))
         .title("Lion-Heart")
         .run()?;
     Ok(())
@@ -93,10 +101,8 @@ pub enum Message {
     BrowserPick(PathBuf),
     BrowserClose,
     UnloadAsset(AssetKind),
-    TogglePresets,
-    ToggleTuner,
-    ToggleLive,
-    ToggleEq,
+    /// Switch the main panel to a view tab (board / tuner / eq / live).
+    ShowPanel(Panel),
     /// Live global-EQ band edit; `commit` also persists to disk.
     EqBand {
         index: usize,
@@ -122,15 +128,26 @@ pub enum Message {
     LoadPreset(String),
 }
 
-enum Overlay {
-    None,
+/// The view tabs in the header, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Panel {
+    /// The pedalboard: the selected slot's faceplate.
+    Board,
     Tuner,
-    Presets,
-    Browser(Browser),
-    /// Stage mode: big preset name, prev/next, big meters.
-    Live,
     /// Global output EQ editor with the live spectrum (PRD 003).
     Eq,
+    /// Stage mode: big preset name, prev/next, big meters.
+    Live,
+}
+
+/// What the main panel is showing. [`Panel`] tabs cover the first four;
+/// settings and the asset browser open from their own controls.
+enum View {
+    Board,
+    Tuner,
+    Eq,
+    Live,
+    Browser(Browser),
     /// Audio I/O settings: devices, input channel, buffer size.
     Settings(SettingsDraft),
 }
@@ -341,7 +358,7 @@ struct Running {
     slots: Vec<SlotUi>,
     selected: String,
     drag: Option<DragState>,
-    overlay: Overlay,
+    view: View,
     preset_name: String,
     presets: Vec<String>,
     active_preset: Option<String>,
@@ -413,7 +430,7 @@ impl App {
             slots: Vec::new(),
             selected: String::new(),
             drag: None,
-            overlay: Overlay::None,
+            view: View::Board,
             preset_name: active_preset.clone().unwrap_or_default(),
             presets: list_presets(),
             active_preset,
@@ -559,14 +576,33 @@ impl Running {
         }
     }
 
-    /// Select the slot at a chain position (clears knob canvases).
+    /// Select the slot at a chain position and show its faceplate: whatever
+    /// view is up, clicking the chain always lands on the board (the fix for
+    /// "chain clicks do nothing while tuner/eq/live/settings is open").
     fn select_position(&mut self, position: usize) {
         if let Some(slot) = self.slots.get(position) {
             self.selected = slot.key.clone();
+            self.view = View::Board;
             for cache in &self.knob_caches {
                 cache.clear();
             }
         }
+    }
+
+    /// The preset `step` away from the active one; with none active, next
+    /// starts at the first and prev at the last.
+    fn preset_neighbor(&self, step: isize) -> Option<String> {
+        if self.presets.is_empty() {
+            return None;
+        }
+        let Some(current) = self.active_preset.as_deref() else {
+            let index = if step > 0 { 0 } else { self.presets.len() - 1 };
+            return Some(self.presets[index].clone());
+        };
+        let pos = self.presets.iter().position(|p| p == current)? as isize;
+        let next = pos + step;
+        (next >= 0 && (next as usize) < self.presets.len())
+            .then(|| self.presets[next as usize].clone())
     }
 
     fn update(&mut self, message: Message) {
@@ -672,15 +708,15 @@ impl Running {
                     .map(PathBuf::from)
                     .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("/"));
-                self.overlay = Overlay::Browser(Browser::open(kind, start));
+                self.view = View::Browser(Browser::open(kind, start));
             }
             Message::BrowserNav(path) => {
-                if let Overlay::Browser(browser) = &mut self.overlay {
+                if let View::Browser(browser) = &mut self.view {
                     browser.navigate(path);
                 }
             }
             Message::BrowserPick(path) => {
-                if let Overlay::Browser(browser) = &self.overlay {
+                if let View::Browser(browser) = &self.view {
                     let result = match browser.kind {
                         AssetKind::Nam => self.session.load_nam(&path),
                         AssetKind::Ir => self.session.load_ir(&path),
@@ -688,13 +724,13 @@ impl Running {
                     match result {
                         Ok(msg) => {
                             self.status = msg;
-                            self.overlay = Overlay::None;
+                            self.view = View::Board;
                         }
                         Err(e) => self.status = format!("error: {e}"),
                     }
                 }
             }
-            Message::BrowserClose => self.overlay = Overlay::None,
+            Message::BrowserClose => self.view = View::Board,
             Message::UnloadAsset(kind) => {
                 let (had, label) = match kind {
                     AssetKind::Nam => (self.session.unload_nam(), "nam"),
@@ -704,45 +740,7 @@ impl Running {
                     self.status = format!("{label}: unloaded");
                 }
             }
-            Message::TogglePresets => {
-                self.overlay = match self.overlay {
-                    Overlay::Presets => Overlay::None,
-                    _ => {
-                        self.presets = list_presets();
-                        Overlay::Presets
-                    }
-                };
-            }
-            Message::ToggleTuner => {
-                self.overlay = match self.overlay {
-                    Overlay::Tuner => Overlay::None,
-                    _ => {
-                        // Stale tap contents would smear the first estimate.
-                        self.drain_tap();
-                        self.tuner.reset();
-                        self.reading = None;
-                        Overlay::Tuner
-                    }
-                };
-            }
-            Message::ToggleLive => {
-                self.overlay = match self.overlay {
-                    Overlay::Live => Overlay::None,
-                    _ => {
-                        // The mini tuner readout runs in live mode too.
-                        self.drain_tap();
-                        self.tuner.reset();
-                        self.reading = None;
-                        Overlay::Live
-                    }
-                };
-            }
-            Message::ToggleEq => {
-                self.overlay = match self.overlay {
-                    Overlay::Eq => Overlay::None,
-                    _ => Overlay::Eq,
-                };
-            }
+            Message::ShowPanel(panel) => self.show_panel(panel),
             Message::EqBand {
                 index,
                 band,
@@ -804,16 +802,16 @@ impl Running {
                 self.eq_cache.clear();
             }
             Message::ToggleSettings => {
-                self.overlay = match self.overlay {
-                    Overlay::Settings(_) => Overlay::None,
+                self.view = match self.view {
+                    View::Settings(_) => View::Board,
                     _ => {
                         let (in_name, out_name) = self.session.io_names();
-                        Overlay::Settings(SettingsDraft::open(&self.opts, in_name, out_name))
+                        View::Settings(SettingsDraft::open(&self.opts, in_name, out_name))
                     }
                 };
             }
             Message::SettingsInput(choice) => {
-                if let Overlay::Settings(draft) = &mut self.overlay {
+                if let View::Settings(draft) = &mut self.view {
                     draft.input = choice;
                     // The tapped channel must exist on the new device.
                     if draft.in_channel > draft.input_channels() {
@@ -822,17 +820,17 @@ impl Running {
                 }
             }
             Message::SettingsOutput(choice) => {
-                if let Overlay::Settings(draft) = &mut self.overlay {
+                if let View::Settings(draft) = &mut self.view {
                     draft.output = choice;
                 }
             }
             Message::SettingsChannel(channel) => {
-                if let Overlay::Settings(draft) = &mut self.overlay {
+                if let View::Settings(draft) = &mut self.view {
                     draft.in_channel = channel;
                 }
             }
             Message::SettingsBuffer(choice) => {
-                if let Overlay::Settings(draft) = &mut self.overlay {
+                if let View::Settings(draft) = &mut self.view {
                     draft.buffer = choice;
                 }
             }
@@ -865,6 +863,37 @@ impl Running {
         }
     }
 
+    /// Switch to a view tab. Radio semantics: re-clicking the active tab is
+    /// a no-op (so it never resets the tuner window mid-reading).
+    fn show_panel(&mut self, panel: Panel) {
+        let already = matches!(
+            (&self.view, panel),
+            (View::Board, Panel::Board)
+                | (View::Tuner, Panel::Tuner)
+                | (View::Eq, Panel::Eq)
+                | (View::Live, Panel::Live)
+        );
+        if already {
+            return;
+        }
+        self.view = match panel {
+            Panel::Board => View::Board,
+            Panel::Eq => View::Eq,
+            // Tuner runs in live mode too; stale tap contents would smear
+            // the first estimate.
+            Panel::Tuner | Panel::Live => {
+                self.drain_tap();
+                self.tuner.reset();
+                self.reading = None;
+                if panel == Panel::Tuner {
+                    View::Tuner
+                } else {
+                    View::Live
+                }
+            }
+        };
+    }
+
     fn on_frame(&mut self, now: Instant) {
         if let Some(last) = self.last_frame {
             let dt = (now - last).as_secs_f32();
@@ -875,6 +904,15 @@ impl Running {
 
         if self.frame_count.is_multiple_of(GC_FRAMES) {
             self.session.collect_garbage();
+        }
+
+        // Keep the preset bar's list fresh (~1 Hz) — files can appear or
+        // vanish under ~/.lion-heart/presets while we run.
+        if self.frame_count.is_multiple_of(PRESET_SCAN_FRAMES) {
+            let fresh = list_presets();
+            if fresh != self.presets {
+                self.presets = fresh;
+            }
         }
 
         // Foot controller: apply queued MIDI and mirror the result in the UI.
@@ -909,13 +947,13 @@ impl Running {
                 chunk.commit_all();
             }
         }
-        if matches!(self.overlay, Overlay::Eq) && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
+        if matches!(self.view, View::Eq) && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
             self.analyzer.update();
             self.eq_cache.clear();
         }
 
         self.drain_tap();
-        if matches!(self.overlay, Overlay::Tuner | Overlay::Live) {
+        if matches!(self.view, View::Tuner | View::Live) {
             if self.frame_count.is_multiple_of(TUNER_FRAMES) {
                 if let Some(est) = self.tuner.estimate() {
                     self.reading = Some((
@@ -976,7 +1014,7 @@ impl Running {
     /// restored; only when that also fails is audio truly gone (→ Failed).
     fn apply_settings(self: Box<Self>) -> App {
         let mut this = *self;
-        let Overlay::Settings(draft) = &this.overlay else {
+        let View::Settings(draft) = &this.view else {
             return App::Running(Box::new(this));
         };
         let new_opts = draft.to_opts(&this.opts);
@@ -1059,6 +1097,7 @@ impl Running {
     fn view(&self) -> Element<'_, Message> {
         let content = column![
             self.header(),
+            self.preset_bar(),
             self.chain_strip(),
             self.main_panel(),
             self.footer(),
@@ -1073,26 +1112,27 @@ impl Running {
             .into()
     }
 
+    /// Logo, the view tabs, and — set apart on the right, utility-corner
+    /// style — settings and the meters.
     fn header(&self) -> Element<'_, Message> {
-        let preset_label = self.active_preset.as_deref().unwrap_or("presets");
+        let tab = |label: &'static str, panel: Panel, lit: bool| {
+            button(text(label).size(13))
+                .on_press(Message::ShowPanel(panel))
+                .style(theme::chip(lit))
+        };
         row![
             text("LION-HEART").size(18).color(theme::ACCENT),
-            button(text(preset_label).size(13))
-                .on_press(Message::TogglePresets)
-                .style(theme::chip(matches!(self.overlay, Overlay::Presets))),
-            button(text("tuner").size(13))
-                .on_press(Message::ToggleTuner)
-                .style(theme::chip(matches!(self.overlay, Overlay::Tuner))),
-            button(text("live").size(13))
-                .on_press(Message::ToggleLive)
-                .style(theme::chip(matches!(self.overlay, Overlay::Live))),
-            button(text("eq").size(13))
-                .on_press(Message::ToggleEq)
-                .style(theme::chip(matches!(self.overlay, Overlay::Eq))),
+            row![
+                tab("board", Panel::Board, matches!(self.view, View::Board)),
+                tab("tuner", Panel::Tuner, matches!(self.view, View::Tuner)),
+                tab("eq", Panel::Eq, matches!(self.view, View::Eq)),
+                tab("live", Panel::Live, matches!(self.view, View::Live)),
+            ]
+            .spacing(6),
+            space().width(Length::Fill),
             button(text("settings").size(13))
                 .on_press(Message::ToggleSettings)
-                .style(theme::chip(matches!(self.overlay, Overlay::Settings(_)))),
-            space().width(Length::Fill),
+                .style(theme::chip(matches!(self.view, View::Settings(_)))),
             Canvas::new(Meters {
                 norms: self.ballistics.norms(),
                 cache: &self.meter_cache,
@@ -1101,6 +1141,45 @@ impl Running {
             .height(40),
         ]
         .spacing(14)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    /// The persistent preset bar: step through presets, pick one directly,
+    /// or save the current board under a name. Grows gracefully as presets
+    /// accumulate (the picker scrolls); MIDI PC changes land here too.
+    fn preset_bar(&self) -> Element<'_, Message> {
+        let step = |label: &'static str, target: Option<String>| {
+            button(text(label).size(12))
+                .on_press_maybe(target.map(Message::LoadPreset))
+                .style(theme::action)
+        };
+        row![
+            text("preset").size(12).color(theme::TEXT_DIM),
+            step("◀", self.preset_neighbor(-1)),
+            pick_list(
+                self.presets.clone(),
+                self.active_preset.clone(),
+                Message::LoadPreset,
+            )
+            .placeholder("— none saved —")
+            .style(theme::pick)
+            .menu_style(theme::menu)
+            .text_size(13)
+            .width(Length::Fixed(220.0)),
+            step("▶", self.preset_neighbor(1)),
+            space().width(Length::Fixed(16.0)),
+            text_input("save as…", &self.preset_name)
+                .on_input(Message::PresetNameChanged)
+                .on_submit(Message::SavePreset)
+                .style(theme::input)
+                .width(Length::Fixed(180.0)),
+            button(text("save").size(12))
+                .on_press(Message::SavePreset)
+                .style(theme::action),
+            space().width(Length::Fill),
+        ]
+        .spacing(8)
         .align_y(iced::Alignment::Center)
         .into()
     }
@@ -1178,10 +1257,9 @@ impl Running {
     }
 
     fn main_panel(&self) -> Element<'_, Message> {
-        match &self.overlay {
-            Overlay::Browser(browser) => browser.view(),
-            Overlay::Presets => self.presets_view(),
-            Overlay::Tuner => container(
+        match &self.view {
+            View::Browser(browser) => browser.view(),
+            View::Tuner => container(
                 Canvas::new(TunerDisplay {
                     reading: self.reading.as_ref().map(|(reading, _)| reading.clone()),
                     cache: &self.tuner_cache,
@@ -1194,10 +1272,10 @@ impl Running {
             .width(Length::Fill)
             .height(Length::Fill)
             .into(),
-            Overlay::Live => self.live_view(),
-            Overlay::Eq => self.eq_view(),
-            Overlay::Settings(draft) => self.settings_view(draft),
-            Overlay::None => self.params_panel(),
+            View::Live => self.live_view(),
+            View::Eq => self.eq_view(),
+            View::Settings(draft) => self.settings_view(draft),
+            View::Board => self.params_panel(),
         }
     }
 
@@ -1386,13 +1464,7 @@ impl Running {
     /// Stage mode: what you need mid-song, readable from a meter away.
     fn live_view(&self) -> Element<'_, Message> {
         let preset = self.active_preset.clone().unwrap_or_else(|| "—".into());
-        let neighbor = |step: isize| -> Option<String> {
-            let current = self.active_preset.as_deref()?;
-            let pos = self.presets.iter().position(|p| p == current)? as isize;
-            let next = pos + step;
-            (next >= 0 && (next as usize) < self.presets.len())
-                .then(|| self.presets[next as usize].clone())
-        };
+        let neighbor = |step: isize| self.preset_neighbor(step);
         let big_button = |label: &'static str, msg: Option<Message>| {
             button(text(label).size(26))
                 .padding([14, 30])
@@ -1596,50 +1668,6 @@ impl Running {
         }
 
         container(body)
-            .style(theme::panel)
-            .padding(14)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    fn presets_view(&self) -> Element<'_, Message> {
-        let save_row = row![
-            text_input("preset name", &self.preset_name)
-                .on_input(Message::PresetNameChanged)
-                .on_submit(Message::SavePreset)
-                .style(theme::input)
-                .width(240),
-            button(text("save").size(13))
-                .on_press(Message::SavePreset)
-                .style(theme::action),
-            space().width(Length::Fill),
-            button(text("close").size(12))
-                .on_press(Message::TogglePresets)
-                .style(theme::action),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
-
-        let mut listing = column![].spacing(2);
-        if self.presets.is_empty() {
-            listing = listing.push(
-                text("no presets yet — name one and press save")
-                    .size(13)
-                    .color(theme::TEXT_DIM),
-            );
-        }
-        for name in &self.presets {
-            let lit = self.active_preset.as_deref() == Some(name);
-            listing = listing.push(
-                button(text(name.clone()).size(13))
-                    .width(Length::Fill)
-                    .on_press(Message::LoadPreset(name.clone()))
-                    .style(theme::chip(lit)),
-            );
-        }
-
-        container(column![save_row, scrollable(listing).height(Length::Fill)].spacing(12))
             .style(theme::panel)
             .padding(14)
             .width(Length::Fill)

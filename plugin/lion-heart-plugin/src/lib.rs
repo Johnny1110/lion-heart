@@ -32,16 +32,16 @@ use std::sync::{Arc, Mutex};
 use nih_plug::prelude::*;
 
 use lh_dsp::Effect;
+use lh_dsp::blocks::swap::AssetHandle;
 use lh_dsp::cab::{CabIr, IrAsset};
-use lh_dsp::comp::Compressor;
-use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
+use lh_dsp::dynamics::Compressor;
+use lh_dsp::dynamics::Limiter;
+use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
-use lh_dsp::gate::NoiseGate;
-use lh_dsp::limiter::Limiter;
 use lh_dsp::modulation::Modulation;
-use lh_dsp::reverb::Reverb;
-use lh_dsp::swap::AssetHandle;
+use lh_dsp::time::Delay;
+use lh_dsp::time::Reverb;
 use lh_engine::{Chain, ChainHandle, build_chain};
 use lh_nam::{NamAmp, NamAsset, load_nam_file};
 

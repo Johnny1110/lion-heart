@@ -12,9 +12,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use lh_core::{ParamDesc, lin_to_db};
-use lh_dsp::delay::Delay;
 use lh_dsp::drive::Drive;
-use lh_dsp::gate::NoiseGate;
+use lh_dsp::dynamics::NoiseGate;
+use lh_dsp::time::Delay;
 use lh_engine::{ChainHandle, build_chain};
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -84,11 +84,13 @@ impl SpikeEngine {
         ]);
         chain.prepare(SAMPLE_RATE);
 
+        // The drive slot's first pedal (ts9) wears the "drive" knob.
         let drive = handle
-            .descriptors()
+            .families()
             .iter()
-            .find(|d| d.key == "drive")
+            .find(|f| f.key == "drive")
             .expect("drive slot")
+            .pedals[0]
             .params
             .iter()
             .find(|p| p.key == "drive")
@@ -101,6 +103,7 @@ impl SpikeEngine {
             .spawn(move || {
                 let mut synth = Pluck::new(SAMPLE_RATE);
                 let mut block = [0.0f32; BLOCK];
+                let mut block_r = [0.0f32; BLOCK];
                 let tick = Duration::from_micros(
                     (BLOCKS_PER_TICK * BLOCK) as u64 * 1_000_000 / SAMPLE_RATE as u64,
                 );
@@ -108,7 +111,9 @@ impl SpikeEngine {
                 while flag.load(Ordering::Relaxed) {
                     for _ in 0..BLOCKS_PER_TICK {
                         synth.fill(&mut block);
-                        chain.process(&mut block);
+                        // Mono source duplicated onto the stereo bus (M7).
+                        block_r.copy_from_slice(&block);
+                        chain.process(&mut block, &mut block_r);
                     }
                     next += tick;
                     let now = Instant::now();
@@ -242,8 +247,11 @@ mod tests {
     fn drive_norm_round_trips_through_range() {
         let mut engine = SpikeEngine::start();
         let real = engine.set_drive_norm(0.5);
-        assert!((real - 20.0).abs() < 1e-3, "mid of 0..40 dB, got {real}");
-        assert_eq!(engine.drive_display(), "20.0 dB");
+        assert!(
+            (real - 5.0).abs() < 1e-3,
+            "mid of the 0..10 pot, got {real}"
+        );
+        assert_eq!(engine.drive_display().trim(), "5.0");
     }
 
     #[test]
