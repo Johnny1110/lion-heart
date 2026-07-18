@@ -5,6 +5,7 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
+use crate::blocks::onepole_ms;
 
 static PARAMS: [ParamDesc; 2] = [
     ParamDesc {
@@ -89,14 +90,10 @@ impl NoiseGate {
     }
 
     fn recompute(&mut self) {
-        self.env_decay = one_pole(ENV_DECAY_MS, self.sample_rate);
-        self.attack_coeff = one_pole(ATTACK_MS, self.sample_rate);
-        self.release_coeff = one_pole(self.release_ms, self.sample_rate);
+        self.env_decay = onepole_ms(ENV_DECAY_MS, self.sample_rate);
+        self.attack_coeff = onepole_ms(ATTACK_MS, self.sample_rate);
+        self.release_coeff = onepole_ms(self.release_ms, self.sample_rate);
     }
-}
-
-fn one_pole(ms: f32, sample_rate: u32) -> f32 {
-    1.0 - (-1.0 / (ms * 1e-3 * sample_rate as f32)).exp()
 }
 
 impl Effect for NoiseGate {
@@ -121,7 +118,7 @@ impl Effect for NoiseGate {
             0 => self.thr_open = db_to_lin(PARAMS[0].range.to_real(normalized)),
             1 => {
                 self.release_ms = PARAMS[1].range.to_real(normalized);
-                self.release_coeff = one_pole(self.release_ms, self.sample_rate);
+                self.release_coeff = onepole_ms(self.release_ms, self.sample_rate);
             }
             _ => {}
         }

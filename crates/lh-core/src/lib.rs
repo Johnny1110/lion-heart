@@ -12,6 +12,14 @@ pub mod drive_law;
 pub mod global_eq;
 pub mod preset;
 
+/// The default pedalboard, as family keys in processing order. The single
+/// source of truth for "the full rig": the app's session registry and the
+/// plugin's fixed chain are both pinned to it by tests, so the two binaries
+/// cannot drift apart.
+pub const DEFAULT_CHAIN: [&str; 10] = [
+    "gate", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
+];
+
 /// Decibels → linear amplitude.
 pub fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)

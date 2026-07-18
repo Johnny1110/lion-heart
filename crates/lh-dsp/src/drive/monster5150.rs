@@ -13,7 +13,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
-use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
+use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 5] = [
     knob("pre", "Pre Gain", 5.0, 20.0),
@@ -68,11 +68,7 @@ pub(super) struct Monster5150 {
     couple2: OnePole,
     dc_os: OnePole,
     fizz: OnePole,
-    eq_lo: OnePole,
-    /// Mid bandpass: cascaded one-poles for a peak at MID_HZ.
-    eq_mid_lp: OnePole,
-    eq_mid_hp: OnePole,
-    eq_hi: OnePole,
+    stack: ToneStack,
     c40: f32,
     c120: f32,
     c1500: f32,
@@ -80,10 +76,6 @@ pub(super) struct Monster5150 {
     c_couple2: f32,
     c12: f32,
     c_fizz: f32,
-    c_lo: f32,
-    c_mid_wide: f32,
-    c_mid_narrow: f32,
-    c_hi: f32,
 }
 
 impl Monster5150 {
@@ -96,10 +88,7 @@ impl Monster5150 {
             couple2: OnePole::default(),
             dc_os: OnePole::default(),
             fizz: OnePole::default(),
-            eq_lo: OnePole::default(),
-            eq_mid_lp: OnePole::default(),
-            eq_mid_hp: OnePole::default(),
-            eq_hi: OnePole::default(),
+            stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
             c40: 0.0,
             c120: 0.0,
             c1500: 0.0,
@@ -107,10 +96,6 @@ impl Monster5150 {
             c_couple2: 0.0,
             c12: 0.0,
             c_fizz: 0.0,
-            c_lo: 0.0,
-            c_mid_wide: 0.0,
-            c_mid_narrow: 0.0,
-            c_hi: 0.0,
         }
     }
 
@@ -134,11 +119,7 @@ impl Circuit for Monster5150 {
         self.c_couple2 = lp_coeff(180.0, os_rate);
         self.c12 = lp_coeff(12.0, os_rate);
         self.c_fizz = lp_coeff(FIZZ_HZ, base_rate);
-        self.c_lo = lp_coeff(BASS_HZ, base_rate);
-        // Bandpass: wide LP then HP via subtracting a narrower LP.
-        self.c_mid_wide = lp_coeff(MID_HZ * 1.4, base_rate);
-        self.c_mid_narrow = lp_coeff(MID_HZ / 1.4, base_rate);
-        self.c_hi = lp_coeff(TREBLE_HZ, base_rate);
+        self.stack.prepare(base_rate);
         self.reset();
     }
 
@@ -150,10 +131,7 @@ impl Circuit for Monster5150 {
         self.couple2.reset();
         self.dc_os.reset();
         self.fizz.reset();
-        self.eq_lo.reset();
-        self.eq_mid_lp.reset();
-        self.eq_mid_hp.reset();
-        self.eq_hi.reset();
+        self.stack.reset();
     }
 
     fn shape(&mut self, block: &mut [f32], drive: &[f32]) {
@@ -190,25 +168,10 @@ impl Circuit for Monster5150 {
     }
 
     fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        // Post-distortion 3-band — the Low knob restores lows *after* the
-        // clipping carved them (resonance-style), so tight and thick are not
-        // in conflict:
-        //
-        //   low  — shelf at 80 Hz (±12 dB)
-        //   mid  — bandpass centred at 550 Hz (±10 dB), Q ≈ 1.0
-        //   high — shelf at 3 kHz (±12 dB)
-        //
-        // Knob 5 = flat (0 dB), 0/10 = cut/boost.
-        for (s, (&l, (&m, &h))) in block.iter_mut().zip(low.iter().zip(mid.iter().zip(high))) {
-            let x = *s;
-            let lo = self.eq_lo.lp(x, self.c_lo);
-            let hi = x - self.eq_hi.lp(x, self.c_hi);
-            let bp_raw = self.eq_mid_lp.lp(x, self.c_mid_wide);
-            let bp = bp_raw - self.eq_mid_hp.lp(bp_raw, self.c_mid_narrow);
-            let lo_gain = db_to_lin(-12.0 + 2.4 * l);
-            let mid_gain = db_to_lin(-10.0 + 2.0 * m);
-            let hi_gain = db_to_lin(-12.0 + 2.4 * h);
-            *s = x + (lo_gain - 1.0) * lo + (mid_gain - 1.0) * bp + (hi_gain - 1.0) * hi;
-        }
+        // Shared 3-band stack, voiced at 80 Hz / 550 Hz / 3 kHz. Post-
+        // distortion placement is the point: the Low knob restores lows
+        // *after* the clipping carved them (resonance-style), so tight and
+        // thick are not in conflict.
+        self.stack.process(block, low, mid, high);
     }
 }

@@ -25,7 +25,6 @@
 //!   capture's rate or the amp slot politely refuses to load.
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -442,30 +441,10 @@ fn group_for(slot: &str) -> String {
 
 // --- preset asset loading (background thread) --------------------------------
 
-fn presets_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".lion-heart").join("presets"))
-}
-
-/// Sorted preset names, same order the standalone app shows.
-fn list_presets() -> Vec<String> {
-    let Some(dir) = presets_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            (p.extension().is_some_and(|x| x == "json"))
-                .then(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .flatten()
-        })
-        .collect();
-    names.sort();
-    names
-}
+// Shared with the standalone app via lh-assets: the sorted preset list is a
+// cross-binary contract (the preset parameter indexes into it exactly like
+// the app's MIDI PC numbers do).
+use lh_assets::{list_presets, presets_dir};
 
 fn load_preset_assets(assets: &mut AssetRuntime, index: usize, sample_rate: u32) {
     let names = list_presets();
@@ -547,3 +526,17 @@ impl Vst3Plugin for LionHeartPlugin {
 
 nih_export_clap!(LionHeartPlugin);
 nih_export_vst3!(LionHeartPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_chain_matches_the_shared_default() {
+        // The plugin's v1 chain is fixed; the app's session registry is
+        // pinned to the same constant, so the two binaries cannot drift.
+        let plugin = LionHeartPlugin::default();
+        let keys: Vec<&str> = plugin.handle.families().iter().map(|f| f.key).collect();
+        assert_eq!(keys, lh_core::DEFAULT_CHAIN);
+    }
+}

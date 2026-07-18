@@ -2148,6 +2148,7 @@ version = "0.0.1"
 dependencies = [
  "assert_no_alloc 1.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "cpal",
+ "lh-core",
  "rtrb",
  "thiserror 2.0.18",
 ]

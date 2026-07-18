@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use lh_core::preset::{AssetRef, PRESET_SCHEMA_VERSION, Preset, PresetAssets};
 use lh_dsp::Effect;
-use lh_dsp::blocks::swap::AssetHandle;
+use lh_dsp::blocks::swap::{AssetHandle, asset_channel};
 use lh_dsp::cab::{CabIr, IrAsset};
 use lh_dsp::drive::Drive;
 use lh_dsp::dynamics::Compressor;
@@ -21,6 +21,10 @@ use lh_dsp::modulation::Modulation;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{ChainHandle, build_chain};
+
+// The ~/.lion-heart disk layout lives in lh-assets, shared with the plugin
+// (the preset list order is a cross-binary contract).
+pub use lh_assets::{app_dir, list_presets, presets_dir};
 use lh_io::passthrough::{DuplexRunner, RunnerOpts};
 use lh_io::stats::Snapshot;
 use lh_nam::{NamAmp, NamAsset, load_nam_file};
@@ -103,66 +107,134 @@ pub struct Session {
     pub midi_status: String,
 }
 
-/// Every chain family, in the default-chain order. The GUI's add menu and
-/// the REPL validate against this list; `Session::add_slot` builds from it.
-pub const FAMILIES: [&str; 10] = [
-    "gate", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
+/// The session asset a chain family mounts (hot-swapped off-thread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetKind {
+    Nam,
+    Ir,
+}
+
+/// One buildable chain family: its descriptor (the key, display name, and
+/// pedal faceplates all come from here), the asset it mounts — mounting
+/// families stay chain singletons — and its constructor. `build` may rewire
+/// the session's asset seams and flags which it replaced (amp, cab), so the
+/// caller re-applies the loaded asset afterwards.
+pub struct FamilyEntry {
+    pub desc: &'static lh_core::FamilyDesc,
+    pub asset: Option<AssetKind>,
+    #[allow(clippy::type_complexity)]
+    build: fn(
+        &mut AssetHandle<NamAsset>,
+        &mut AssetHandle<IrAsset>,
+        &mut (bool, bool),
+    ) -> Box<dyn Effect>,
+}
+
+/// Every chain family the session can build, in the default-chain (and add
+/// menu) order — the one place that knows the full rig. Pinned to
+/// [`lh_core::DEFAULT_CHAIN`] by a test, which also pins the plugin's fixed
+/// chain to the same constant.
+pub static FAMILY_REGISTRY: [FamilyEntry; 10] = [
+    FamilyEntry {
+        desc: &lh_dsp::dynamics::gate::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(NoiseGate::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::dynamics::comp::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Compressor::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::drive::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Drive::new()),
+    },
+    FamilyEntry {
+        desc: &lh_nam::FAMILY,
+        asset: Some(AssetKind::Nam),
+        build: |nam, _, rebuilt| {
+            let (amp, handle) = NamAmp::new();
+            *nam = handle;
+            rebuilt.0 = true;
+            Box::new(amp)
+        },
+    },
+    FamilyEntry {
+        desc: &lh_dsp::eq::chain::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Eq::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::modulation::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Modulation::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::time::delay::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Delay::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::time::reverb::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Reverb::new()),
+    },
+    FamilyEntry {
+        desc: &lh_dsp::cab::FAMILY,
+        asset: Some(AssetKind::Ir),
+        build: |_, cab, rebuilt| {
+            let (cab_fx, handle) = CabIr::new();
+            *cab = handle;
+            rebuilt.1 = true;
+            Box::new(cab_fx)
+        },
+    },
+    FamilyEntry {
+        desc: &lh_dsp::dynamics::limiter::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Limiter::new()),
+    },
 ];
 
+/// The registry entry for a family key, `None` when unknown.
+pub fn family_entry(key: &str) -> Option<&'static FamilyEntry> {
+    FAMILY_REGISTRY.iter().find(|e| e.desc.key == key)
+}
+
+/// The asset a family mounts, if any. Instance handles equal family keys
+/// for the mounting families (they are singletons), so slot handles work.
+pub fn asset_kind(family_key: &str) -> Option<AssetKind> {
+    family_entry(family_key).and_then(|e| e.asset)
+}
+
 /// Build a fresh effect for a family key (PRD 002's factory seam — the
-/// session owns the concrete effect crates). `amp`/`cab` rewire the
-/// session's asset handles onto the new instance and flag it, so the caller
-/// re-applies the loaded asset afterwards.
+/// registry owns the concrete effect crates).
 fn build_family_effect(
     nam: &mut AssetHandle<NamAsset>,
     cab: &mut AssetHandle<IrAsset>,
     rebuilt: &mut (bool, bool),
     key: &str,
 ) -> Option<Box<dyn Effect>> {
-    match key {
-        "gate" => Some(Box::new(NoiseGate::new())),
-        "comp" => Some(Box::new(Compressor::new())),
-        "drive" => Some(Box::new(Drive::new())),
-        "amp" => {
-            let (amp, handle) = NamAmp::new();
-            *nam = handle;
-            rebuilt.0 = true;
-            Some(Box::new(amp))
-        }
-        "eq" => Some(Box::new(Eq::new())),
-        "mod" => Some(Box::new(Modulation::new())),
-        "delay" => Some(Box::new(Delay::new())),
-        "reverb" => Some(Box::new(Reverb::new())),
-        "cab" => {
-            let (cab_fx, handle) = CabIr::new();
-            *cab = handle;
-            rebuilt.1 = true;
-            Some(Box::new(cab_fx))
-        }
-        "limiter" => Some(Box::new(Limiter::new())),
-        _ => None,
-    }
+    family_entry(key).map(|entry| (entry.build)(nam, cab, rebuilt))
 }
 
 impl Session {
-    /// Build the full pedalboard —
-    /// gate → comp → drive → amp → eq → mod → delay → reverb → cab → limiter
-    /// — and start the stream.
+    /// Build the full pedalboard ([`lh_core::DEFAULT_CHAIN`], every registry
+    /// family once, in order) and start the stream.
     pub fn start(opts: &SessionOpts) -> Result<Self, lh_io::IoError> {
-        let (nam_amp, nam_handle) = NamAmp::new();
-        let (cab, cab_handle) = CabIr::new();
-        let effects: Vec<Box<dyn Effect>> = vec![
-            Box::new(NoiseGate::new()),
-            Box::new(Compressor::new()),
-            Box::new(Drive::new()),
-            Box::new(nam_amp),
-            Box::new(Eq::new()),
-            Box::new(Modulation::new()),
-            Box::new(Delay::new()),
-            Box::new(Reverb::new()),
-            Box::new(cab),
-            Box::new(Limiter::new()),
-        ];
+        // Placeholder seams: building the default chain rewires both (it
+        // contains amp and cab), so these never receive an install.
+        let (_, mut nam_handle) = asset_channel::<NamAsset>();
+        let (_, mut cab_handle) = asset_channel::<IrAsset>();
+        let mut rebuilt = (false, false);
+        let effects: Vec<Box<dyn Effect>> = lh_core::DEFAULT_CHAIN
+            .iter()
+            .map(|key| {
+                build_family_effect(&mut nam_handle, &mut cab_handle, &mut rebuilt, key)
+                    .expect("DEFAULT_CHAIN keys are registered (pinned by test)")
+            })
+            .collect();
         let (mut chain, mut chain_handle) = build_chain(effects);
 
         let tuner_tap = if opts.tuner_tap {
@@ -357,13 +429,14 @@ impl Session {
         family_key: &str,
         position: Option<usize>,
     ) -> Result<Vec<String>, String> {
-        if !FAMILIES.contains(&family_key) {
+        let Some(entry) = family_entry(family_key) else {
+            let known: Vec<&str> = FAMILY_REGISTRY.iter().map(|e| e.desc.key).collect();
             return Err(format!(
                 "unknown family {family_key:?} — one of: {}",
-                FAMILIES.join(", ")
+                known.join(", ")
             ));
-        }
-        if matches!(family_key, "amp" | "cab") && self.chain.contains_family(family_key) {
+        };
+        if entry.asset.is_some() && self.chain.contains_family(family_key) {
             return Err(format!(
                 "only one {family_key} per chain (it mounts the loaded asset)"
             ));
@@ -371,7 +444,7 @@ impl Session {
         let mut rebuilt = (false, false);
         let effect = {
             let Session { nam, cab, .. } = &mut *self;
-            build_family_effect(nam, cab, &mut rebuilt, family_key).expect("validated family")
+            (entry.build)(nam, cab, &mut rebuilt)
         };
         let handle = self
             .chain
@@ -661,20 +734,7 @@ impl Session {
     }
 }
 
-enum AssetKind {
-    Nam,
-    Ir,
-}
-
 // --- disk layout & helpers ---
-
-pub fn app_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".lion-heart"))
-}
-
-pub fn presets_dir() -> Option<PathBuf> {
-    app_dir().map(|d| d.join("presets"))
-}
 
 pub fn global_eq_path() -> Option<PathBuf> {
     app_dir().map(|d| d.join("global_eq.json"))
@@ -696,27 +756,6 @@ fn load_global_eq() -> lh_core::global_eq::GlobalEqState {
         },
         Err(_) => lh_core::global_eq::GlobalEqState::default(),
     }
-}
-
-/// Sorted preset names on disk (empty when none).
-pub fn list_presets() -> Vec<String> {
-    let Some(dir) = presets_dir() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let p = e.path();
-            (p.extension().is_some_and(|x| x == "json"))
-                .then(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .flatten()
-        })
-        .collect();
-    names.sort();
-    names
 }
 
 pub fn valid_preset_name(name: &str) -> bool {
@@ -821,4 +860,55 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_matches_the_default_chain_and_its_invariants() {
+        let keys: Vec<&str> = FAMILY_REGISTRY.iter().map(|e| e.desc.key).collect();
+        assert_eq!(
+            keys,
+            lh_core::DEFAULT_CHAIN,
+            "registry order is the default chain"
+        );
+        for (i, a) in keys.iter().enumerate() {
+            // Trailing digits are reserved for instance handles ("drive2");
+            // the engine's handle parser depends on it.
+            assert!(
+                !a.ends_with(|c: char| c.is_ascii_digit()),
+                "family key {a:?} must not end in a digit"
+            );
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b, "family keys are unique");
+            }
+        }
+        // Only the asset-mounting families are singletons.
+        let mounting: Vec<&str> = FAMILY_REGISTRY
+            .iter()
+            .filter(|e| e.asset.is_some())
+            .map(|e| e.desc.key)
+            .collect();
+        assert_eq!(mounting, ["amp", "cab"]);
+    }
+
+    #[test]
+    fn every_registry_entry_builds_its_own_family() {
+        let (_, mut nam) = asset_channel::<NamAsset>();
+        let (_, mut cab) = asset_channel::<IrAsset>();
+        let mut rebuilt = (false, false);
+        for entry in &FAMILY_REGISTRY {
+            let effect = build_family_effect(&mut nam, &mut cab, &mut rebuilt, entry.desc.key)
+                .expect("registered family builds");
+            assert!(
+                std::ptr::eq(effect.family(), entry.desc),
+                "{}: built effect must report the registry's own family",
+                entry.desc.key
+            );
+        }
+        assert!(rebuilt.0 && rebuilt.1, "amp and cab rewire their seams");
+        assert!(build_family_effect(&mut nam, &mut cab, &mut rebuilt, "wah").is_none());
+    }
 }

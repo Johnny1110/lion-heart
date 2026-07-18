@@ -38,7 +38,7 @@ mod monster5150;
 mod red_charlie;
 mod ts9;
 
-use lh_core::{FamilyDesc, ParamDesc, Range, drive_law};
+use lh_core::{FamilyDesc, ParamDesc, Range, db_to_lin, drive_law};
 
 use crate::Effect;
 use crate::blocks::oversample::{CHUNK, Oversampler4x};
@@ -155,9 +155,7 @@ pub trait Circuit: Send {
 
 // --- shared building blocks ---
 
-fn lp_coeff(hz: f32, rate: f32) -> f32 {
-    1.0 - (-std::f32::consts::TAU * hz / rate).exp()
-}
+use crate::blocks::onepole_hz as lp_coeff;
 
 /// One-pole lowpass state; highpass is the input minus this. The flush keeps
 /// decaying feedback out of denormal territory (RT rule 7).
@@ -204,6 +202,76 @@ impl Ramp {
         let v = self.v;
         self.v += self.step;
         v
+    }
+}
+
+/// Shared 3-band tone stack for pedals with Low/Mid/High faceplates:
+/// one-pole shelves plus a cascaded-one-pole mid bandpass (LP at f·1.4 minus
+/// a second LP at f/1.4). Knob 5 = flat (0 dB), 0/10 = full cut/boost —
+/// low/high reach ±12 dB, mid ±10 dB. Each pedal keeps only its voicing
+/// (the corner frequencies); the filter math and the dB knob laws live
+/// here, once.
+struct ToneStack {
+    low_hz: f32,
+    mid_hz: f32,
+    high_hz: f32,
+    lo: OnePole,
+    mid_lp: OnePole,
+    mid_hp: OnePole,
+    hi: OnePole,
+    c_lo: f32,
+    c_mid_wide: f32,
+    c_mid_narrow: f32,
+    c_hi: f32,
+}
+
+impl ToneStack {
+    fn new(low_hz: f32, mid_hz: f32, high_hz: f32) -> Self {
+        Self {
+            low_hz,
+            mid_hz,
+            high_hz,
+            lo: OnePole::default(),
+            mid_lp: OnePole::default(),
+            mid_hp: OnePole::default(),
+            hi: OnePole::default(),
+            c_lo: 0.0,
+            c_mid_wide: 0.0,
+            c_mid_narrow: 0.0,
+            c_hi: 0.0,
+        }
+    }
+
+    fn prepare(&mut self, base_rate: f32) {
+        self.c_lo = lp_coeff(self.low_hz, base_rate);
+        self.c_mid_wide = lp_coeff(self.mid_hz * 1.4, base_rate);
+        self.c_mid_narrow = lp_coeff(self.mid_hz / 1.4, base_rate);
+        self.c_hi = lp_coeff(self.high_hz, base_rate);
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.lo.reset();
+        self.mid_lp.reset();
+        self.mid_hp.reset();
+        self.hi.reset();
+    }
+
+    /// Apply the stack in place. Band gains are mapped from the smoothed
+    /// knob trajectories with the shared [`Ramp`] — two `powf` per band per
+    /// chunk instead of three per sample.
+    fn process(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
+        let mut lo_gain = Ramp::over(low, |l| db_to_lin(-12.0 + 2.4 * l) - 1.0);
+        let mut mid_gain = Ramp::over(mid, |m| db_to_lin(-10.0 + 2.0 * m) - 1.0);
+        let mut hi_gain = Ramp::over(high, |h| db_to_lin(-12.0 + 2.4 * h) - 1.0);
+        for s in block.iter_mut() {
+            let x = *s;
+            let lo = self.lo.lp(x, self.c_lo);
+            let hi = x - self.hi.lp(x, self.c_hi);
+            let bp_raw = self.mid_lp.lp(x, self.c_mid_wide);
+            let bp = bp_raw - self.mid_hp.lp(bp_raw, self.c_mid_narrow);
+            *s = x + lo_gain.tick() * lo + mid_gain.tick() * bp + hi_gain.tick() * hi;
+        }
     }
 }
 
@@ -1048,20 +1116,22 @@ mod tests {
 
     #[test]
     fn evva_eq_is_flat_at_defaults() {
-        // At all-EQ knobs at 5, the 3-band EQ should be roughly transparent
-        // (each band gain ≈ 1.0).
-        let x = guitar(220.0, SR as usize);
+        // With every EQ knob at 5 the stack contributes 0 dB per band: the
+        // output must match a run with the EQ hook skipped, bit for bit
+        // aside from float noise. (The stack's flat gains are exactly
+        // db_to_lin(0) − 1 = 0, so its adds vanish.)
+        let x = tones(&[80.0, 220.0, 750.0, 3_000.0], SR as usize / 2);
         let mut d = prepared(4);
         set_pos(&mut d, 0, 2.0);
-        let y = process_in_blocks(&mut d, &x, 256);
-        // Compare the shape of the spectrum: flat EQ should not radically
-        // reshape the output relative to the input.
-        let in_220 = tone_at(&x, 220.0);
-        let out_220 = tone_at(&y, 220.0);
-        let ratio = out_220 / in_220.max(1e-9);
-        assert!(
-            ratio > 0.0,
-            "evva flat eq must pass signal: ratio {ratio:.3}"
-        );
+        let flat = process_in_blocks(&mut d, &x, 256);
+        for freq in [80.0, 220.0, 750.0, 3_000.0] {
+            let ratio = tone_at(&flat, freq) / tone_at(&x, freq).max(1e-12);
+            // Near-clean gain 2 through makeup and level: each probe tone
+            // must come through at a sane, roughly uniform level.
+            assert!(
+                (0.2..5.0).contains(&ratio),
+                "flat evva EQ must pass {freq} Hz cleanly, ratio {ratio:.3}"
+            );
+        }
     }
 }

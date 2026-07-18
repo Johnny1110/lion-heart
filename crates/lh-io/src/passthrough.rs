@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use cpal::traits::StreamTrait;
+use lh_core::db_to_lin;
 
 use crate::stats::{Snapshot, Stats};
 use crate::stream::{self, DuplexSpec};
@@ -252,27 +253,10 @@ impl Passthrough {
     }
 }
 
-fn db_to_lin(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
-}
-
 /// The buffer size the backend actually granted, when it can report one.
 fn describe_actual_buffer(stream: &cpal::Stream) -> String {
     stream
         .buffer_size()
         .map(|n| n.to_string())
         .unwrap_or_else(|_| "?".into())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn db_to_lin_reference_points() {
-        assert!((db_to_lin(0.0) - 1.0).abs() < 1e-6);
-        assert!((db_to_lin(-6.0) - 0.5012).abs() < 1e-3);
-        assert!((db_to_lin(-60.0) - 0.001).abs() < 1e-6);
-        assert!((db_to_lin(6.0) - 1.9953).abs() < 1e-3);
-    }
 }

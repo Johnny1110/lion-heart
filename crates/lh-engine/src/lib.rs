@@ -167,9 +167,15 @@ impl OutputStage {
     fn prepare(&mut self, sample_rate: u32) {
         self.eq.prepare(sample_rate);
         self.safety.prepare(sample_rate);
-        let ceiling = &lh_dsp::dynamics::limiter::DESC.params[0];
+        // Look the ceiling up by key: a faceplate reorder must fail loudly
+        // here (covered by engine tests), never silently misconfigure the
+        // one limiter that is always on.
+        let desc = &lh_dsp::dynamics::limiter::DESC;
+        let index = desc
+            .param_index("ceiling")
+            .expect("safety limiter has a ceiling param");
         self.safety
-            .set_param(0, ceiling.range.to_norm(SAFETY_CEILING_DB));
+            .set_param(index, desc.params[index].range.to_norm(SAFETY_CEILING_DB));
         self.mono = vec![0.0; MAX_BLOCK];
     }
 

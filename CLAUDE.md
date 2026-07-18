@@ -101,6 +101,29 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    returns to the board view with that slot's faceplate open
    (`select_position` sets `View::Board`) — it used to do nothing while
    tuner/eq/live/settings was up.
+4. **Health pass (no behavior change intended).** Family knowledge now has
+   one home: `lh_core::DEFAULT_CHAIN` is the canonical rig order,
+   `session::FAMILY_REGISTRY` (desc + mounted-asset kind + builder) replaces
+   the FAMILIES string list / `build_family_effect` match / hardcoded
+   `Session::start` chain, and the plugin's fixed chain is pinned to the
+   same constant by a test — adding a family is now one registry entry.
+   `~/.lion-heart` path helpers (`presets_dir`/`list_presets`) moved to
+   lh-assets, shared by app and plugin (the sorted preset list is a
+   cross-binary contract: MIDI PC and the plugin preset param index it).
+   Shared 3-band `ToneStack` in `drive/mod.rs` replaces the triplicated
+   `eq()` in evva/red-charlie/monster5150 (gains now Ramp-mapped: 2 powf
+   per chunk instead of 3 per sample); one-pole coefficient math deduped
+   into `blocks::{onepole_ms, onepole_hz}`. Perf (Apple Silicon, measured):
+   chain EQ and global EQ skip coefficient rebuilds while controls are
+   settled (global_eq_4band ~1.66 µs → ~0.80 µs; eq_3band ~0.60 → ~0.38 µs —
+   docs/benchmarks.md now has a native Apple Silicon section);
+   GUI knob drags update one param in place instead of re-snapshotting the
+   whole chain per mouse-move. Benched-and-rejected (kept the original
+   code): branchless ring-buffer wrap in delay/mod/reverb (+10% on delay —
+   the div pipelines, the branches don't) and a below-threshold compressor
+   fast path (+8% in the worst case, which is the RT budget). Also: engine
+   output stage now finds the safety-limiter ceiling by key, not `params[0]`;
+   out-of-range `set_param` no longer panics in chain-EQ/reverb.
 
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
@@ -175,7 +198,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |
 | `lh-midi`        | MIDI foot control: PC/CC parsing, mapping, midir input            | —             |
-| `lh-assets`      | IR WAV loading: decode, sinc-resample, normalize, build convolver | dsp           |
+| `lh-assets`      | IR WAV loading (decode, sinc-resample, normalize, build convolver) + the `~/.lion-heart` disk layout shared by app & plugin | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
 | `plugin/…`       | CLAP/VST3 wrapper via nih-plug (GPLv3 for VST3 builds)            | core→assets   |
 

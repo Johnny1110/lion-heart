@@ -215,7 +215,10 @@ impl Effect for Reverb {
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
-        let real = PARAMS[index].range.to_real(normalized);
+        let Some(param) = PARAMS.get(index) else {
+            return; // out-of-range indices are ignored (Effect contract)
+        };
+        let real = param.range.to_real(normalized);
         match index {
             0 => {
                 self.t60 = real;

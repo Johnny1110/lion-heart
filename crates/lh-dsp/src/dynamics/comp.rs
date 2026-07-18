@@ -6,6 +6,7 @@
 use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin, lin_to_db};
 
 use crate::Effect;
+use crate::blocks::onepole_ms;
 use crate::blocks::smooth::Smoothed;
 
 static PARAMS: [ParamDesc; 5] = [
@@ -115,13 +116,9 @@ impl Compressor {
     }
 
     fn recompute(&mut self) {
-        self.attack_coeff = one_pole(self.attack_ms, self.sample_rate);
-        self.release_coeff = one_pole(self.release_ms, self.sample_rate);
+        self.attack_coeff = onepole_ms(self.attack_ms, self.sample_rate);
+        self.release_coeff = onepole_ms(self.release_ms, self.sample_rate);
     }
-}
-
-fn one_pole(ms: f32, sample_rate: u32) -> f32 {
-    1.0 - (-1.0 / (ms * 1e-3 * sample_rate as f32)).exp()
 }
 
 impl Effect for Compressor {
@@ -147,11 +144,11 @@ impl Effect for Compressor {
             1 => self.ratio = PARAMS[1].range.to_real(normalized),
             2 => {
                 self.attack_ms = PARAMS[2].range.to_real(normalized);
-                self.attack_coeff = one_pole(self.attack_ms, self.sample_rate);
+                self.attack_coeff = onepole_ms(self.attack_ms, self.sample_rate);
             }
             3 => {
                 self.release_ms = PARAMS[3].range.to_real(normalized);
-                self.release_coeff = one_pole(self.release_ms, self.sample_rate);
+                self.release_coeff = onepole_ms(self.release_ms, self.sample_rate);
             }
             4 => self
                 .makeup
@@ -172,6 +169,9 @@ impl Effect for Compressor {
             };
             self.env += coeff * (a - self.env);
 
+            // Unconditional dB math: a below-threshold fast path benched 8%
+            // *slower* in the above-threshold (worst) case, and the worst
+            // case is the real-time budget.
             let over = lin_to_db(self.env) - self.threshold_db;
             let gr_db = if over > 0.0 { over * slope } else { 0.0 };
             let gain = db_to_lin(gr_db) * self.makeup.tick();

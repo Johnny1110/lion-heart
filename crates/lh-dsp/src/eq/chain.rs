@@ -80,6 +80,10 @@ pub struct Eq {
     mid_db: Smoothed,
     mid_freq: Smoothed,
     high_db: Smoothed,
+    /// A control change landed since the last coefficient rebuild. Together
+    /// with the smoothers' settled state this lets `update_coeffs` skip the
+    /// per-block trig entirely while no knob is moving (the common case).
+    dirty: bool,
     low: [Biquad; 2],
     mid: [Biquad; 2],
     high: [Biquad; 2],
@@ -99,6 +103,7 @@ impl Eq {
             mid_db: Smoothed::new(PARAMS[1].default),
             mid_freq: Smoothed::new(PARAMS[2].default),
             high_db: Smoothed::new(PARAMS[3].default),
+            dirty: true,
             low: [Biquad::default(); 2],
             mid: [Biquad::default(); 2],
             high: [Biquad::default(); 2],
@@ -106,7 +111,17 @@ impl Eq {
     }
 
     /// Advance smoothed controls by `n` samples and rebuild coefficients.
+    /// Settled controls with no pending change skip the rebuild — the
+    /// steady-state cost of the EQ is then just the biquad ticks.
     fn update_coeffs(&mut self, n: usize) {
+        let settled = self.low_db.is_settled()
+            && self.mid_db.is_settled()
+            && self.mid_freq.is_settled()
+            && self.high_db.is_settled();
+        if settled && !self.dirty {
+            return;
+        }
+        self.dirty = false;
         for _ in 0..n {
             self.low_db.tick();
             self.mid_db.tick();
@@ -142,6 +157,7 @@ impl Effect for Eq {
             smoothed.configure(desc.smoothing_ms, sample_rate);
             smoothed.snap_to_target();
         }
+        self.dirty = true; // rate changed — coefficients must rebuild
         self.update_coeffs(0);
         self.reset();
     }
@@ -155,7 +171,10 @@ impl Effect for Eq {
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
-        let real = PARAMS[index].range.to_real(normalized);
+        let Some(param) = PARAMS.get(index) else {
+            return;
+        };
+        let real = param.range.to_real(normalized);
         match index {
             0 => self.low_db.set_target(real),
             1 => self.mid_db.set_target(real),
@@ -163,6 +182,7 @@ impl Effect for Eq {
             3 => self.high_db.set_target(real),
             _ => {}
         }
+        self.dirty = true;
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {

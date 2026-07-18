@@ -32,7 +32,8 @@ use lh_dsp::tuner::Tuner;
 use lh_io::devices::DeviceDesc;
 
 use crate::cli::GuiArgs;
-use crate::session::{Session, SessionOpts, list_presets, load_config};
+pub use crate::session::AssetKind;
+use crate::session::{FAMILY_REGISTRY, Session, SessionOpts, list_presets, load_config};
 use browser::Browser;
 use eq::EqPanel;
 use lh_core::global_eq::{Band, BandKind};
@@ -61,12 +62,6 @@ pub fn run(args: GuiArgs) -> anyhow::Result<()> {
         .title("Lion-Heart")
         .run()?;
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssetKind {
-    Nam,
-    Ir,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +571,36 @@ impl Running {
         }
     }
 
+    /// Refresh one param's UI mirror after a live knob move — the cheap
+    /// path for drags; `refresh_slots` re-snapshots the entire chain.
+    fn update_param_ui(&mut self, slot_key: &str, param_key: &str, real: f32) {
+        let Some(desc) = self.session.chain.param_desc(slot_key, param_key) else {
+            return;
+        };
+        let Some(slot) = self.slots.iter_mut().find(|s| s.key == slot_key) else {
+            return;
+        };
+        let mut knob_index = 0;
+        for param in &mut slot.params {
+            let is_knob = param.stepped.is_none();
+            if param.key == param_key {
+                param.norm = desc.range.to_norm(real);
+                param.display = desc
+                    .range
+                    .label(real)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format_value(real, desc.unit));
+                if is_knob && let Some(cache) = self.knob_caches.get(knob_index) {
+                    cache.clear();
+                }
+                return;
+            }
+            if is_knob {
+                knob_index += 1;
+            }
+        }
+    }
+
     /// Select the slot at a chain position and show its faceplate: whatever
     /// view is up, clicking the chain always lands on the board (the fix for
     /// "chain clicks do nothing while tuner/eq/live/settings is open").
@@ -687,16 +712,18 @@ impl Running {
                 }
             }
             Message::Knob { slot, param, norm } => {
-                let real = self
-                    .session
-                    .chain
-                    .param_desc(&slot, &param)
-                    .map(|p| p.range.to_real(norm));
-                if let Some(real) = real {
-                    match self.session.chain.set_param(&slot, &param, real) {
-                        Ok(_) => self.refresh_slots(),
-                        Err(e) => self.status = e.to_string(),
-                    }
+                let Some(desc) = self.session.chain.param_desc(&slot, &param) else {
+                    return;
+                };
+                let stepped = matches!(desc.range, lh_core::Range::Stepped { .. });
+                let real = desc.range.to_real(norm);
+                match self.session.chain.set_param(&slot, &param, real) {
+                    // A drag streams one message per mouse move: update the
+                    // one dragged param in place instead of re-snapshotting
+                    // the whole chain (and redrawing every knob) each event.
+                    Ok(applied) if !stepped => self.update_param_ui(&slot, &param, applied.real),
+                    Ok(_) => self.refresh_slots(),
+                    Err(e) => self.status = e.to_string(),
                 }
             }
             Message::OpenBrowser(kind) => {
@@ -1184,16 +1211,16 @@ impl Running {
         .into()
     }
 
-    /// Families the "＋" menu offers right now (amp/cab stay singletons —
-    /// they mount the loaded assets; nothing offered when the chain is full).
+    /// Families the "＋" menu offers right now (asset-mounting families stay
+    /// singletons; nothing offered when the chain is full).
     fn addable_families(&self) -> Vec<&'static str> {
         if self.session.chain.is_full() {
             return Vec::new();
         }
-        crate::session::FAMILIES
+        FAMILY_REGISTRY
             .iter()
-            .copied()
-            .filter(|f| !(matches!(*f, "amp" | "cab") && self.session.chain.contains_family(f)))
+            .filter(|e| !(e.asset.is_some() && self.session.chain.contains_family(e.desc.key)))
+            .map(|e| e.desc.key)
             .collect()
     }
 
@@ -1638,7 +1665,7 @@ impl Running {
             body = body.push(selectors);
         }
         body = body.push(knobs);
-        if let Some(kind) = asset_kind_for(&slot.key) {
+        if let Some(kind) = crate::session::asset_kind(&slot.key) {
             let (nam_name, ir_name) = self.session.asset_names();
             let (label, file) = match kind {
                 AssetKind::Nam => ("capture", nam_name),
@@ -1692,14 +1719,6 @@ impl Running {
         ]
         .spacing(10)
         .into()
-    }
-}
-
-fn asset_kind_for(slot_key: &str) -> Option<AssetKind> {
-    match slot_key {
-        "amp" => Some(AssetKind::Nam),
-        "cab" => Some(AssetKind::Ir),
-        _ => None,
     }
 }
 

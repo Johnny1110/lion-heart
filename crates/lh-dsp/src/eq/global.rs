@@ -54,6 +54,11 @@ struct BandRuntime {
     /// Target state (kind and enabled are authoritative here; the smoothed
     /// values below chase freq/gain/q).
     band: Band,
+    /// A `set_band` landed since the last coefficient rebuild (it may have
+    /// changed `kind`, which no smoother tracks). Together with the settled
+    /// state this lets `rebuild_coeffs` skip the per-block trig while the
+    /// band is not being edited (the common case).
+    dirty: bool,
     /// 0..1 engage crossfade.
     wet: Smoothed,
     /// Smoothed in the log domain so drags glide musically.
@@ -67,6 +72,7 @@ impl BandRuntime {
     fn new(band: Band) -> Self {
         Self {
             band,
+            dirty: true,
             wet: Smoothed::new(if band.enabled { 1.0 } else { 0.0 }),
             freq_log2: Smoothed::new(band.freq.log2()),
             gain_db: Smoothed::new(band.gain_db),
@@ -78,6 +84,10 @@ impl BandRuntime {
     /// Still audible: engaged, or fading out.
     fn engaged(&self) -> bool {
         !(self.wet.is_settled() && self.wet.target() == 0.0)
+    }
+
+    fn controls_settled(&self) -> bool {
+        self.freq_log2.is_settled() && self.gain_db.is_settled() && self.q.is_settled()
     }
 }
 
@@ -118,6 +128,7 @@ impl GlobalEq {
             band.freq_log2.snap_to_target();
             band.gain_db.snap_to_target();
             band.q.snap_to_target();
+            band.dirty = true; // rate changed — coefficients must rebuild
             for filter in &mut band.filters {
                 filter.reset();
             }
@@ -142,6 +153,7 @@ impl GlobalEq {
         let band = band.clamped();
         let was_off = rt.wet.is_settled() && rt.wet.target() == 0.0;
         rt.band = band;
+        rt.dirty = true;
         rt.freq_log2.set_target(band.freq.log2());
         rt.gain_db.set_target(band.gain_db);
         rt.q.set_target(band.q);
@@ -165,13 +177,15 @@ impl GlobalEq {
     }
 
     /// Advance control smoothers by `n` samples and rebuild coefficients
-    /// for engaged bands (block rate, like the chain EQ slot).
+    /// for engaged bands (block rate, like the chain EQ slot). Bands whose
+    /// controls are settled with no pending edit skip the trig rebuild.
     fn rebuild_coeffs(&mut self, n: usize) {
         let sample_rate = self.sample_rate;
         for band in &mut self.bands {
-            if !band.engaged() {
+            if !band.engaged() || (band.controls_settled() && !band.dirty) {
                 continue;
             }
+            band.dirty = false;
             for _ in 0..n {
                 band.freq_log2.tick();
                 band.gain_db.tick();

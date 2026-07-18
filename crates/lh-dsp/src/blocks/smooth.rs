@@ -21,11 +21,7 @@ impl Smoothed {
 
     /// Set the time constant. 0 ms = snap instantly.
     pub fn configure(&mut self, ms: f32, sample_rate: u32) {
-        self.coeff = if ms <= 0.0 || sample_rate == 0 {
-            1.0
-        } else {
-            1.0 - (-1.0 / (ms * 1e-3 * sample_rate as f32)).exp()
-        };
+        self.coeff = super::onepole_ms(ms, sample_rate);
     }
 
     pub fn set_target(&mut self, value: f32) {

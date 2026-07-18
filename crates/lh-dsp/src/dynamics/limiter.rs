@@ -73,8 +73,7 @@ impl Limiter {
     }
 
     fn recompute(&mut self) {
-        self.release_coeff =
-            1.0 - (-1.0 / (self.release_ms * 1e-3 * self.sample_rate as f32)).exp();
+        self.release_coeff = crate::blocks::onepole_ms(self.release_ms, self.sample_rate);
     }
 }
 

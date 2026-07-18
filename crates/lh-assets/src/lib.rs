@@ -143,6 +143,46 @@ pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), 
     Ok((Box::new(IrAsset { left, right }), info))
 }
 
+// --- ~/.lion-heart disk layout -----------------------------------------------
+//
+// Shared by the standalone app and the plugin. Keeping these here (rather
+// than copied into each binary) is what guarantees both sides see the same
+// preset list in the same order — MIDI PC numbers and the plugin's preset
+// parameter both index into it.
+
+/// `~/.lion-heart`, the app-global config/preset directory.
+pub fn app_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".lion-heart"))
+}
+
+/// `~/.lion-heart/presets`.
+pub fn presets_dir() -> Option<std::path::PathBuf> {
+    app_dir().map(|d| d.join("presets"))
+}
+
+/// Sorted preset names on disk (empty when none). The sort order is part of
+/// the contract: PC `n` and the plugin's preset parameter address the n-th
+/// entry of exactly this list.
+pub fn list_presets() -> Vec<String> {
+    let Some(dir) = presets_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            (p.extension().is_some_and(|x| x == "json"))
+                .then(|| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .flatten()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 /// SHA-256 of a file's contents, hex-encoded — the identity presets use to
 /// reference external assets (white paper §4.3).
 pub fn hash_file(path: &Path) -> Result<String, AssetError> {

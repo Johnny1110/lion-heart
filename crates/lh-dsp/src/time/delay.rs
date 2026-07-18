@@ -66,6 +66,9 @@ struct DelayChannel {
 
 impl DelayChannel {
     /// One sample: interpolated read, filtered feedback write, returns wet.
+    /// (The `%` stays: branchless wrap benched ~10% *slower* here on Apple
+    /// Silicon — the div pipelines under the surrounding FLOPs, the branches
+    /// don't.)
     #[inline]
     fn step(&mut self, x: f32, delay_smp: f32, feedback: f32, fb_lp_coeff: f32) -> f32 {
         let len = self.buf.len();
