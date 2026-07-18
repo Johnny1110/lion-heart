@@ -20,6 +20,7 @@ mod spectrum;
 mod theme;
 mod tuner;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,10 @@ const PRESET_SCAN_FRAMES: u32 = 60;
 /// Keep showing the last tuner reading this long after the note decays.
 const TUNER_HOLD: Duration = Duration::from_millis(800);
 const MAX_KNOBS: usize = 8;
+/// A gap longer than this between taps starts a fresh tempo (PRD 004).
+const TAP_TIMEOUT: Duration = Duration::from_millis(2_000);
+/// Inter-tap intervals averaged for the tempo estimate.
+const TAP_HISTORY: usize = 4;
 
 pub fn run(args: GuiArgs) -> anyhow::Result<()> {
     iced::application(move || App::new(&args), App::update, App::view)
@@ -91,6 +96,9 @@ pub enum Message {
         param: String,
         norm: f32,
     },
+    /// Tap-tempo button on a delay faceplate (PRD 004): each press is timed
+    /// on arrival; two-plus in rhythm set the delay time.
+    TapTempo(String),
     OpenBrowser(AssetKind),
     BrowserNav(PathBuf),
     BrowserPick(PathBuf),
@@ -307,6 +315,8 @@ impl SettingsDraft {
 struct SlotUi {
     /// Instance handle ("drive", "drive2", …) — the engine address.
     key: String,
+    /// Family key ("delay", "drive", …) — for family-specific UI (tap tempo).
+    family_key: &'static str,
     name: &'static str,
     active: bool,
     /// The active pedal's identity color (chain card, faceplate, knobs).
@@ -322,6 +332,17 @@ struct SlotUi {
 struct DragState {
     from: usize,
     over: Option<usize>,
+}
+
+/// Per-delay tap-tempo state (PRD 004): the last tap's arrival and the
+/// running average of recent intervals, kept UI-side and never persisted.
+#[derive(Default)]
+struct TapState {
+    last: Option<Instant>,
+    /// Seconds per tapped beat (a quarter note), once two-plus taps land.
+    period: Option<f32>,
+    /// Recent inter-tap intervals (seconds), newest last.
+    history: Vec<f32>,
 }
 
 struct ParamUi {
@@ -357,6 +378,8 @@ struct Running {
     slots: Vec<SlotUi>,
     selected: String,
     drag: Option<DragState>,
+    /// Tap-tempo state per delay instance handle (PRD 004).
+    taps: BTreeMap<String, TapState>,
     view: View,
     preset_name: String,
     presets: Vec<String>,
@@ -429,6 +452,7 @@ impl App {
             slots: Vec::new(),
             selected: String::new(),
             drag: None,
+            taps: BTreeMap::new(),
             view: View::Board,
             preset_name: active_preset.clone().unwrap_or_default(),
             presets: list_presets(),
@@ -532,6 +556,7 @@ impl Running {
                 let values = slot.pedals.get(desc.key);
                 SlotUi {
                     key: handle,
+                    family_key: family.key,
                     name: family.name,
                     active: slot.active,
                     color: theme::pedal_color(family.key, desc.key),
@@ -605,6 +630,57 @@ impl Running {
                 knob_index += 1;
             }
         }
+    }
+
+    /// Record a tap and, once a tempo is known, set the delay time (PRD 004).
+    /// Taps more than [`TAP_TIMEOUT`] apart start a fresh tempo; the rest are
+    /// averaged for a steady reading.
+    fn tap(&mut self, slot_key: &str, now: Instant) {
+        let state = self.taps.entry(slot_key.to_string()).or_default();
+        if let Some(last) = state.last {
+            let elapsed = now.duration_since(last);
+            if elapsed < TAP_TIMEOUT {
+                state.history.push(elapsed.as_secs_f32());
+                if state.history.len() > TAP_HISTORY {
+                    state.history.remove(0);
+                }
+                let sum: f32 = state.history.iter().sum();
+                state.period = Some(sum / state.history.len() as f32);
+            } else {
+                state.history.clear();
+                state.period = None;
+            }
+        }
+        state.last = Some(now);
+        self.apply_tap_time(slot_key);
+    }
+
+    /// Set a delay slot's `time` from its tapped tempo × its subdivision.
+    fn apply_tap_time(&mut self, slot_key: &str) {
+        let Some(period) = self.taps.get(slot_key).and_then(|t| t.period) else {
+            return;
+        };
+        let ratio = self.subdivision_ratio_for(slot_key);
+        let time_ms = period * 1_000.0 * ratio;
+        let Some(desc) = self.session.chain.param_desc(slot_key, "time") else {
+            return;
+        };
+        let clamped = desc.range.clamp(time_ms);
+        if let Ok(applied) = self.session.chain.set_param(slot_key, "time", clamped) {
+            self.update_param_ui(slot_key, "time", applied.real);
+            self.status = format!("{slot_key} tap: ♩ = {:.0} bpm", 60.0 / period);
+        }
+    }
+
+    /// The subdivision ratio the delay slot's `subdivision` selector is on.
+    fn subdivision_ratio_for(&self, slot_key: &str) -> f32 {
+        self.slots
+            .iter()
+            .find(|s| s.key == slot_key)
+            .and_then(|s| s.params.iter().find(|p| p.key == "subdivision"))
+            .and_then(|p| p.stepped.map(|(_, index)| index))
+            .map(lh_dsp::time::delay::subdivision_ratio)
+            .unwrap_or(1.0)
     }
 
     /// Select the slot at a chain position and show its faceplate: whatever
@@ -728,10 +804,18 @@ impl Running {
                     // one dragged param in place instead of re-snapshotting
                     // the whole chain (and redrawing every knob) each event.
                     Ok(applied) if !stepped => self.update_param_ui(&slot, &param, applied.real),
-                    Ok(_) => self.refresh_slots(),
+                    Ok(_) => {
+                        self.refresh_slots();
+                        // Flipping a delay's subdivision re-locks its echo to
+                        // the last tapped tempo (PRD 004).
+                        if param == "subdivision" {
+                            self.apply_tap_time(&slot);
+                        }
+                    }
                     Err(e) => self.status = e.to_string(),
                 }
             }
+            Message::TapTempo(slot) => self.tap(&slot, Instant::now()),
             Message::OpenBrowser(kind) => {
                 let remembered = match kind {
                     AssetKind::Nam => self.session.config.nam_dir.clone(),
@@ -1258,11 +1342,7 @@ impl Running {
         let target = self.drag.as_ref().and_then(|d| d.over);
         for (position, slot) in self.slots.iter().enumerate() {
             if position > 0 {
-                strip = strip.push(
-                    text("›")
-                        .size(15)
-                        .color(theme::dim(theme::TEXT_DIM, 0.65)),
-                );
+                strip = strip.push(text("›").size(15).color(theme::dim(theme::TEXT_DIM, 0.65)));
             }
             let led = if slot.active {
                 theme::METER_OK
@@ -1640,10 +1720,17 @@ impl Running {
         }
         title = title
             .push(
-                button(text(if slot.active { "● ON" } else { "○ BYPASSED" }).size(12))
-                    .padding([4, 12])
-                    .on_press(Message::ToggleSlot(slot.key.clone()))
-                    .style(theme::power(slot.active)),
+                button(
+                    text(if slot.active {
+                        "● ON"
+                    } else {
+                        "○ BYPASSED"
+                    })
+                    .size(12),
+                )
+                .padding([4, 12])
+                .on_press(Message::ToggleSlot(slot.key.clone()))
+                .style(theme::power(slot.active)),
             )
             .push(space().width(Length::Fill))
             .push(
@@ -1739,6 +1826,31 @@ impl Running {
                 .size(11)
                 .color(theme::dim(theme::TEXT_DIM, 0.8)),
         );
+        // Tap tempo (PRD 004): a momentary button, not a knob — timed on the
+        // control side, it only sets the `time` param (scaled by the
+        // subdivision selector above).
+        if slot.family_key == "delay" {
+            let bpm = self
+                .taps
+                .get(&slot.key)
+                .and_then(|t| t.period)
+                .map(|p| format!("♩ = {:.0} bpm", 60.0 / p))
+                .unwrap_or_else(|| "tap ×2 in rhythm to set the time".to_string());
+            body = body.push(
+                row![
+                    button(text("TAP").size(15))
+                        .padding([8, 26])
+                        .on_press(Message::TapTempo(slot.key.clone()))
+                        .style(theme::action),
+                    text(bpm)
+                        .size(13)
+                        .color(theme::TEXT_DIM)
+                        .font(iced::Font::MONOSPACE),
+                ]
+                .spacing(12)
+                .align_y(iced::Alignment::Center),
+            );
+        }
         if let Some(kind) = crate::session::asset_kind(&slot.key) {
             let (nam_name, ir_name) = self.session.asset_names();
             let (label, file) = match kind {

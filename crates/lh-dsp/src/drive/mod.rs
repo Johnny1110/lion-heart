@@ -30,6 +30,7 @@
 //! pedal dropdown and knobs, REPL labels (`set drive.pedal ts9`), MIDI CC
 //! mapping, preset save/load, and the plugin's per-pedal host params.
 
+mod angry_charlie;
 mod bd2;
 mod centaur;
 mod classic;
@@ -72,10 +73,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &evva::DESC,
         &red_charlie::DESC,
         &monster5150::DESC,
+        &angry_charlie::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 7;
+pub const MODEL_COUNT: usize = 8;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -132,6 +134,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &monster5150::DESC,
         controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
         build: || Box::new(monster5150::Monster5150::new()),
+    },
+    ModelDef {
+        desc: &angry_charlie::DESC,
+        controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
+        build: || Box::new(angry_charlie::AngryCharlie::new()),
     },
 ];
 
@@ -551,6 +558,7 @@ mod tests {
         assert_eq!(captions(4), ["Gain", "Low", "Mid", "High", "Level"]);
         assert_eq!(captions(5), ["Gain", "Bass", "Middle", "Treble", "Master"]);
         assert_eq!(captions(6), ["Pre Gain", "Low", "Mid", "High", "Post Gain"]);
+        assert_eq!(captions(7), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -704,7 +712,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -1111,6 +1119,158 @@ mod tests {
         assert!(
             cut_mid < 0.7 * flat_mid,
             "mid scoop: {cut_mid:.3} vs flat {flat_mid:.3}"
+        );
+    }
+
+    #[test]
+    fn monster5150_clip_is_symmetric_and_suppresses_even_harmonics() {
+        // Re-tooled to matched diode-to-ground clamps at every stage — the
+        // even harmonics the old asymmetric cascade made should be starved,
+        // same fingerprint as the angry-charlie's LEDs and a sharp contrast
+        // with the red-charlie's cold-biased (asymmetric) cascade.
+        let x = guitar(220.0, SR as usize);
+        let mut monster = prepared(6);
+        set_pos(&mut monster, 0, 6.0);
+        let monster_h2 = {
+            let y = process_in_blocks(&mut monster, &x, 256);
+            tone_at(&y, 440.0) / tone_at(&y, 220.0)
+        };
+        assert!(
+            monster_h2 < 0.02,
+            "monster5150's symmetric clip should suppress even harmonics, got h2/f0 = {monster_h2:.4}"
+        );
+        let mut red = prepared(5);
+        set_pos(&mut red, 0, 6.0);
+        let red_h2 = {
+            let y = process_in_blocks(&mut red, &x, 256);
+            tone_at(&y, 440.0) / tone_at(&y, 220.0)
+        };
+        assert!(
+            red_h2 > 3.0 * monster_h2,
+            "monster5150 must suppress even harmonics far more than the red-charlie's \
+             asymmetric cascade: monster {monster_h2:.4} vs red {red_h2:.4}"
+        );
+    }
+
+    #[test]
+    fn monster5150_cascades_harder_than_the_single_stage_angry_charlie() {
+        // Three cascaded symmetric clamps (with interstage reshaping between
+        // each) should out-saturate the angry-charlie's single hard clip at
+        // the same knob position — the "one level deeper" cascade the model
+        // is built around still holds once both are symmetric.
+        let x = guitar(220.0, SR as usize);
+        let mut monster = prepared(6);
+        set_pos(&mut monster, 0, 4.0);
+        let monster_res = harmonic_residual(&process_in_blocks(&mut monster, &x, 256), 220.0);
+        let mut angry = prepared(7);
+        set_pos(&mut angry, 0, 4.0);
+        let angry_res = harmonic_residual(&process_in_blocks(&mut angry, &x, 256), 220.0);
+        assert!(
+            monster_res > angry_res,
+            "monster5150's cascade must out-distort the angry-charlie's single clip: \
+             monster {monster_res:.3} vs angry {angry_res:.3}"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_clip_is_symmetric_and_suppresses_even_harmonics() {
+        // Two matched red LEDs to ground — same fingerprint as the ts9's
+        // matched feedback diodes (h2 should vanish), but from a hard knee
+        // instead of a soft one.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(7);
+        set_pos(&mut d, 0, 6.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
+        assert!(
+            h2 < 0.02,
+            "angry-charlie's symmetric clip should suppress even harmonics, got h2/f0 = {h2:.4}"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_hard_clip_is_squarer_than_the_red_charlies_soft_knee() {
+        // Diodes to ground outside the feedback loop clamp flat; the
+        // red-charlie's cascaded tanh knees round the top off instead.
+        // Driven hard, the flat clamp's crest factor (peak/rms) sits closer
+        // to a square wave's ~1.0 than the tanh cascade's.
+        let x = guitar(220.0, SR as usize);
+        let crest = |model: usize| -> f64 {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, 9.0);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let tail = &y[y.len() / 2..];
+            f64::from(peak(tail)) / f64::from(rms(tail))
+        };
+        let angry_crest = crest(7);
+        let red_crest = crest(5);
+        assert!(
+            angry_crest < red_crest,
+            "angry-charlie's hard clip should be squarer (lower crest factor) than \
+             red-charlie's soft knee: {angry_crest:.3} vs {red_crest:.3}"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_stays_clean_below_the_led_threshold() {
+        // Real LEDs don't conduct until well past a silicon diode's forward
+        // voltage: low gain rides under the knee almost entirely clean,
+        // unlike a continuously-compressing tanh stage.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(7);
+        set_pos(&mut d, 0, 1.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let residual = harmonic_residual(&y, 220.0);
+        assert!(
+            residual < 0.05,
+            "angry-charlie low-gain must stay clean under the LED knee, got {residual:.3} residual"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_eq_bands_work() {
+        // Same identity trick as the other post-distortion stacks: only EQ
+        // knobs change between measurements.
+        let x = tones(&[70.0, 150.0, 350.0, 550.0, 2_800.0, 6_000.0], SR as usize);
+        let measure = |bass: f32, middle: f32, treble: f32, freq: f32| -> f64 {
+            let mut d = prepared(7);
+            set_pos(&mut d, 0, 2.0);
+            set_pos(&mut d, 1, bass);
+            set_pos(&mut d, 2, middle);
+            set_pos(&mut d, 3, treble);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, freq)
+        };
+
+        // Bass shelf: boosting bass should lift 70 Hz relative to 2.8 kHz.
+        let flat_lo = measure(5.0, 5.0, 5.0, 70.0) / measure(5.0, 5.0, 5.0, 2_800.0);
+        let boosted_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 2_800.0);
+        assert!(
+            boosted_lo > 1.3 * flat_lo,
+            "bass boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+        );
+
+        // Middle: boosting should lift 550 Hz relative to 150 Hz.
+        let flat_mid = measure(5.0, 5.0, 5.0, 550.0) / measure(5.0, 5.0, 5.0, 150.0);
+        let boosted_mid = measure(5.0, 10.0, 5.0, 550.0) / measure(5.0, 10.0, 5.0, 150.0);
+        assert!(
+            boosted_mid > 1.5 * flat_mid,
+            "middle boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
+        );
+
+        // Treble shelf: boosting should lift 6 kHz relative to 350 Hz.
+        let flat_hi = measure(5.0, 5.0, 5.0, 6_000.0) / measure(5.0, 5.0, 5.0, 350.0);
+        let boosted_hi = measure(5.0, 5.0, 10.0, 6_000.0) / measure(5.0, 5.0, 10.0, 350.0);
+        assert!(
+            boosted_hi > 1.5 * flat_hi,
+            "treble boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
+        );
+
+        // Cut: middle at 0 should scoop 550 Hz.
+        let cut_mid = measure(5.0, 0.0, 5.0, 550.0) / measure(5.0, 0.0, 5.0, 150.0);
+        assert!(
+            cut_mid < 0.7 * flat_mid,
+            "middle scoop: {cut_mid:.3} vs flat {flat_mid:.3}"
         );
     }
 

@@ -55,6 +55,12 @@ const EVVA: Color = Color::from_rgb(0.93, 0.42, 0.58);
 const RED_CHARLIE: Color = Color::from_rgb(0.89, 0.32, 0.28);
 const MONSTER5150: Color = Color::from_rgb(0.88, 0.86, 0.82);
 
+// Delay voices: digital reads cold and clean, tape warm sepia, vintage a
+// dusty analog teal.
+const DIGITAL: Color = Color::from_rgb(0.36, 0.72, 0.90);
+const TAPE: Color = Color::from_rgb(0.85, 0.66, 0.42);
+const VINTAGE: Color = Color::from_rgb(0.46, 0.68, 0.70);
+
 /// A family's signature color (chain card band, fallbacks).
 pub fn family_color(key: &str) -> Color {
     match key {
@@ -71,20 +77,26 @@ pub fn family_color(key: &str) -> Color {
     }
 }
 
-/// The signature color of one pedal — drive pedals wear their real-world
+/// The signature color of one pedal — drive and delay pedals wear their own
 /// liveries; everything else inherits the family color.
 pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
-    if family_key != "drive" {
-        return family_color(family_key);
-    }
-    match pedal_key {
-        "ts9" => TS9,
-        "bd2" => BD2,
-        "centaur" => CENTAUR,
-        "evva" => EVVA,
-        "red-charlie" => RED_CHARLIE,
-        "monster5150" => MONSTER5150,
-        _ => ACCENT, // classic wears the house amber
+    match family_key {
+        "drive" => match pedal_key {
+            "ts9" => TS9,
+            "bd2" => BD2,
+            "centaur" => CENTAUR,
+            "evva" => EVVA,
+            "red-charlie" => RED_CHARLIE,
+            "monster5150" => MONSTER5150,
+            _ => ACCENT, // classic wears the house amber
+        },
+        "delay" => match pedal_key {
+            "digital" => DIGITAL,
+            "tape" => TAPE,
+            "vintage" => VINTAGE,
+            _ => DELAY,
+        },
+        _ => family_color(family_key),
     }
 }
 

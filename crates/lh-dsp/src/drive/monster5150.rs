@@ -1,15 +1,21 @@
-//! **monster5150** — EVH 5150-style high gain. The cascade goes one deeper
-//! than the red-charlie: a warm input triode, a hot second stage, then a
-//! *very* cold third clipper — the wall of saturation and singing sustain
-//! come from stacking those knees, and even the gain floor is dirty (the
-//! lead channel has no clean). What keeps the wall usable is the low end
-//! being carved out *before* the gain: a hard input trim below ~120 Hz plus
-//! a second, tighter interstage coupling at 180 Hz — palm mutes chug
-//! instead of flubbing — while the Low knob adds lows back *after* the
-//! distortion, the way the amp's resonance control does. A fixed bright
-//! pre-emphasis keeps the sizzle at every gain, and a post-distortion
-//! lowpass (~6.8 kHz) files the fizz off the top. Low/Mid/High reach
-//! 80 Hz / 550 Hz / 3 kHz; Pre/Post Gain follow the amp's panel.
+//! **monster5150** — 80s-metal-mod high gain. The tube-warm tanh cascade is
+//! gone; every stage now clips with a genuine **symmetric hard clamp** — the
+//! diode-to-ground clipping mod period thrash/speed players bolted onto
+//! their Marshalls and Boogies for more sustain and a harsher, buzzsaw edge
+//! than the amp's own tubes gave on their own. Three cascaded clips (the
+//! same threshold each time, like matched diode pairs) still go one deeper
+//! than the red-charlie's two soft ones, so the wall builds in layers
+//! instead of one flat ceiling; the low end is carved out *before* any of
+//! that clipping — a hard input trim below ~120 Hz plus a second, tighter
+//! interstage coupling at 180 Hz — so palm mutes chug instead of flubbing
+//! out, and even the gain floor is dirty (the lead channel has no clean).
+//! The Low knob adds lows back *after* the distortion (resonance-style, the
+//! way the amp's own control works), a fixed bright pre-emphasis keeps the
+//! sizzle at every gain, and a post-distortion lowpass (~6.8 kHz) files the
+//! harshest fizz off the top. Symmetric clipping throughout starves the even
+//! harmonics, leaving the buzzsaw stack of odds that made those hot-rodded
+//! 80s rigs sound so vicious. Low/Mid/High reach 80 Hz / 550 Hz / 3 kHz;
+//! Pre/Post Gain follow the amp's panel.
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
@@ -29,20 +35,15 @@ pub(super) static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
-/// Stage-1 knees: warm input triode.
-const STAGE1_KNEE_POS: f32 = 0.8;
-const STAGE1_KNEE_NEG: f32 = 1.0;
-/// Stage-2 knees: hot and moderately cold; opposite polarity models the
-/// stage inversion.
-const STAGE2_KNEE_POS: f32 = 1.0;
-const STAGE2_KNEE_NEG: f32 = 0.55;
-/// Fixed second-stage gain (+12 dB).
+/// Shared symmetric hard-clip ceiling — every stage clamps at the same
+/// threshold, like matched diode pairs to ground; three of them cascade
+/// (with interstage filtering reshaping the wave between clips) instead of
+/// one softer knee doing all the work.
+const KNEE: f32 = 0.85;
+/// Fixed second-stage gain (+12 dB) driving the already-clipped signal back
+/// into the next clamp.
 const STAGE2_GAIN: f32 = 4.0;
-/// Stage-3 knees: the very cold clipper — colder than the red-charlie's —
-/// shearing the (re-inverted) positive swing almost immediately.
-const STAGE3_KNEE_POS: f32 = 0.35;
-const STAGE3_KNEE_NEG: f32 = 0.9;
-/// Fixed third-stage gain (+6 dB).
+/// Fixed third-stage gain (+6 dB) into the final, tightest wall.
 const STAGE3_GAIN: f32 = 2.0;
 /// Fixed bright pre-emphasis into stage 1 (+~3 dB above 1.5 kHz): the 5150
 /// sizzle rides at every gain, unlike the red-charlie's fading bright cap.
@@ -53,7 +54,7 @@ const LOW_TRIM: f32 = 0.65;
 /// Post-distortion fizz lowpass corner.
 const FIZZ_HZ: f32 = 6_800.0;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
-const MAKEUP: f32 = 0.25;
+const MAKEUP: f32 = 0.16;
 
 /// 3-band tone stack corner frequencies.
 const BASS_HZ: f32 = 80.0;
@@ -99,14 +100,11 @@ impl Monster5150 {
         }
     }
 
-    /// Asymmetric tanh clipper with independent knees per polarity.
+    /// Symmetric hard clip — a genuine flat-topped clamp, not a tanh curve:
+    /// the diode-to-ground character, both polarities alike.
     #[inline]
-    fn clip(v: f32, knee_pos: f32, knee_neg: f32) -> f32 {
-        if v >= 0.0 {
-            knee_pos * (v / knee_pos).tanh()
-        } else {
-            knee_neg * (v / knee_neg).tanh()
-        }
+    fn hard_clip(v: f32) -> f32 {
+        v.clamp(-KNEE, KNEE)
     }
 }
 
@@ -146,15 +144,15 @@ impl Circuit for Monster5150 {
             let x = x - LOW_TRIM * self.lf_trim.lp(x, self.c120);
             // Fixed bright pre-emphasis: the sizzle at every gain.
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1500));
-            // Stage 1: warm asymmetric soft clip.
-            let s1 = Self::clip(gain.tick() * x, STAGE1_KNEE_POS, STAGE1_KNEE_NEG);
+            // Stage 1: symmetric hard clip to the shared ceiling.
+            let s1 = Self::hard_clip(gain.tick() * x);
             let s1 = s1 - self.couple1.lp(s1, self.c_couple1);
-            // Stage 2: hot, moderately cold.
-            let s2 = Self::clip(STAGE2_GAIN * s1, STAGE2_KNEE_POS, STAGE2_KNEE_NEG);
-            // Tighter second coupling before the coldest stage.
+            // Stage 2: re-amplify the already-clipped wave and clamp again.
+            let s2 = Self::hard_clip(STAGE2_GAIN * s1);
+            // Tighter second coupling before the final stage.
             let s2 = s2 - self.couple2.lp(s2, self.c_couple2);
-            // Stage 3: the very cold clipper — the wall.
-            let s3 = Self::clip(STAGE3_GAIN * s2, STAGE3_KNEE_POS, STAGE3_KNEE_NEG);
+            // Stage 3: the last, tightest slam of the wall.
+            let s3 = Self::hard_clip(STAGE3_GAIN * s2);
             *s = s3 - self.dc_os.lp(s3, self.c12);
         }
     }

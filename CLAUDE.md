@@ -125,6 +125,27 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    output stage now finds the safety-limiter ceiling by key, not `params[0]`;
    out-of-range `set_param` no longer panics in chain-EQ/reverb.
 
+**M9 (delay family) — code landed (uncommitted).** Specced in PRD 004,
+recorded as ADR 007. The `delay` slot became a **three-pedal family**
+(`digital`/`tape`/`vintage`, family key unchanged), one shared interpolated
+delay engine `match`ing per-voice `VoiceDef` constants (one file per pedal
+under `time/delay/`, like drive). New shared controls: **tone** (feedback-path
+lowpass, dark⇄bright, compounding per repeat, settled-skip coefficient),
+**mod** as each voice's signature knobs (tape Wow+Flutter, vintage Mod —
+depth over voice-fixed LFO rates; digital none), and **tap tempo**. digital is
+clean/linear (feedback ≤ 0.9); tape/vintage soft-clip the feedback
+(`tanh(drive·x)/drive`, unity small-signal, `1/drive` ceiling) so feedback
+≥ 1.0 self-oscillates into a *bounded* drone — never NaN/runaway. **Tap** is
+control-side, GUI-only: a `subdivision` stepped param (stored in presets,
+no-op in the DSP audio path) plus a per-slot `TapState` in the GUI that times
+taps and sets `time = period × subdivision`; flipping subdivision re-derives
+from the last tempo. Preset **schema v4**: `migrate_v3_delay_pedal` renames the
+old `delay` pedal → `digital` (`DELAY_PEDALS` pins the family, `time/feedback/
+mix` carry over, old files sound the same bar a brighter default tone). Engine
+/ session / plugin needed **no code changes** (the multi-pedal path already
+covered them); the plugin auto-expands per-voice params — **pre-v0.1 param-id
+break** (`delay_digital_time`, …, `delay_pedal`), re-run clap-validator.
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -136,9 +157,14 @@ add/remove — tails keep ringing through the fade), a 3-drive board saved
 and reloaded, the EQ panel against real playing (spectrum sanity, drag
 feel, persistence across restarts), plugin re-check in a real host
 (drive/mod param ids changed and red-charlie/monster5150 params
-appeared — pre-v0.1 break; re-run clap-validator), plus the standing M7 items (stereo width
-by ear, foot controller end-to-end, `--buffer 32` on hardware, RTL
-numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
+appeared — pre-v0.1 break; re-run clap-validator, now with the delay voices
+expanded too), **the three delays by ear** (digital clean, tape wobble +
+warmth, vintage dark/gooey self-oscillation, tone sweep, feedback into bounded
+self-oscillation), **tap tempo** (two taps lock the time, subdivision reshapes
+the echo, BPM readout), a delay-heavy board saved/reloaded and an **old v3
+preset** loaded (delay → digital, still rings), plus the standing M7 items
+(stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
+RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
 after that.
 
 M7 recap: stereo bus end to end (ADR 002 implemented) and the

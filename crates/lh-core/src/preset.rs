@@ -10,12 +10,16 @@
 //! v3 (PRD 001): a slot stores its selected pedal plus **per-pedal** param
 //! maps — every pedal of the family keeps its own values, so switching
 //! pedals restores each one's knobs.
+//!
+//! v4 (PRD 004): the delay slot became a family (digital/tape/vintage); its
+//! lone v3 pedal `delay` is renamed to `digital`, whose faceplate is a
+//! superset of the old one — old files sound the same (a hair brighter).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 3;
+pub const PRESET_SCHEMA_VERSION: u32 = 4;
 
 /// Stepped index of the "classic" model in the v2 drive registry, the target
 /// of the v1 migration. The v2→v3 migration then resolves indices through
@@ -26,7 +30,7 @@ pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
 /// pedals past index 4 postdate v2 and are unreachable from the migration).
 /// The registry lives in `lh-dsp` (which this crate cannot see); a test over
 /// there pins the two together so they cannot drift.
-pub const DRIVE_PEDALS: [&str; 7] = [
+pub const DRIVE_PEDALS: [&str; 8] = [
     "ts9",
     "bd2",
     "classic",
@@ -34,10 +38,16 @@ pub const DRIVE_PEDALS: [&str; 7] = [
     "evva",
     "red-charlie",
     "monster5150",
+    "angry-charlie",
 ];
 
 /// v2 modulation type indices → v3 pedal keys, same pinning contract.
 pub const MOD_PEDALS: [&str; 4] = ["chorus", "flanger", "phaser", "tremolo"];
+
+/// The delay family's pedal keys in registry order (PRD 004). The v3→v4
+/// migration renames the old single `delay` pedal to the first of these; a
+/// test over in `lh-dsp` pins this to `delay::FAMILY.pedals`.
+pub const DELAY_PEDALS: [&str; 3] = ["digital", "tape", "vintage"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -126,6 +136,9 @@ impl Preset {
         }
         if preset.schema_version < 3 {
             migrate_v2_pedal_slots(&mut preset);
+        }
+        if preset.schema_version < 4 {
+            migrate_v3_delay_pedal(&mut preset);
         }
         preset.schema_version = PRESET_SCHEMA_VERSION;
         Ok(preset)
@@ -237,6 +250,24 @@ fn migrate_v2_pedal_slots(preset: &mut Preset) {
                     slot.pedals.insert(slot.key.clone(), old);
                 }
             }
+        }
+    }
+}
+
+/// v3 → v4 (PRD 004): the delay slot became a multi-pedal family, so its lone
+/// v3 pedal `delay` is renamed to the family's first pedal, `digital`. That
+/// faceplate is a superset — `time`/`feedback`/`mix` carry over verbatim,
+/// `tone`/`subdivision` take their defaults — so old files sound the same
+/// (digital simply defaults to a slightly brighter tone).
+fn migrate_v3_delay_pedal(preset: &mut Preset) {
+    const OLD: &str = "delay";
+    let new = DELAY_PEDALS[0];
+    for slot in preset.chain.iter_mut().filter(|s| s.key == "delay") {
+        if slot.pedal.as_deref() == Some(OLD) || slot.pedal.is_none() {
+            slot.pedal = Some(new.to_string());
+        }
+        if let Some(values) = slot.pedals.remove(OLD) {
+            slot.pedals.entry(new.to_string()).or_insert(values);
         }
     }
 }
@@ -422,5 +453,48 @@ mod tests {
         assert_eq!(p.chain[0].pedal.as_deref(), Some("bd2"));
         assert_eq!(p.chain[0].pedals["bd2"]["gain"], 7.0);
         assert_eq!(p.chain[0].pedals["ts9"]["drive"], 3.0);
+    }
+
+    #[test]
+    fn v3_delay_pedal_migrates_to_digital() {
+        // The v3 delay slot (single `delay` pedal) becomes the `digital`
+        // voice of the new family, its shared values intact.
+        let v3 = r#"{
+            "schema_version": 3,
+            "name": "echoes",
+            "chain": [{"key": "delay", "pedal": "delay",
+                       "pedals": {"delay": {"time": 420.0, "feedback": 0.5, "mix": 0.3}}}]
+        }"#;
+        let p = Preset::from_json(v3).unwrap();
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("digital"));
+        assert!(!slot.pedals.contains_key("delay"), "old key renamed");
+        let d = &slot.pedals["digital"];
+        assert_eq!(d["time"], 420.0);
+        assert_eq!(d["feedback"], 0.5);
+        assert_eq!(d["mix"], 0.3);
+    }
+
+    #[test]
+    fn v3_sparse_delay_slot_selects_digital() {
+        // A bare delay slot (no pedal, no values) still lands on digital.
+        let v3 = r#"{"schema_version": 3, "name": "s", "chain": [{"key": "delay"}]}"#;
+        let p = Preset::from_json(v3).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("digital"));
+    }
+
+    #[test]
+    fn v4_delay_slots_are_not_remapped() {
+        // Native v4: the tape/vintage voices survive untouched.
+        let v4 = r#"{
+            "schema_version": 4,
+            "name": "new",
+            "chain": [{"key": "delay", "pedal": "tape",
+                       "pedals": {"tape": {"wow": 0.4}}}]
+        }"#;
+        let p = Preset::from_json(v4).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("tape"));
+        assert_eq!(p.chain[0].pedals["tape"]["wow"], 0.4);
     }
 }

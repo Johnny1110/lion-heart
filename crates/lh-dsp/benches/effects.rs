@@ -56,9 +56,12 @@ fn bench_effects(c: &mut Criterion) {
         );
     }
 
-    let mut delay = Delay::new();
-    delay.prepare(SR);
-    bench_stereo!(group, "delay", delay, buf, buf_r);
+    for (index, pedal) in lh_dsp::time::delay::FAMILY.pedals.iter().enumerate() {
+        let mut delay = Delay::new();
+        delay.prepare(SR);
+        delay.select_pedal(index);
+        bench_stereo!(group, format!("delay_{}", pedal.key), delay, buf, buf_r);
+    }
 
     // Cab with a realistic 100 ms IR (4800 taps at 48 kHz, 128-sample partitions).
     let (mut cab, mut cab_handle) = lh_dsp::cab::CabIr::new();
