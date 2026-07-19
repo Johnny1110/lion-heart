@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::collections::BTreeMap;
 
 use lh_core::global_eq::{BAND_COUNT, Band, GlobalEqState};
-use lh_core::preset::SlotState;
+use lh_core::preset::{SlotState, Snapshot, SnapshotSlot};
 use lh_core::{FamilyDesc, ParamDesc, ParamId, lin_to_db};
 use lh_dsp::Effect;
 use lh_dsp::blocks::smooth::Smoothed;
@@ -80,6 +80,14 @@ pub enum EngineMsg {
     RemoveSlot {
         index: u8,
     },
+    /// Move a slot's effect into a spill lane **immediately** (PRD 010): it
+    /// leaves the audible chain now (the main loop skips the emptied slot)
+    /// and keeps ringing in the lane, fed silence, until it decays. Pushed
+    /// before any `InstallSlot` that reuses the index, so FIFO order keeps
+    /// reuse correct. Retired down the chute once the tail goes silent.
+    SpillSlot {
+        index: u8,
+    },
     /// Update one global-EQ band on the output stage (PRD 003).
     SetEqBand {
         band: u8,
@@ -133,6 +141,93 @@ struct Slot {
     effect: Box<dyn Effect>,
     /// 1.0 = active, 0.0 = bypassed; smoothed for click-free toggling.
     wet: Smoothed,
+}
+
+/// Number of spill lanes (PRD 010): tails kept ringing after their slot
+/// leaves the chain. Four gives comfortable headroom for rapid A/B between
+/// space-heavy presets; each idle lane costs nothing.
+pub const SPILL_LANES: usize = 4;
+/// A lane whose output stays below this (≈ −80 dBFS) is considered silent.
+const SPILL_SILENCE: f32 = 1e-4;
+/// Silence must persist this long before a lane retires (seconds).
+const SPILL_SILENCE_SECS: f32 = 0.25;
+/// A tail rings freely this long before forced decay begins (seconds) —
+/// insurance against a self-oscillating feedback delay that never decays.
+const SPILL_GRACE_SECS: f32 = 8.0;
+/// Forced-decay slope once the grace elapses.
+const SPILL_DECAY_DB_PER_S: f32 = 12.0;
+
+/// One spill lane: an effect ringing out on silence, summed into the output
+/// bus after the master fade. Preallocated; `effect` is `None` when free.
+struct SpillLane {
+    effect: Option<Box<dyn Effect>>,
+    /// Samples since the spill began (grace timer before forced decay).
+    age: u64,
+    /// Consecutive silent samples (retire when this passes the threshold).
+    quiet: u64,
+    /// Forced-decay gain — 1.0 until the grace elapses, then ramps to 0.
+    decay_gain: f32,
+}
+
+impl SpillLane {
+    fn free() -> Self {
+        Self {
+            effect: None,
+            age: 0,
+            quiet: 0,
+            decay_gain: 1.0,
+        }
+    }
+
+    /// Take on a spilled effect (its internal tail is preserved — never
+    /// reset). Resets only the lane's own timers/gain.
+    fn start(&mut self, effect: Box<dyn Effect>) {
+        self.effect = Some(effect);
+        self.age = 0;
+        self.quiet = 0;
+        self.decay_gain = 1.0;
+    }
+
+    /// Run one chunk of the tail (already rendered into `wet_*`) into the
+    /// bus: apply the forced-decay gain, sum, and advance the timers.
+    /// `sr` is the sample rate. Returns nothing; call [`Self::finished`].
+    fn mix_into(
+        &mut self,
+        bus_l: &mut [f32],
+        bus_r: &mut [f32],
+        wet_l: &[f32],
+        wet_r: &[f32],
+        sr: f32,
+    ) {
+        let grace = (SPILL_GRACE_SECS * sr) as u64;
+        let per_sample = 10f32.powf(-SPILL_DECAY_DB_PER_S / 20.0 / sr);
+        let mut peak = 0.0f32;
+        for i in 0..bus_l.len() {
+            if self.age >= grace {
+                self.decay_gain *= per_sample;
+                if self.decay_gain < 1e-7 {
+                    self.decay_gain = 0.0; // floor: no sustained denormals
+                }
+            }
+            self.age += 1;
+            let g = self.decay_gain;
+            let l = wet_l[i] * g;
+            let r = wet_r[i] * g;
+            bus_l[i] += l;
+            bus_r[i] += r;
+            peak = peak.max(l.abs()).max(r.abs());
+        }
+        if peak < SPILL_SILENCE {
+            self.quiet += bus_l.len() as u64;
+        } else {
+            self.quiet = 0;
+        }
+    }
+
+    /// The tail has gone silent long enough to retire.
+    fn finished(&self, sr: f32) -> bool {
+        self.quiet >= (SPILL_SILENCE_SECS * sr) as u64
+    }
 }
 
 /// The always-on ceiling of the output stage. With the chain limiter now
@@ -232,6 +327,12 @@ pub struct Chain {
     sample_rate: u32,
     dry_l: Vec<f32>,
     dry_r: Vec<f32>,
+    /// Spill lanes (PRD 010): tails ringing out after their slot left the
+    /// chain. Preallocated; processed after the master fade.
+    spill: Vec<SpillLane>,
+    /// Preallocated scratch the spill lanes render their tails into.
+    spill_l: Vec<f32>,
+    spill_r: Vec<f32>,
     /// Always-on output stage: global EQ → safety limiter → spectrum tap.
     output: OutputStage,
     telemetry: Arc<Telemetry>,
@@ -251,12 +352,22 @@ impl Chain {
         self.fade.snap_to_target();
         self.dry_l = vec![0.0; MAX_BLOCK];
         self.dry_r = vec![0.0; MAX_BLOCK];
+        for lane in self.spill.iter_mut().flat_map(|l| l.effect.as_mut()) {
+            lane.prepare(sample_rate);
+        }
+        self.spill_l = vec![0.0; MAX_BLOCK];
+        self.spill_r = vec![0.0; MAX_BLOCK];
         self.output.prepare(sample_rate);
     }
 
     pub fn reset(&mut self) {
         for slot in self.slots.iter_mut().flatten() {
             slot.effect.reset();
+        }
+        // A hard reset drops spill tails too (transient, not state). reset
+        // runs off the audio thread, so dropping the boxes here is allowed.
+        for lane in &mut self.spill {
+            *lane = SpillLane::free();
         }
         self.output.reset();
     }
@@ -298,6 +409,65 @@ impl Chain {
         self.pending_removes[index] = false;
         if let Some(old) = self.slots[index].replace(Slot { effect, wet }) {
             self.retire(old.effect);
+        }
+    }
+
+    /// Hand a spilled effect to a free lane; if all lanes are busy, evict
+    /// the oldest (its tail is the most decayed) and take its place. No
+    /// allocation — a pointer move (PRD 010).
+    fn spill_effect(&mut self, effect: Box<dyn Effect>) {
+        if let Some(lane) = self.spill.iter_mut().find(|l| l.effect.is_none()) {
+            lane.start(effect);
+            return;
+        }
+        // All lanes busy: retire the oldest, reuse its lane.
+        if let Some((idx, _)) = self.spill.iter().enumerate().max_by_key(|(_, l)| l.age) {
+            if let Some(old) = self.spill[idx].effect.take() {
+                self.retire(old);
+            }
+            self.spill[idx].start(effect);
+        } else {
+            // No lanes configured at all: nothing to do but retire it.
+            self.retire(effect);
+        }
+    }
+
+    /// Render and sum all active spill lanes into the bus, then retire any
+    /// whose tail has gone silent. Runs after the master fade so a
+    /// structure-change fade never mutes a tail; before the output stage so
+    /// the safety limiter still covers the sum. Idle (early return) when no
+    /// lane is ringing.
+    fn process_spill(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if self.spill.iter().all(|l| l.effect.is_none()) {
+            return;
+        }
+        let sr = self.sample_rate as f32;
+        // Borrow the scratch out of `self` so the lane loop can hold both it
+        // and `self.spill` (disjoint, but the borrow checker needs the move).
+        let mut scratch_l = std::mem::take(&mut self.spill_l);
+        let mut scratch_r = std::mem::take(&mut self.spill_r);
+        for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
+            let n = chunk_l.len();
+            for lane in self.spill.iter_mut() {
+                let Some(effect) = lane.effect.as_mut() else {
+                    continue;
+                };
+                scratch_l[..n].fill(0.0);
+                scratch_r[..n].fill(0.0);
+                effect.process(&mut scratch_l[..n], &mut scratch_r[..n]);
+                lane.mix_into(chunk_l, chunk_r, &scratch_l[..n], &scratch_r[..n], sr);
+            }
+        }
+        self.spill_l = scratch_l;
+        self.spill_r = scratch_r;
+        // Retire finished lanes (scratch is back, so `self.retire` is free
+        // to borrow). A silent-long-enough tail dies down the chute.
+        for i in 0..self.spill.len() {
+            if self.spill[i].finished(sr)
+                && let Some(effect) = self.spill[i].effect.take()
+            {
+                self.retire(effect);
+            }
         }
     }
 
@@ -350,6 +520,18 @@ impl Chain {
                     if (index as usize) < MAX_SLOTS {
                         self.pending_removes[index as usize] = true;
                         self.fade.set_target(0.0);
+                    }
+                }
+                Ok(EngineMsg::SpillSlot { index }) => {
+                    // Immediate: take the slot now (the main loop already
+                    // skips an emptied slot) and hand its ringing effect to
+                    // a lane. Cancel any pending removal of this index — a
+                    // spill supersedes it.
+                    if (index as usize) < MAX_SLOTS {
+                        self.pending_removes[index as usize] = false;
+                        if let Some(slot) = self.slots[index as usize].take() {
+                            self.spill_effect(slot.effect);
+                        }
                     }
                 }
                 Ok(EngineMsg::SetEqBand { band, state }) => {
@@ -447,6 +629,10 @@ impl Chain {
             }
         }
 
+        // Spill lanes (PRD 010): sum ringing-out tails on top of the faded
+        // chain. After the fade so a structure change cannot mute them.
+        self.process_spill(left, right);
+
         // Output stage (PRD 003): global EQ → safety limiter → spectrum tap.
         self.output.process(left, right);
 
@@ -475,19 +661,24 @@ struct SlotShadow {
     /// pedal → param norms — the per-pedal knob memory (PRD 001).
     norms: Vec<Vec<f32>>,
     active: bool,
+    /// The effect's tail hint (PRD 010), cached at install so the control
+    /// side can choose spill-vs-remove without touching the audio effect.
+    tail_secs: f32,
 }
 
 impl SlotShadow {
-    fn new(family: &'static FamilyDesc, pedal: usize) -> Self {
+    fn from_effect(effect: &dyn Effect) -> Self {
+        let family = effect.family();
         Self {
             family,
-            pedal,
+            pedal: effect.pedal_index(),
             norms: family
                 .pedals
                 .iter()
                 .map(|p| p.params.iter().map(|pd| pd.default_norm()).collect())
                 .collect(),
             active: true,
+            tail_secs: effect.tail_seconds(),
         }
     }
 }
@@ -671,6 +862,16 @@ impl ChainHandle {
         let shadow = self.shadow(slot);
         let desc = shadow.family.pedals[shadow.pedal];
         desc.params.get(desc.param_index(param_key)?)
+    }
+
+    /// The current normalized value of the active pedal's `param_key`,
+    /// from the shadow (soft-takeover compares the pedal against this).
+    pub fn param_norm(&self, handle: &str, param_key: &str) -> Option<f32> {
+        let slot = self.slot_index(handle).ok()?;
+        let shadow = self.shadow(slot);
+        let desc = shadow.family.pedals[shadow.pedal];
+        let param = desc.param_index(param_key)?;
+        Some(shadow.norms[shadow.pedal][param])
     }
 
     /// The active pedal's key for a slot.
@@ -877,7 +1078,7 @@ impl ChainHandle {
         }
         let index = self.free_index().ok_or(EngineError::ChainFull)?;
         effect.prepare(self.sample_rate);
-        self.slots[index] = Some(SlotShadow::new(effect.family(), effect.pedal_index()));
+        self.slots[index] = Some(SlotShadow::from_effect(effect.as_ref()));
         if self
             .tx
             .push(EngineMsg::InstallSlot {
@@ -906,6 +1107,27 @@ impl ChainHandle {
             .map_err(|_| EngineError::QueueFull)?;
         self.slots[index] = None;
         Ok(())
+    }
+
+    /// Spill a slot: it leaves the chain now but keeps ringing out in a
+    /// spill lane until its tail decays (PRD 010). Same control-side
+    /// bookkeeping as [`Self::remove_slot`]; the engine keeps the effect.
+    pub fn spill_slot(&mut self, handle: &str) -> Result<(), EngineError> {
+        let index = self.slot_index(handle)?;
+        self.order.retain(|&i| i as usize != index);
+        self.push_order()?;
+        self.tx
+            .push(EngineMsg::SpillSlot { index: index as u8 })
+            .map_err(|_| EngineError::QueueFull)?;
+        self.slots[index] = None;
+        Ok(())
+    }
+
+    /// Whether a slot has a tail worth spilling (delay/reverb, PRD 010).
+    pub fn slot_has_tail(&self, handle: &str) -> bool {
+        self.slot_index(handle)
+            .map(|i| self.shadow(i).tail_secs > 0.0)
+            .unwrap_or(false)
     }
 
     fn free_index(&mut self) -> Option<usize> {
@@ -953,6 +1175,34 @@ impl ChainHandle {
                 }
             })
             .collect()
+    }
+
+    /// Capture the current **scene** (PRD 009): per handle, the bypass flag
+    /// and the *selected* pedal's real values. Unlike [`snapshot_chain`]
+    /// this is a value+bypass overlay — no structure, no unselected pedals'
+    /// memory — the unit a snapshot stores and morphs.
+    pub fn capture_scene(&self) -> Snapshot {
+        let mut slots = BTreeMap::new();
+        for position in 0..self.order.len() {
+            let i = self.order[position] as usize;
+            let shadow = self.shadow(i);
+            let pedal = shadow.pedal;
+            let desc = shadow.family.pedals[pedal];
+            let values = desc
+                .params
+                .iter()
+                .enumerate()
+                .map(|(j, pd)| (pd.key.to_string(), pd.range.to_real(shadow.norms[pedal][j])))
+                .collect();
+            slots.insert(
+                self.handle_at(position),
+                SnapshotSlot {
+                    active: shadow.active,
+                    values,
+                },
+            );
+        }
+        Snapshot { slots }
     }
 
     /// Update one pedal's shadow values from a preset map, collecting
@@ -1039,32 +1289,50 @@ impl ChainHandle {
     pub fn apply_preset_chain(
         &mut self,
         chain: &[SlotState],
+        spillover: bool,
         build: &mut dyn FnMut(&str) -> Option<Box<dyn Effect>>,
     ) -> Result<Vec<String>, EngineError> {
         let mut warnings = Vec::new();
 
-        // Pass 1: claim surviving instances, first-come in chain order.
+        // Pass 1: claim surviving instances, first-come in chain order. A
+        // tailed slot (delay/reverb) is deliberately *not* claimed when
+        // spillover is on — reusing it would glue the incoming preset's
+        // values onto a ringing buffer (a delay-time glide artifact). It is
+        // spilled in pass 2 and rebuilt fresh in pass 3 instead.
         let mut available = self.order.clone();
         let claims: Vec<Option<u8>> = chain
             .iter()
             .map(|state| {
                 available
                     .iter()
-                    .position(|&i| self.shadow(i as usize).family.key == state.key)
+                    .position(|&i| {
+                        let shadow = self.shadow(i as usize);
+                        shadow.family.key == state.key && !(spillover && shadow.tail_secs > 0.0)
+                    })
                     .map(|pos| available.remove(pos))
             })
             .collect();
 
         // Pass 2: release unclaimed instances — the preset defines the
-        // structure. Freed indices become available for the installs below;
-        // the engine cancels a pending removal when an index is re-used.
+        // structure. Tailed slots spill (keep ringing) when spillover is on;
+        // the rest are removed. Freed indices become available for the
+        // installs below; the engine cancels a pending removal when an index
+        // is re-used.
         for &index in &available {
-            let key = self.shadow(index as usize).family.key;
-            self.tx
-                .push(EngineMsg::RemoveSlot { index })
-                .map_err(|_| EngineError::QueueFull)?;
+            let shadow = self.shadow(index as usize);
+            let key = shadow.family.key;
+            let spill = spillover && shadow.tail_secs > 0.0;
+            let msg = if spill {
+                EngineMsg::SpillSlot { index }
+            } else {
+                EngineMsg::RemoveSlot { index }
+            };
+            self.tx.push(msg).map_err(|_| EngineError::QueueFull)?;
             self.slots[index as usize] = None;
-            warnings.push(format!("slot {key:?} not in preset — removed"));
+            warnings.push(format!(
+                "slot {key:?} not in preset — {}",
+                if spill { "spilled" } else { "removed" }
+            ));
         }
 
         // Pass 3: build the new order, installing what the claims missed.
@@ -1086,8 +1354,7 @@ impl ChainHandle {
                         continue;
                     };
                     effect.prepare(self.sample_rate);
-                    self.slots[index] =
-                        Some(SlotShadow::new(effect.family(), effect.pedal_index()));
+                    self.slots[index] = Some(SlotShadow::from_effect(effect.as_ref()));
                     if self
                         .tx
                         .push(EngineMsg::InstallSlot {
@@ -1181,7 +1448,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
     let mut shadows: Vec<Option<SlotShadow>> = Vec::with_capacity(MAX_SLOTS);
     let mut slots: Vec<Option<Slot>> = Vec::with_capacity(MAX_SLOTS);
     for effect in effects {
-        shadows.push(Some(SlotShadow::new(effect.family(), effect.pedal_index())));
+        shadows.push(Some(SlotShadow::from_effect(effect.as_ref())));
         slots.push(Some(Slot {
             effect,
             wet: Smoothed::new(1.0),
@@ -1206,6 +1473,9 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             sample_rate: 48_000,
             dry_l: Vec::new(),
             dry_r: Vec::new(),
+            spill: (0..SPILL_LANES).map(|_| SpillLane::free()).collect(),
+            spill_l: Vec::new(),
+            spill_r: Vec::new(),
             output: OutputStage::new(),
             telemetry: Arc::clone(&telemetry),
             tap: None,

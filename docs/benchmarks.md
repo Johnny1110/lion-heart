@@ -7,6 +7,93 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-19 (M13 expression: manual wah) — macOS, Apple Silicon (native)
+
+The filter family's second pedal (PRD 008 / ADR 011): the manual wah drops
+the envelope follower and reads a smoothed `pos` instead — same per-sample
+sweep (exp + sin) and SVF, so the two pedals price alike. The family
+restructure (one engine, per-pedal `Ctl` tables) left the autowah's cost
+unchanged.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| filter — autowah (env + SVF)       | ~1.20 µs    | 0.09 %                 |
+| filter — wah (pos + SVF)           | ~1.15 µs    | 0.09 %                 |
+
+## 2026-07-19 (M13 spillover) — macOS, Apple Silicon (native)
+
+The spill lanes (PRD 010 / ADR 013): tails ringing out after their slot
+leaves the chain, summed into the output bus. Cost is one `Effect::process`
+per occupied lane per block — a reverb's FDN runs the same whatever its tail
+level, so this is a true per-block worst case, not a transient. Run with
+`cargo bench -p lh-engine --bench spillover`.
+
+`spillover_worst` fills all four lanes with reverb (the priciest tail) and
+sums them; measured with the default `hall` voice. The absolute worst case
+is four of the costliest voice (~4.4 µs each, see below) ≈ 18 µs — still
+1.4 % of the deadline, and only while four tails ring at once.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| spillover_worst (4 × hall)         | ~7.6 µs     | 0.57 %                 |
+
+## 2026-07-19 (M12 filter family) — macOS, Apple Silicon (native)
+
+The new `filter` slot's first pedal (PRD 007 / ADR 010). Per-sample cost is
+the sweep itself (one exp for the geometric fc map, one sin for the SVF
+retune) plus the band soft clip.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| filter — autowah (env + SVF)       | ~1.23 µs    | 0.09 %                 |
+
+## 2026-07-18 (M11 mod family expansion) — macOS, Apple Silicon (native)
+
+Tremolo rebuilt (dB-linear depth, wave/spread) and four pedals added
+(PRD 006 / ADR 009). Univibe pays four per-sample `tan`s for its staggered
+stage corners — 0.21 % of the deadline, cache rejected as premature.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| mod — chorus                       | ~871 ns     | 0.07 %                 |
+| mod — flanger                      | ~908 ns     | 0.07 %                 |
+| mod — phaser (4-stage swept)       | ~1.56 µs    | 0.12 %                 |
+| mod — tremolo (dB-depth, slewed)   | ~804 ns     | 0.06 %                 |
+| mod — vibrato                      | ~852 ns     | 0.06 %                 |
+| mod — harmonic                     | ~766 ns     | 0.06 %                 |
+| mod — rotary (two rotors)          | ~972 ns     | 0.07 %                 |
+| mod — univibe (staggered stages)   | ~2.85 µs    | 0.21 %                 |
+
+## 2026-07-18 (M10 reverb family) — macOS, Apple Silicon (native)
+
+The reverb slot became a twelve-machine family (PRD 005 / ADR 008); the old
+`reverb_fdn8` bench is superseded by one bench per voice, each at its own
+faceplate defaults. The tank now does interpolated reads (size scaling +
+mod), per-line length ramps, and per-sample knob smoothing, so even the
+plain hall costs more than the old fixed-read FDN (~735 ns) — the worst
+voice is still ~0.33 % of the 1.33 ms deadline.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| reverb — hall                      | ~2.73 µs    | 0.21 %                 |
+| reverb — room                      | ~3.76 µs    | 0.28 %                 |
+| reverb — plate                     | ~3.46 µs    | 0.26 %                 |
+| reverb — spring                    | ~4.06 µs    | 0.31 %                 |
+| reverb — swell                     | ~3.57 µs    | 0.27 %                 |
+| reverb — bloom                     | ~3.85 µs    | 0.29 %                 |
+| reverb — cloud                     | ~3.71 µs    | 0.28 %                 |
+| reverb — chorale                   | ~3.87 µs    | 0.29 %                 |
+| reverb — shimmer                   | ~4.36 µs    | 0.33 %                 |
+| reverb — magneto                   | ~4.43 µs    | 0.33 %                 |
+| reverb — nonlinear                 | ~3.13 µs    | 0.24 %                 |
+| reverb — reflections               | ~1.97 µs    | 0.15 %                 |
+
+Hall at defaults (mod 0) skips the LFO trig; voices with mod on by default
+(room/plate upward) pay one `sin_cos` per sample distributed to all eight
+lines by phase rotation. If the reverb ever needs to shrink again, the
+candidate is a fixed-read fast path when size/mod are settled at neutral —
+rejected for now as premature (0.3 % of budget).
+
 ## 2026-07-18 (post-M8 health pass) — macOS, Apple Silicon (native)
 
 First native-hardware run. Includes the health-pass optimizations: both EQs

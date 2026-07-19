@@ -23,11 +23,20 @@ commands:
   unload nam | unload ir       remove the capture / IR
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
+  delete <name>                delete a saved preset
+  rename <old> <new>           rename a saved preset
+  copy <src> <new>             duplicate a preset under a new name
   add <family> [pos]           insert a slot (e.g. `add drive`, `add comp 0`)
   remove <slot>                remove a slot instance (e.g. `remove drive2`)
   order <slot> <slot> ...      reorder the chain (all handles, new order)
   pedal <slot> <name>          switch the slot's pedal (e.g. `pedal drive ts9`)
   set <slot>.<param> <value>   e.g. `set drive2.drive 6`, `set drive.pedal evva`
+  learn <slot>.<param>         bind the next MIDI CC to this knob
+  unlearn <slot>.<param>       clear the knob's MIDI CC binding
+  snapshot <A-D>               switch scene (morphs over `morph`)
+  snapshot save <A-D>          store the current scene into a slot
+  morph <ms>                   scene morph time, 0–2000 ms
+  spillover on|off             let delay/reverb tails ring out on switch
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -90,6 +99,7 @@ pub fn run(args: JamArgs) -> Result<()> {
             break;
         }
         session.collect_garbage();
+        session.tick_morph(Instant::now());
         for line in session.drain_midi() {
             println!("  {line}");
         }
@@ -182,6 +192,31 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 }
             }
         }
+        Some("delete") | Some("rm") => match parts.next() {
+            Some(name) if parts.next().is_none() => match session.delete_preset(name) {
+                Ok(msg) => println!("  {msg}"),
+                Err(e) => println!("  error: {e}"),
+            },
+            _ => println!("usage: delete <name>"),
+        },
+        Some("rename") => match (parts.next(), parts.next()) {
+            (Some(old), Some(new)) if parts.next().is_none() => {
+                match session.rename_preset(old, new) {
+                    Ok(msg) => println!("  {msg}"),
+                    Err(e) => println!("  error: {e}"),
+                }
+            }
+            _ => println!("usage: rename <old> <new>"),
+        },
+        Some("copy") => match (parts.next(), parts.next()) {
+            (Some(src), Some(new)) if parts.next().is_none() => {
+                match session.duplicate_preset(src, new) {
+                    Ok(msg) => println!("  {msg}"),
+                    Err(e) => println!("  error: {e}"),
+                }
+            }
+            _ => println!("usage: copy <src> <new>"),
+        },
         Some("order") => {
             let keys: Vec<String> = parts.map(str::to_string).collect();
             if keys.is_empty() {
@@ -263,7 +298,10 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     println!("usage: pedal <slot> <name>");
                 } else {
                     match session.chain.select_pedal(slot, &name) {
-                        Ok(pedal) => println!("  {slot}: {pedal}"),
+                        Ok(pedal) => {
+                            session.midi_desync_slot(slot);
+                            println!("  {slot}: {pedal}");
+                        }
                         Err(e) => println!("  error: {e}"),
                     }
                 }
@@ -287,7 +325,10 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 // label.
                 if lh_engine::is_pedal_selector(param) {
                     match session.chain.select_pedal(slot, &value) {
-                        Ok(pedal) => println!("  {slot}.pedal = {pedal}"),
+                        Ok(pedal) => {
+                            session.midi_desync_slot(slot);
+                            println!("  {slot}.pedal = {pedal}");
+                        }
                         Err(e) => println!("  error: {e}"),
                     }
                     return true;
@@ -310,12 +351,58 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 };
                 match session.chain.set_param(slot, param, v) {
                     Ok(applied) => {
+                        // The knob moved out from under a pickup-gated pedal.
+                        session.midi_desync_param(slot, param);
                         println!("  {slot}.{param} = {:.2} {}", applied.real, applied.unit)
                     }
                     Err(e) => println!("  error: {e}"),
                 }
             }
             None => println!("usage: set <slot>.<param> <value>"),
+        },
+        Some("learn") => match parts.next().and_then(|p| p.split_once('.')) {
+            Some((slot, param)) => match session.arm_midi_learn(slot, param) {
+                Ok(msg) => println!("  {msg}"),
+                Err(e) => println!("  error: {e}"),
+            },
+            None => println!("usage: learn <slot>.<param>"),
+        },
+        Some("unlearn") => match parts.next().and_then(|p| p.split_once('.')) {
+            Some((slot, param)) => match session.clear_cc_binding(slot, param) {
+                Ok(msg) => println!("  {msg}"),
+                Err(e) => println!("  error: {e}"),
+            },
+            None => println!("usage: unlearn <slot>.<param>"),
+        },
+        Some("snapshot") | Some("snap") => {
+            let arg = parts.next();
+            let result = match arg {
+                Some("save") | Some("store") => match parts.next() {
+                    Some(letter) => session.store_snapshot(letter),
+                    None => Err("usage: snapshot save <A-D>".into()),
+                },
+                Some(letter) => session.switch_snapshot(letter),
+                None => Err("usage: snapshot <A-D> | snapshot save <A-D>".into()),
+            };
+            match result {
+                Ok(msg) => println!("  {msg}"),
+                Err(e) => println!("  error: {e}"),
+            }
+        }
+        Some("morph") => match parts.next() {
+            Some(ms) => match ms.parse::<u32>() {
+                Ok(v) => println!("  {}", session.set_morph_ms(v)),
+                Err(_) => println!("  not a number: {ms}"),
+            },
+            None => println!("  morph time is {} ms", session.morph_ms()),
+        },
+        Some("spillover") => match parts.next() {
+            Some("on") => println!("  {}", session.set_spillover(true)),
+            Some("off") => println!("  {}", session.set_spillover(false)),
+            _ => println!(
+                "  spillover is {} — usage: spillover on|off",
+                if session.spillover() { "on" } else { "off" }
+            ),
         },
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }

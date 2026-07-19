@@ -68,14 +68,83 @@ pub enum Action {
     /// PC beyond the explicit list — callers may fall back to the sorted
     /// preset list at this index.
     LoadPresetIndex(u8),
-    /// A CC mapped to `slot.param`; `norm` is the 0..1 controller position.
+    /// A CC mapped to `slot.param`; `norm` is the shaped 0..1 landing
+    /// position. `pickup` asks the applier for soft-takeover: hold the
+    /// value until the controller crosses the parameter (PRD 008).
     SetParam {
         slot: String,
         param: String,
         norm: f32,
+        pickup: bool,
     },
     /// A CC mapped to a bare slot key: value ≥ 64 enables, < 64 bypasses.
     SetActive { slot: String, active: bool },
+}
+
+/// One CC assignment: the legacy bare target string, or the shaped form
+/// with a landing range, taper, and soft-takeover (PRD 008). Serde-untagged
+/// keeps old `midi.json` files (and learn-written entries) as plain strings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CcMapping {
+    /// `"slot.param"` or `"slot"` — full range, linear, no pickup.
+    Target(String),
+    Shaped(CcShape),
+}
+
+impl CcMapping {
+    /// The `"slot.param"` / `"slot"` string this mapping points at.
+    pub fn target(&self) -> &str {
+        match self {
+            CcMapping::Target(t) => t,
+            CcMapping::Shaped(s) => &s.target,
+        }
+    }
+}
+
+/// The shaped form of a CC entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CcShape {
+    pub target: String,
+    /// Normalized landing zone endpoints; `min > max` inverts the pedal.
+    #[serde(default = "shape_min_default")]
+    pub min: f32,
+    #[serde(default = "shape_max_default")]
+    pub max: f32,
+    #[serde(default)]
+    pub curve: Curve,
+    /// Soft-takeover: stay silent after a desync until the pedal sweeps
+    /// across the parameter's current value.
+    #[serde(default)]
+    pub pickup: bool,
+}
+
+fn shape_min_default() -> f32 {
+    0.0
+}
+fn shape_max_default() -> f32 {
+    1.0
+}
+
+impl CcShape {
+    /// Shape a raw 0..1 controller position into the landing zone.
+    pub fn apply(&self, raw: f32) -> f32 {
+        let curved = match self.curve {
+            Curve::Linear => raw,
+            Curve::Audio => raw * raw,
+        };
+        (self.min + (self.max - self.min) * curved).clamp(0.0, 1.0)
+    }
+}
+
+/// Controller-to-parameter taper.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Curve {
+    #[default]
+    Linear,
+    /// x² — the log-taper feel a volume pedal wants.
+    Audio,
 }
 
 /// User mapping, persisted as `~/.lion-heart/midi.json`.
@@ -85,7 +154,12 @@ pub enum Action {
 ///   "input": "FCB1010",
 ///   "channel": 1,
 ///   "pc_presets": ["lead", "rhythm"],
-///   "cc": { "11": "drive.level", "80": "gate", "81": "mod.type" }
+///   "cc": {
+///     "11": { "target": "filter.pos", "pickup": true },
+///     "7":  { "target": "amp.output", "curve": "audio" },
+///     "80": "gate",
+///     "81": "mod.type"
+///   }
 /// }
 /// ```
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -99,9 +173,9 @@ pub struct MidiMap {
     /// Program Change `n` loads the `n`-th name here (0-based).
     #[serde(default)]
     pub pc_presets: Vec<String>,
-    /// Controller number (as a JSON key) → `"slot.param"` or `"slot"`.
+    /// Controller number (as a JSON key) → target, bare or shaped.
     #[serde(default)]
-    pub cc: BTreeMap<String, String>,
+    pub cc: BTreeMap<String, CcMapping>,
 }
 
 impl MidiMap {
@@ -113,15 +187,20 @@ impl MidiMap {
         serde_json::to_string_pretty(self).expect("midi map serializes")
     }
 
-    pub fn action_for(&self, event: &MidiEvent) -> Option<Action> {
+    /// Whether an event passes the channel filter (learn listens through
+    /// the same gate the mappings do).
+    pub fn on_channel(&self, event: &MidiEvent) -> bool {
         let channel = match *event {
             MidiEvent::ProgramChange { channel, .. } | MidiEvent::ControlChange { channel, .. } => {
                 channel
             }
         };
-        if let Some(only) = self.channel
-            && channel != only.saturating_sub(1)
-        {
+        self.channel
+            .is_none_or(|only| channel == only.saturating_sub(1))
+    }
+
+    pub fn action_for(&self, event: &MidiEvent) -> Option<Action> {
+        if !self.on_channel(event) {
             return None;
         }
         match *event {
@@ -134,20 +213,58 @@ impl MidiMap {
             MidiEvent::ControlChange {
                 controller, value, ..
             } => {
-                let target = self.cc.get(&controller.to_string())?;
-                match target.split_once('.') {
-                    Some((slot, param)) => Some(Action::SetParam {
-                        slot: slot.to_string(),
-                        param: param.to_string(),
-                        norm: value as f32 / 127.0,
-                    }),
+                let mapping = self.cc.get(&controller.to_string())?;
+                let shape = match mapping {
+                    CcMapping::Target(_) => None,
+                    CcMapping::Shaped(s) => Some(s),
+                };
+                match mapping.target().split_once('.') {
+                    Some((slot, param)) => {
+                        let raw = value as f32 / 127.0;
+                        Some(Action::SetParam {
+                            slot: slot.to_string(),
+                            param: param.to_string(),
+                            norm: shape.map_or(raw, |s| s.apply(raw)),
+                            pickup: shape.is_some_and(|s| s.pickup),
+                        })
+                    }
+                    // Shaping is for continuous params; a bare-slot bypass
+                    // target keeps the value ≥ 64 rule whatever the form.
                     None => Some(Action::SetActive {
-                        slot: target.clone(),
+                        slot: mapping.target().to_string(),
                         active: value >= 64,
                     }),
                 }
             }
         }
+    }
+
+    /// The controller bound to `slot.param`, if any (GUI badges).
+    pub fn cc_for_param(&self, slot: &str, param: &str) -> Option<u8> {
+        let want = format!("{slot}.{param}");
+        self.cc.iter().find_map(|(cc, mapping)| {
+            (mapping.target() == want)
+                .then(|| cc.parse().ok())
+                .flatten()
+        })
+    }
+
+    /// Bind a controller to `slot.param` (MIDI learn writes the simple
+    /// string form); returns the target it displaced, if any.
+    pub fn bind_cc(&mut self, controller: u8, slot: &str, param: &str) -> Option<String> {
+        self.cc
+            .insert(
+                controller.to_string(),
+                CcMapping::Target(format!("{slot}.{param}")),
+            )
+            .map(|old| old.target().to_string())
+    }
+
+    /// Remove the binding for `slot.param`; returns the controller it sat on.
+    pub fn unbind_param(&mut self, slot: &str, param: &str) -> Option<u8> {
+        let controller = self.cc_for_param(slot, param)?;
+        self.cc.remove(&controller.to_string());
+        Some(controller)
     }
 }
 
@@ -277,7 +394,8 @@ mod tests {
             Some(Action::SetParam {
                 slot: "drive".into(),
                 param: "level".into(),
-                norm: 1.0
+                norm: 1.0,
+                pickup: false
             })
         );
         assert_eq!(
@@ -309,6 +427,92 @@ mod tests {
 
         let omni = MidiMap::default();
         assert!(omni.action_for(&on_ch(9)).is_some(), "omni hears all");
+    }
+
+    /// The shaped object form: range, inversion, taper, pickup (PRD 008).
+    #[test]
+    fn shaped_cc_lands_in_its_zone() {
+        let m = MidiMap::from_json(
+            r#"{
+                "cc": {
+                    "11": { "target": "filter.pos", "min": 0.25, "max": 0.75,
+                            "pickup": true },
+                    "7":  { "target": "amp.output", "curve": "audio" },
+                    "12": { "target": "mod.depth", "min": 1.0, "max": 0.0 }
+                }
+            }"#,
+        )
+        .unwrap();
+        let cc = |controller, value| MidiEvent::ControlChange {
+            channel: 0,
+            controller,
+            value,
+        };
+        // min/max bound the landing zone; pickup surfaces on the action.
+        assert_eq!(
+            m.action_for(&cc(11, 127)),
+            Some(Action::SetParam {
+                slot: "filter".into(),
+                param: "pos".into(),
+                norm: 0.75,
+                pickup: true
+            })
+        );
+        assert_eq!(
+            m.action_for(&cc(11, 0)),
+            Some(Action::SetParam {
+                slot: "filter".into(),
+                param: "pos".into(),
+                norm: 0.25,
+                pickup: true
+            })
+        );
+        // Audio taper: half travel lands at a quarter (x²).
+        let Some(Action::SetParam { norm, .. }) = m.action_for(&cc(7, 64)) else {
+            panic!("cc 7 must map");
+        };
+        assert!((norm - (64.0 / 127.0f32).powi(2)).abs() < 1e-6);
+        // min > max inverts the pedal.
+        let Some(Action::SetParam { norm, .. }) = m.action_for(&cc(12, 127)) else {
+            panic!("cc 12 must map");
+        };
+        assert_eq!(norm, 0.0);
+    }
+
+    #[test]
+    fn shaped_and_bare_entries_round_trip() {
+        let mut m = MidiMap::default();
+        m.cc.insert("80".into(), CcMapping::Target("gate".into()));
+        m.cc.insert(
+            "11".into(),
+            CcMapping::Shaped(CcShape {
+                target: "filter.pos".into(),
+                min: 0.1,
+                max: 0.9,
+                curve: Curve::Audio,
+                pickup: true,
+            }),
+        );
+        let json = m.to_json_pretty();
+        let back = MidiMap::from_json(&json).unwrap();
+        assert_eq!(back.cc, m.cc);
+        // The bare form stays a plain string on disk (old files, and the
+        // entries learn writes, keep the simple shape).
+        assert!(json.contains("\"80\": \"gate\""), "bare form: {json}");
+    }
+
+    #[test]
+    fn learn_binds_unbinds_and_reports_displacement() {
+        let mut m = map();
+        assert_eq!(m.cc_for_param("drive", "level"), Some(11));
+        assert_eq!(m.cc_for_param("filter", "pos"), None);
+        // Learning CC 11 onto a new target displaces the old one.
+        assert_eq!(m.bind_cc(11, "filter", "pos"), Some("drive.level".into()));
+        assert_eq!(m.cc_for_param("filter", "pos"), Some(11));
+        assert_eq!(m.cc_for_param("drive", "level"), None);
+        assert_eq!(m.unbind_param("filter", "pos"), Some(11));
+        assert_eq!(m.cc_for_param("filter", "pos"), None);
+        assert_eq!(m.unbind_param("filter", "pos"), None);
     }
 
     #[test]

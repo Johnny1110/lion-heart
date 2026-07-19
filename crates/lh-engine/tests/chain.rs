@@ -76,6 +76,40 @@ fn params_travel_through_the_queue() {
     assert!((clamped.real - 0.9).abs() < 1e-6);
 }
 
+/// Snapshots (PRD 009): `capture_scene` reflects the *selected* pedal's
+/// live values and the bypass flag, so a scene stored now re-applies later.
+#[test]
+fn capture_scene_reflects_selected_pedal_and_bypass() {
+    let (_chain, mut handle) = build_chain(pedalboard());
+
+    handle.set_param("drive", "drive", 7.0).unwrap();
+    handle.set_active("delay", false).unwrap();
+    let delay_time = handle.set_param("delay", "time", 350.0).unwrap().real;
+
+    let scene = handle.capture_scene();
+    // One entry per handle, keyed by handle.
+    assert_eq!(scene.slots.len(), 3);
+    assert!(scene.slots.contains_key("gate"));
+
+    let drive = &scene.slots["drive"];
+    assert!(drive.active, "drive left active");
+    assert!(
+        (drive.values["drive"] - 7.0).abs() < 1e-4,
+        "{:?}",
+        drive.values
+    );
+    // Only the selected pedal's params are captured (not the whole family).
+    assert!(
+        drive.values.contains_key("drive") && !drive.values.contains_key("gain"),
+        "captured the selected pedal's faceplate only: {:?}",
+        drive.values.keys().collect::<Vec<_>>()
+    );
+
+    let delay = &scene.slots["delay"];
+    assert!(!delay.active, "delay bypass captured");
+    assert!((delay.values["time"] - delay_time).abs() < 1e-3);
+}
+
 #[test]
 fn bypassing_everything_becomes_a_passthrough() {
     let (mut chain, mut handle) = build_chain(pedalboard());
@@ -335,7 +369,9 @@ fn preset_snapshot_applies_back_identically() {
     // A fresh chain of the same pedals, restored from the snapshot.
     let (mut chain2, mut handle2) = build_chain(pedalboard());
     chain2.prepare(SR);
-    let warnings = handle2.apply_preset_chain(&saved, &mut |_| None).unwrap();
+    let warnings = handle2
+        .apply_preset_chain(&saved, false, &mut |_| None)
+        .unwrap();
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(handle2.snapshot_chain(), saved);
 }
@@ -365,7 +401,7 @@ fn preset_apply_rebuilds_structure() {
     ];
     let mut built = 0;
     let warnings = handle
-        .apply_preset_chain(&states, &mut |key| {
+        .apply_preset_chain(&states, false, &mut |key| {
             (key == "add").then(|| {
                 built += 1;
                 Box::new(AddOne) as Box<dyn Effect>
@@ -415,9 +451,11 @@ fn pedal_selector_aliases_and_cc_norms() {
     let applied = handle.set_param("drive", "model", 1.0).unwrap();
     assert_eq!(applied.real, 1.0);
     assert_eq!(handle.active_pedal("drive").unwrap(), "bd2");
-    // A CC at full deflection lands on the last pedal.
+    // A CC at full deflection lands on the last pedal — whatever the
+    // (append-only) registry's newest entry is.
+    let last = lh_dsp::drive::FAMILY.pedals.last().unwrap().key;
     handle.select_pedal_norm("drive", 1.0).unwrap();
-    assert_eq!(handle.active_pedal("drive").unwrap(), "monster5150");
+    assert_eq!(handle.active_pedal("drive").unwrap(), last);
     assert!(handle.select_pedal("drive", "wah").is_err());
     // Display names resolve too.
     handle.select_pedal("drive", "Blues Driver").unwrap();
@@ -579,7 +617,7 @@ fn preset_apply_is_forward_compatible() {
         },
     ];
     let warnings = handle
-        .apply_preset_chain(&chain_states, &mut |_| None)
+        .apply_preset_chain(&chain_states, false, &mut |_| None)
         .unwrap();
     assert_eq!(warnings.len(), 3, "{warnings:?}"); // sparkle, wah, delay
 
@@ -588,4 +626,174 @@ fn preset_apply_is_forward_compatible() {
     assert_eq!(now[0].key, "drive");
     assert_eq!(now[0].pedals["ts9"]["drive"], 8.0);
     assert_eq!(now[1].key, "gate");
+}
+
+// --- spillover (PRD 010) --------------------------------------------------
+
+static TAIL_DESC: EffectDesc = EffectDesc {
+    key: "tail",
+    name: "Tail",
+    params: &NO_PARAMS,
+};
+static TAIL_FAMILY: FamilyDesc = FamilyDesc {
+    key: "tail",
+    name: "Tail",
+    pedals: &[&TAIL_DESC],
+};
+
+/// A deterministic tail generator for spill tests: a pure feedback resonator
+/// (`y = x + fb·y⁻¹`). Charged with an impulse, on silence it rings out at
+/// `fb` per sample. `fb = 1.0` sustains forever (a stand-in for a self-
+/// oscillating feedback delay) — the spill lane's forced decay must cap it.
+struct Tail {
+    l: f32,
+    r: f32,
+    fb: f32,
+}
+
+impl Tail {
+    fn new(fb: f32) -> Self {
+        Self { l: 0.0, r: 0.0, fb }
+    }
+}
+
+impl Effect for Tail {
+    fn family(&self) -> &'static FamilyDesc {
+        &TAIL_FAMILY
+    }
+    fn prepare(&mut self, _: u32) {}
+    fn reset(&mut self) {
+        self.l = 0.0;
+        self.r = 0.0;
+    }
+    fn set_param(&mut self, _: usize, _: f32) {}
+    fn tail_seconds(&self) -> f32 {
+        5.0
+    }
+    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+            self.l = *l + self.l * self.fb;
+            self.r = *r + self.r * self.fb;
+            *l = self.l;
+            *r = self.r;
+        }
+    }
+}
+
+/// Run `blocks` × 64 frames of silence; assert every sample stays finite and
+/// return the peak of the **final** block (the tail's current level).
+fn drain_silence(chain: &mut lh_engine::Chain, blocks: usize) -> f32 {
+    let mut last = 0.0f32;
+    for _ in 0..blocks {
+        let mut l = [0.0f32; 64];
+        let mut r = [0.0f32; 64];
+        chain.process(&mut l, &mut r);
+        last = 0.0;
+        for s in l.iter().chain(r.iter()) {
+            assert!(s.is_finite(), "spill output must stay finite");
+            last = last.max(s.abs());
+        }
+    }
+    last
+}
+
+/// Charge the chain's Tail with a single impulse so it has something to ring.
+fn charge(chain: &mut lh_engine::Chain) {
+    let mut l = [0.0f32; 64];
+    let mut r = [0.0f32; 64];
+    l[0] = 0.5;
+    r[0] = 0.5;
+    chain.process(&mut l, &mut r);
+}
+
+#[test]
+fn spilled_tail_rings_on_then_evicts() {
+    let (mut chain, mut handle) = build_chain(vec![Box::new(Tail::new(0.999))]);
+    chain.prepare(SR);
+    assert!(handle.slot_has_tail("tail"), "tail hint routes the spill");
+
+    charge(&mut chain);
+    handle.spill_slot("tail").unwrap();
+    assert!(handle.order_handles().is_empty(), "slot left the chain");
+
+    // Right after the spill the lane is still ringing on silence.
+    let early = drain_silence(&mut chain, 4);
+    assert!(
+        early > 1e-3,
+        "tail must keep sounding after the slot left: {early}"
+    );
+
+    // Given enough silence (fb 0.999 ≈ 21 ms τ → ~0.17 s to the floor, plus
+    // the 0.25 s hold) the tail decays out and the lane retires the effect.
+    let late = drain_silence(&mut chain, 500); // ~0.67 s
+    assert!(late < early, "tail must decay: {late} vs {early}");
+    assert_eq!(handle.collect_garbage(), 1, "the spent tail was retired");
+}
+
+#[test]
+fn spillover_off_path_cuts_the_tail() {
+    // The hard-remove path (what the session uses with spillover off) drops
+    // the slot at the fade bottom — no lingering tail in a lane.
+    let (mut chain, mut handle) = build_chain(vec![Box::new(Tail::new(0.999))]);
+    chain.prepare(SR);
+    charge(&mut chain);
+    handle.remove_slot("tail").unwrap();
+    // Once the master fade and the deferred removal settle, output is silent
+    // — the tail was cut, not left ringing in a lane.
+    let peak = drain_silence(&mut chain, 50);
+    assert!(
+        peak < 1e-3,
+        "hard remove must not leave a ringing tail: {peak}"
+    );
+    assert_eq!(handle.collect_garbage(), 1, "removed effect retired");
+}
+
+#[test]
+fn forced_decay_caps_a_self_oscillating_tail() {
+    // fb = 1.0 never decays on its own (a bounded self-oscillation). The
+    // lane must let it ring through the 8 s grace, then force it down.
+    let (mut chain, mut handle) = build_chain(vec![Box::new(Tail::new(1.0))]);
+    chain.prepare(SR);
+    charge(&mut chain);
+    handle.spill_slot("tail").unwrap();
+
+    let bps = SR as usize / 64;
+    // Through the grace (~7 s): still sustaining, undecayed.
+    let before = drain_silence(&mut chain, bps * 7);
+    assert!(
+        before > 0.1,
+        "must ring undecayed through the grace: {before}"
+    );
+
+    // Past the 8 s grace (out to ~12 s): forced −12 dB/s has pulled it down.
+    let after = drain_silence(&mut chain, bps * 5);
+    assert!(
+        after < before * 0.3,
+        "forced decay must pull a non-decaying tail down: {after} vs {before}"
+    );
+}
+
+#[test]
+fn lane_exhaustion_retires_the_oldest() {
+    // Five tailed slots, four lanes: spilling the fifth evicts one to fit.
+    let effects: Vec<Box<dyn Effect>> = (0..5).map(|_| Box::new(Tail::new(0.999)) as _).collect();
+    let (mut chain, mut handle) = build_chain(effects);
+    chain.prepare(SR);
+    charge(&mut chain);
+
+    assert_eq!(handle.order_handles().len(), 5);
+    // Each spill removes the front slot, so the next becomes "tail" — spill
+    // the front five times to drain the chain into the lanes.
+    for _ in 0..5 {
+        handle.spill_slot("tail").unwrap();
+    }
+    assert!(handle.order_handles().is_empty());
+    // One process call applies all five SpillSlot messages; the fifth found
+    // every lane full and retired one to make room.
+    drain_silence(&mut chain, 1);
+    assert_eq!(
+        handle.collect_garbage(),
+        1,
+        "one of five spills was evicted to make room for the rest"
+    );
 }

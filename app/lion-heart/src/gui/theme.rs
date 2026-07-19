@@ -39,6 +39,12 @@ pub const fn dim(color: Color, alpha: f32) -> Color {
 // --- pedal identity colors ---------------------------------------------------
 
 const GATE: Color = Color::from_rgb(0.60, 0.63, 0.66);
+/// Acid lime — the funk box (PRD 007; autowah wears it as the family's
+/// founding pedal).
+const FILTER: Color = Color::from_rgb(0.72, 0.83, 0.32);
+/// Chrome — the Crybaby treadle (PRD 008): the manual wah reads as
+/// hardware, not another green box.
+const WAH: Color = Color::from_rgb(0.76, 0.79, 0.84);
 const COMP: Color = Color::from_rgb(0.44, 0.64, 0.94);
 const AMP: Color = Color::from_rgb(1.0, 0.70, 0.36);
 const EQ: Color = Color::from_rgb(0.36, 0.77, 0.72);
@@ -54,6 +60,13 @@ const CENTAUR: Color = Color::from_rgb(0.86, 0.72, 0.38);
 const EVVA: Color = Color::from_rgb(0.93, 0.42, 0.58);
 const RED_CHARLIE: Color = Color::from_rgb(0.89, 0.32, 0.28);
 const MONSTER5150: Color = Color::from_rgb(0.88, 0.86, 0.82);
+/// Hot scarlet-orange: the JHS enclosure (and its red-LED clippers),
+/// deliberately hotter than the red-charlie's crimson.
+const ANGRY_CHARLIE: Color = Color::from_rgb(0.97, 0.44, 0.20);
+/// Warm bronze — the Vemuram's raw brass hardware, and a nod to the vintage
+/// Fender chime it chases. Darker and more coppery than the centaur's gold so
+/// the two transparent boosts don't read as the same box.
+const JAN_RAY: Color = Color::from_rgb(0.82, 0.60, 0.30);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -61,10 +74,40 @@ const DIGITAL: Color = Color::from_rgb(0.36, 0.72, 0.90);
 const TAPE: Color = Color::from_rgb(0.85, 0.66, 0.42);
 const VINTAGE: Color = Color::from_rgb(0.46, 0.68, 0.70);
 
+// Mod pedals (PRD 006): the box colors everyone knows where one exists —
+// Phase 90 orange, CE-x blue-gray, blonde-amp tremolo — and era-true guesses
+// for the rest (Leslie walnut, brownface brown, psychedelic vibe green).
+const MOD_CHORUS: Color = Color::from_rgb(0.62, 0.74, 0.88);
+const MOD_FLANGER: Color = Color::from_rgb(0.72, 0.62, 0.88);
+const MOD_PHASER: Color = Color::from_rgb(0.95, 0.52, 0.18);
+const MOD_TREMOLO: Color = Color::from_rgb(0.90, 0.83, 0.62);
+const MOD_VIBRATO: Color = Color::from_rgb(0.92, 0.55, 0.75);
+const MOD_HARMONIC: Color = Color::from_rgb(0.72, 0.52, 0.38);
+const MOD_ROTARY: Color = Color::from_rgb(0.62, 0.30, 0.34);
+const MOD_UNIVIBE: Color = Color::from_rgb(0.34, 0.80, 0.62);
+
+// Reverb voices (PRD 005): a mostly cool, airy family — hall wears the big
+// sky blue — with deliberate outliers for the machines that are really
+// something else in disguise (magneto's tape copper, chorale's choir gold,
+// nonlinear's alarm orange).
+const HALL: Color = Color::from_rgb(0.45, 0.71, 0.96);
+const ROOM: Color = Color::from_rgb(0.76, 0.68, 0.55);
+const PLATE: Color = Color::from_rgb(0.72, 0.76, 0.80);
+const SPRING: Color = Color::from_rgb(0.42, 0.82, 0.66);
+const SWELL: Color = Color::from_rgb(0.62, 0.50, 0.90);
+const BLOOM: Color = Color::from_rgb(0.88, 0.48, 0.78);
+const CLOUD: Color = Color::from_rgb(0.78, 0.86, 0.94);
+const CHORALE: Color = Color::from_rgb(0.90, 0.78, 0.42);
+const SHIMMER: Color = Color::from_rgb(0.55, 0.90, 0.82);
+const MAGNETO: Color = Color::from_rgb(0.80, 0.50, 0.32);
+const NONLINEAR: Color = Color::from_rgb(0.95, 0.58, 0.25);
+const REFLECTIONS: Color = Color::from_rgb(0.45, 0.60, 0.62);
+
 /// A family's signature color (chain card band, fallbacks).
 pub fn family_color(key: &str) -> Color {
     match key {
         "gate" => GATE,
+        "filter" => FILTER,
         "comp" => COMP,
         "amp" => AMP,
         "eq" => EQ,
@@ -88,13 +131,45 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "evva" => EVVA,
             "red-charlie" => RED_CHARLIE,
             "monster5150" => MONSTER5150,
+            "angry-charlie" => ANGRY_CHARLIE,
+            "jan-ray" => JAN_RAY,
             _ => ACCENT, // classic wears the house amber
+        },
+        "filter" => match pedal_key {
+            "wah" => WAH,
+            _ => FILTER, // autowah wears the family lime
+        },
+        "mod" => match pedal_key {
+            "chorus" => MOD_CHORUS,
+            "flanger" => MOD_FLANGER,
+            "phaser" => MOD_PHASER,
+            "tremolo" => MOD_TREMOLO,
+            "vibrato" => MOD_VIBRATO,
+            "harmonic" => MOD_HARMONIC,
+            "rotary" => MOD_ROTARY,
+            "univibe" => MOD_UNIVIBE,
+            _ => MODULATION,
         },
         "delay" => match pedal_key {
             "digital" => DIGITAL,
             "tape" => TAPE,
             "vintage" => VINTAGE,
             _ => DELAY,
+        },
+        "reverb" => match pedal_key {
+            "hall" => HALL,
+            "room" => ROOM,
+            "plate" => PLATE,
+            "spring" => SPRING,
+            "swell" => SWELL,
+            "bloom" => BLOOM,
+            "cloud" => CLOUD,
+            "chorale" => CHORALE,
+            "shimmer" => SHIMMER,
+            "magneto" => MAGNETO,
+            "nonlinear" => NONLINEAR,
+            "reflections" => REFLECTIONS,
+            _ => REVERB,
         },
         _ => family_color(family_key),
     }
@@ -221,6 +296,22 @@ pub fn drag_card(
     }
 }
 
+/// A preset management row: a recessed well (like [`inset`]) that frames in
+/// the accent when it is a drag's drop target, and mutes while it is the row
+/// being dragged.
+pub fn preset_row(target: bool, dragged: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_| container::Style {
+        background: Some(Background::Color(if target { PANEL_HI } else { INSET })),
+        text_color: dragged.then_some(TEXT_DIM),
+        border: Border {
+            color: if target { ACCENT } else { dim(TRACK, 0.6) },
+            width: if target { 2.0 } else { 1.0 },
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 // --- buttons -------------------------------------------------------------------
 
 fn lift(bg: Color, hovered: bool) -> Color {
@@ -229,7 +320,7 @@ fn lift(bg: Color, hovered: bool) -> Color {
             r: (bg.r + 0.035).min(1.0),
             g: (bg.g + 0.035).min(1.0),
             b: (bg.b + 0.035).min(1.0),
-            a: bg.a.max(1.0),
+            a: bg.a,
         }
     } else {
         bg
@@ -242,12 +333,14 @@ pub fn chip(lit: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
         let hovered = matches!(status, button::Status::Hovered);
         let (bg, fg, border) = if lit {
             (PANEL_HI, ACCENT, dim(ACCENT, 0.55))
+        } else if hovered {
+            (dim(PANEL_HI, 0.75), TEXT, Color::TRANSPARENT)
         } else {
             (Color::TRANSPARENT, TEXT_DIM, Color::TRANSPARENT)
         };
         button::Style {
-            background: Some(Background::Color(if lit { bg } else { lift(bg, hovered) })),
-            text_color: if hovered && !lit { TEXT } else { fg },
+            background: Some(Background::Color(bg)),
+            text_color: fg,
             border: Border {
                 color: border,
                 width: 1.0,
@@ -391,5 +484,46 @@ pub fn input(_: &Theme, status: text_input::Status) -> text_input::Style {
         placeholder: TEXT_DIM,
         value: TEXT_BRIGHT,
         selection: dim(ACCENT, 0.4),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every selectable pedal in a multi-pedal family must wear its own
+    /// livery. An unregistered pedal falls back to the family color (drive:
+    /// the house amber, worn by "classic") — so a forgotten entry shows up
+    /// here as a pairwise clash instead of silently shipping two identical
+    /// cards.
+    #[test]
+    fn every_selectable_pedal_wears_its_own_livery() {
+        let families: [&lh_core::FamilyDesc; 5] = [
+            &lh_dsp::drive::FAMILY,
+            &lh_dsp::filter::FAMILY,
+            &lh_dsp::modulation::FAMILY,
+            &lh_dsp::time::delay::FAMILY,
+            &lh_dsp::time::reverb::FAMILY,
+        ];
+        for family in families {
+            let mut seen: Vec<(&str, [u8; 3])> = Vec::new();
+            for pedal in family.pedals {
+                let c = pedal_color(family.key, pedal.key);
+                let rgb = [
+                    (c.r * 255.0).round() as u8,
+                    (c.g * 255.0).round() as u8,
+                    (c.b * 255.0).round() as u8,
+                ];
+                for (other, other_rgb) in &seen {
+                    assert_ne!(
+                        rgb, *other_rgb,
+                        "{}: pedals {:?} and {:?} share a color — register a \
+                         livery in pedal_color",
+                        family.key, pedal.key, other
+                    );
+                }
+                seen.push((pedal.key, rgb));
+            }
+        }
     }
 }

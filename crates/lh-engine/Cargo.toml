@@ -11,3 +11,10 @@ lh-core.workspace = true
 lh-dsp.workspace = true
 rtrb.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "spillover"
+harness = false

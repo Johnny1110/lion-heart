@@ -79,25 +79,28 @@ impl Browser {
             AssetKind::Ir => "load cabinet IR (.wav)",
         };
         let header = row![
-            text(title).size(14).color(theme::TEXT_BRIGHT),
+            text(title).size(15).color(theme::TEXT_BRIGHT),
             text(self.cwd.display().to_string())
                 .size(12)
                 .color(theme::TEXT_DIM)
+                .font(iced::Font::MONOSPACE)
                 .width(Length::Fill),
             button(text("close").size(12))
+                .padding([4, 12])
                 .on_press(Message::BrowserClose)
                 .style(theme::action),
         ]
         .spacing(12)
         .align_y(iced::Alignment::Center);
 
-        let mut listing = column![].spacing(2);
+        let mut listing = column![].spacing(1);
         if let Some(parent) = self.cwd.parent() {
             listing = listing.push(
                 button(text("⬑ ..").size(13).color(theme::TEXT_DIM))
                     .width(Length::Fill)
+                    .padding([5, 10])
                     .on_press(Message::BrowserNav(parent.to_path_buf()))
-                    .style(theme::chip(false)),
+                    .style(theme::list_row),
             );
         }
         if let Some(error) = &self.error {
@@ -121,14 +124,15 @@ impl Browser {
                     theme::TEXT_BRIGHT
                 }))
                 .width(Length::Fill)
+                .padding([5, 10])
                 .on_press(message)
-                .style(theme::chip(false)),
+                .style(theme::list_row),
             );
         }
 
         container(column![header, scrollable(listing).height(Length::Fill)].spacing(10))
             .style(theme::panel)
-            .padding(14)
+            .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

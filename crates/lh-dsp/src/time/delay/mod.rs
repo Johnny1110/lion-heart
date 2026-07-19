@@ -321,6 +321,13 @@ impl Effect for Delay {
         self.voice
     }
 
+    /// A delay rings: long time × high feedback can hold audible repeats
+    /// for several seconds (tape/vintage self-oscillate — bounded, ended by
+    /// the spill lane's silence/forced-decay logic, PRD 010).
+    fn tail_seconds(&self) -> f32 {
+        8.0
+    }
+
     fn select_pedal(&mut self, pedal: usize) {
         if pedal != self.voice && pedal < VOICE_COUNT {
             self.voice = pedal;

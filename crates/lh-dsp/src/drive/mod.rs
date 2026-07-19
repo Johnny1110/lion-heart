@@ -35,6 +35,7 @@ mod bd2;
 mod centaur;
 mod classic;
 mod evva;
+mod jan_ray;
 mod monster5150;
 mod red_charlie;
 mod ts9;
@@ -74,10 +75,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &red_charlie::DESC,
         &monster5150::DESC,
         &angry_charlie::DESC,
+        &jan_ray::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 8;
+pub const MODEL_COUNT: usize = 9;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -139,6 +141,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &angry_charlie::DESC,
         controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
         build: || Box::new(angry_charlie::AngryCharlie::new()),
+    },
+    ModelDef {
+        desc: &jan_ray::DESC,
+        controls: &[Ctl::Drive, Ctl::Low, Ctl::High, Ctl::Level],
+        build: || Box::new(jan_ray::JanRay::new()),
     },
 ];
 
@@ -559,6 +566,7 @@ mod tests {
         assert_eq!(captions(5), ["Gain", "Bass", "Middle", "Treble", "Master"]);
         assert_eq!(captions(6), ["Pre Gain", "Low", "Mid", "High", "Post Gain"]);
         assert_eq!(captions(7), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
+        assert_eq!(captions(8), ["Gain", "Bass", "Treble", "Volume"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -712,7 +720,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -1293,5 +1301,141 @@ mod tests {
                 "flat evva EQ must pass {freq} Hz cleanly, ratio {ratio:.3}"
             );
         }
+    }
+
+    #[test]
+    fn jan_ray_stays_dynamic_at_low_gain() {
+        // The series-diode headroom: at gain 2 the Jan Ray is a near-clean,
+        // touch-sensitive boost, barely into the clip — the transparent voice
+        // it's famous for.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(8);
+        set_pos(&mut d, 0, 2.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let residual = harmonic_residual(&y, 220.0);
+        assert!(
+            residual < 0.06,
+            "jan-ray low-gain must stay clean, got {residual:.3} residual"
+        );
+
+        // And it still breaks up when pushed.
+        let mut d = prepared(8);
+        set_pos(&mut d, 0, 9.0);
+        let pushed = harmonic_residual(&process_in_blocks(&mut d, &x, 256), 220.0);
+        assert!(
+            pushed > 2.0 * residual.max(0.01),
+            "cranked jan-ray must break up: {pushed:.3}"
+        );
+    }
+
+    #[test]
+    fn jan_ray_distorts_lows_more_evenly_than_the_ts9() {
+        // Full-range vs mid-scooped. Both pedals dirty a mid note; the
+        // question is the *low* note. Only a 70 Hz subsonic trim sits ahead of
+        // the Jan Ray's clip, so a 110 Hz note breaks up nearly as hard as an
+        // 800 Hz one — the amp-in-a-box. The ts9's 720 Hz input high-pass
+        // keeps its lows far cleaner than its mids: a much more lopsided
+        // mid-over-low distortion ratio.
+        let ratio = |model: usize| -> f64 {
+            let mut d = prepared(model);
+            // Measured at moderate gain, where the ts9's scoop is starkest:
+            // cranked, even its attenuated lows eventually distort.
+            set_pos(&mut d, 0, 4.0);
+            let lows = harmonic_residual(
+                &process_in_blocks(&mut d, &guitar(110.0, SR as usize), 256),
+                110.0,
+            );
+            d.reset();
+            let mids = harmonic_residual(
+                &process_in_blocks(&mut d, &guitar(800.0, SR as usize), 256),
+                800.0,
+            );
+            mids / lows.max(1e-6)
+        };
+        let jan = ratio(8);
+        let ts9 = ratio(0);
+        assert!(
+            ts9 > 1.5 * jan,
+            "ts9 must scoop lows harder than the jan-ray: ts9 mid/low {ts9:.2} vs jan {jan:.2}"
+        );
+    }
+
+    #[test]
+    fn jan_ray_chimes_brighter_than_its_input() {
+        // The Fender sparkle: the fixed bright pre-emphasis tilts a treble
+        // tone up relative to a low-mid tone through the (near-clean) pedal.
+        // Measured at low gain where the voicing is linear.
+        let x = tones(&[300.0, 4_000.0], SR as usize);
+        let mut d = prepared(8);
+        set_pos(&mut d, 0, 1.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let tilt_in = tone_at(&x, 4_000.0) / tone_at(&x, 300.0);
+        let tilt_out = tone_at(&y, 4_000.0) / tone_at(&y, 300.0);
+        assert!(
+            tilt_out > 1.2 * tilt_in,
+            "jan-ray chime must tilt treble up: out {tilt_out:.3} vs in {tilt_in:.3}"
+        );
+    }
+
+    #[test]
+    fn jan_ray_has_gentle_even_harmonic_warmth() {
+        // The internal bias trim, modelled as mildly uneven knees (0.95/0.80),
+        // leaves a small but real 2nd harmonic — the "tube-like" warmth — well
+        // under the strong even harmonic of the openly-asymmetric evva.
+        let x = guitar(220.0, SR as usize);
+        let h2 = |model: usize, pos: f32| -> f64 {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, pos);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, 440.0) / tone_at(&y, 220.0)
+        };
+        let jan_h2 = h2(8, 6.0);
+        assert!(
+            jan_h2 > 0.015,
+            "jan-ray bias asymmetry: expected a gentle 2nd harmonic, got {jan_h2:.4}"
+        );
+        assert!(
+            jan_h2 < h2(4, 6.0),
+            "jan-ray warmth must stay milder than the evva's strong even harmonic"
+        );
+    }
+
+    #[test]
+    fn jan_ray_tone_bands_work() {
+        // The two-band Fender tone: a 120 Hz bass shelf and a 2.8 kHz treble
+        // shelf (no mid). Same identity trick as the other post-distortion
+        // stacks — only tone knobs change between measurements.
+        let x = tones(&[70.0, 200.0, 500.0, 6_100.0], SR as usize);
+        let measure = |bass: f32, treble: f32, freq: f32| -> f64 {
+            let mut d = prepared(8);
+            set_pos(&mut d, 0, 2.0);
+            set_pos(&mut d, 1, bass);
+            set_pos(&mut d, 2, treble);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, freq)
+        };
+
+        // Bass shelf: boosting bass lifts 70 Hz relative to 500 Hz.
+        let flat_lo = measure(5.0, 5.0, 70.0) / measure(5.0, 5.0, 500.0);
+        let boosted_lo = measure(10.0, 5.0, 70.0) / measure(10.0, 5.0, 500.0);
+        assert!(
+            boosted_lo > 1.3 * flat_lo,
+            "bass boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+        );
+
+        // Treble shelf: boosting treble lifts 6.1 kHz relative to 500 Hz.
+        let flat_hi = measure(5.0, 5.0, 6_100.0) / measure(5.0, 5.0, 500.0);
+        let boosted_hi = measure(5.0, 10.0, 6_100.0) / measure(5.0, 10.0, 500.0);
+        assert!(
+            boosted_hi > 1.5 * flat_hi,
+            "treble boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
+        );
+
+        // Cut: bass at 0 thins 70 Hz — the tight, cranked setting.
+        let cut_lo = measure(0.0, 5.0, 70.0) / measure(0.0, 5.0, 500.0);
+        assert!(
+            cut_lo < 0.7 * flat_lo,
+            "bass cut: {cut_lo:.3} vs flat {flat_lo:.3}"
+        );
     }
 }

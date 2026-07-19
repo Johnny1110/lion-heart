@@ -101,6 +101,32 @@ impl Biquad {
         self.set(b, 1.0 - cos_w, b, 1.0 + alpha, -2.0 * cos_w, 1.0 - alpha);
     }
 
+    /// Bandpass (constant 0 dB peak gain) centered on `fc`; `q` sets the
+    /// bandwidth. Used for resonant coloring (e.g. vowel formants).
+    pub fn set_bandpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let (sin_w, cos_w) = w.sin_cos();
+        let alpha = sin_w / (2.0 * q);
+        self.set(alpha, 0.0, -alpha, 1.0 + alpha, -2.0 * cos_w, 1.0 - alpha);
+    }
+
+    /// Second-order allpass at `fc`: unity magnitude everywhere, maximum
+    /// group delay around `fc` (higher `q` = sharper delay peak). Cascades of
+    /// these make dispersive "chirps" (spring reverb).
+    pub fn set_allpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
+        let (sin_w, cos_w) = w.sin_cos();
+        let alpha = sin_w / (2.0 * q);
+        self.set(
+            1.0 - alpha,
+            -2.0 * cos_w,
+            1.0 + alpha,
+            1.0 + alpha,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        );
+    }
+
     /// Magnitude response at `freq` in dB, straight from the coefficients —
     /// what the GUI curve plots is exactly what the filter does.
     pub fn magnitude_db(&self, sample_rate: f32, freq: f32) -> f32 {
@@ -198,6 +224,37 @@ mod tests {
                 "{freq} Hz: analytic {analytic} vs rendered {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn bandpass_peaks_at_center_and_rejects_the_skirts() {
+        let mut f = Biquad::default();
+        f.set_bandpass(SR, 800.0, 6.0);
+        assert!(gain_at(&mut f, 800.0).abs() < 0.3, "0 dB at center");
+        f.reset();
+        assert!(gain_at(&mut f, 100.0) < -15.0);
+        f.reset();
+        assert!(gain_at(&mut f, 6_000.0) < -15.0);
+    }
+
+    #[test]
+    fn allpass_is_unity_magnitude_but_not_identity() {
+        let mut f = Biquad::default();
+        f.set_allpass(SR, 2_500.0, 3.0);
+        for freq in [200.0, 2_500.0, 9_000.0] {
+            let g = gain_at(&mut f, freq);
+            f.reset();
+            assert!(g.abs() < 0.1, "allpass must be flat at {freq} Hz, got {g}");
+        }
+        // Phase must actually turn: an impulse response that differs from a
+        // pure delta (energy spread over time = dispersion).
+        let mut x = vec![0.0f32; 256];
+        x[0] = 1.0;
+        for s in x.iter_mut() {
+            *s = f.process_sample(*s);
+        }
+        let late: f32 = x[1..].iter().map(|s| s * s).sum();
+        assert!(late > 0.1, "allpass must smear the impulse, got {late}");
     }
 
     #[test]

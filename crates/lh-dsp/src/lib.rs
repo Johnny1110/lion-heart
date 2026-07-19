@@ -12,6 +12,7 @@
 //! - [`dynamics`] — noise gate, compressor, safety limiter
 //! - [`drive`] — the overdrive/distortion pedal family (one file per pedal)
 //! - [`eq`] — the in-chain tone EQ and the global output EQ
+//! - [`filter`] — envelope-driven filters (auto-wah)
 //! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
 //! - [`time`] — delay, reverb
 //! - [`cab`] — cabinet IR convolution
@@ -23,6 +24,7 @@ pub mod cab;
 pub mod drive;
 pub mod dynamics;
 pub mod eq;
+pub mod filter;
 pub mod modulation;
 pub mod testutil;
 pub mod time;
@@ -70,4 +72,16 @@ pub trait Effect: Send {
     /// `left` and `right` are always the same length (the engine guarantees
     /// it); a mono source enters the chain duplicated onto both channels.
     fn process(&mut self, left: &mut [f32], right: &mut [f32]);
+
+    /// A conservative upper bound (seconds) on how long this effect keeps
+    /// producing audible output after its input goes silent — its tail.
+    /// `0.0` (the default) means "no tail": removing it is instantaneous.
+    /// Time-based effects (delay, reverb) override this; the control side
+    /// reads it to decide whether a removed slot should **spill** (keep
+    /// ringing in a spill lane) rather than be cut (PRD 010). It is a hint
+    /// for that decision only — the engine ends a real tail by detecting
+    /// silence, not by trusting this number.
+    fn tail_seconds(&self) -> f32 {
+        0.0
+    }
 }

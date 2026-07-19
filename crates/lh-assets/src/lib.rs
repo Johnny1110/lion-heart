@@ -160,10 +160,18 @@ pub fn presets_dir() -> Option<std::path::PathBuf> {
     app_dir().map(|d| d.join("presets"))
 }
 
-/// Sorted preset names on disk (empty when none). The sort order is part of
-/// the contract: PC `n` and the plugin's preset parameter address the n-th
-/// entry of exactly this list.
+/// Preset names on disk in display order (empty when none). The order is part
+/// of a cross-binary contract — PC `n` and the plugin's preset parameter
+/// address the n-th entry of exactly this list. It is the user's custom
+/// arrangement from [`preset_order_path`] where present, with any unlisted
+/// presets (e.g. freshly saved ones) sorted in alphabetically after it — so
+/// the result is always deterministic and shared by the app and the plugin.
 pub fn list_presets() -> Vec<String> {
+    apply_preset_order(scan_preset_files(), &read_preset_order())
+}
+
+/// The raw alphabetical scan of `presets_dir` for `*.json` stems.
+fn scan_preset_files() -> Vec<String> {
     let Some(dir) = presets_dir() else {
         return Vec::new();
     };
@@ -181,6 +189,62 @@ pub fn list_presets() -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// `~/.lion-heart/preset_order`: the user's custom preset order, one name per
+/// line. Absent ⇒ plain alphabetical.
+pub fn preset_order_path() -> Option<std::path::PathBuf> {
+    app_dir().map(|d| d.join("preset_order"))
+}
+
+/// Read the saved custom order (one name per line); empty when absent.
+pub fn read_preset_order() -> Vec<String> {
+    preset_order_path()
+        .map(|path| read_order_at(&path))
+        .unwrap_or_default()
+}
+
+/// Parse an order file: one name per line, trimmed, blanks skipped; an absent
+/// or unreadable file is an empty order. Split out for unit testing.
+fn read_order_at(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persist a custom preset order (one name per line). Silently no-ops when
+/// `$HOME` is unavailable — ordering is a preference, never load-bearing.
+pub fn save_preset_order(order: &[String]) {
+    let Some(path) = preset_order_path() else {
+        return;
+    };
+    if let Some(dir) = app_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    let _ = std::fs::write(&path, order.join("\n"));
+}
+
+/// Order `names` (an alphabetical scan) by `saved`: names in `saved` come
+/// first, in saved order, skipping any that no longer exist; the rest keep
+/// their alphabetical order after. Pure — unit-testable without the disk.
+fn apply_preset_order(names: Vec<String>, saved: &[String]) -> Vec<String> {
+    let mut ordered: Vec<String> = saved
+        .iter()
+        .filter(|n| names.contains(n))
+        .cloned()
+        .collect();
+    for n in names {
+        if !ordered.contains(&n) {
+            ordered.push(n);
+        }
+    }
+    ordered
 }
 
 /// SHA-256 of a file's contents, hex-encoded — the identity presets use to
@@ -428,5 +492,33 @@ mod tests {
         let seconds = interior.len() as f64 / f64::from(sr_out);
         let freq = crossings as f64 / seconds;
         assert!((freq - 1_000.0).abs() < 10.0, "freq {freq}");
+    }
+
+    #[test]
+    fn preset_order_puts_saved_first_then_new_alphabetically() {
+        // Disk scan is alphabetical; saved order is a custom arrangement.
+        let names = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let saved = vec!["c".to_string(), "a".to_string()];
+        // Saved names first in saved order; the rest (b, d) keep alpha order.
+        assert_eq!(apply_preset_order(names, &saved), ["c", "a", "b", "d"]);
+
+        // A saved name that no longer exists is skipped.
+        let names = vec!["a".into(), "b".into()];
+        let saved = vec!["gone".to_string(), "b".to_string()];
+        assert_eq!(apply_preset_order(names, &saved), ["b", "a"]);
+
+        // No saved order ⇒ the scan order is preserved verbatim (callers pass
+        // an already-alphabetical scan, so that means alphabetical).
+        let names = vec!["b".into(), "a".into()];
+        assert_eq!(apply_preset_order(names.clone(), &[]), names);
+    }
+
+    #[test]
+    fn reads_order_file_trimming_blanks_and_missing() {
+        let path = std::env::temp_dir().join("lion-heart-order-test");
+        std::fs::write(&path, "c\n a \n\nb\n").unwrap();
+        assert_eq!(read_order_at(&path), ["c", "a", "b"]);
+        let _ = std::fs::remove_file(&path);
+        assert!(read_order_at(&path).is_empty(), "absent file ⇒ empty order");
     }
 }

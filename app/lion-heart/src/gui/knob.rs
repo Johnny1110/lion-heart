@@ -1,8 +1,8 @@
 //! The rotary knob: a ticked 270° dial whose arc glows in the owning
 //! pedal's identity color. Dragged vertically; the wheel nudges the value;
-//! double-click snaps back to the pedal's default. Name above, a recessed
-//! value readout below, all drawn in one cached canvas that only
-//! re-renders when the value changes.
+//! double-click snaps back to the pedal's default; right-click arms MIDI
+//! learn (PRD 008). Name above, a recessed value readout below, all drawn
+//! in one cached canvas that only re-renders when the value changes.
 
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,19 @@ use iced::widget::text::Alignment as TextAlign;
 use iced::{Color, Font, Pixels, Point, Radians, Rectangle, Renderer, Size, Theme, mouse};
 
 use super::Message;
-use super::theme::{INSET, PANEL_HI, TEXT_BRIGHT, TEXT_DIM, TRACK, dim};
+use super::theme::{ACCENT, INSET, PANEL_HI, TEXT_BRIGHT, TEXT_DIM, TRACK, dim};
+
+/// The knob's MIDI-binding state, worn as a corner badge. The badge is
+/// house-amber, not the pedal color: it reads as "controller", not
+/// identity.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MidiTag {
+    None,
+    /// Bound to this CC number.
+    Mapped(u8),
+    /// Armed: the next CC binds here.
+    Learning,
+}
 
 pub const WIDTH: f32 = 96.0;
 pub const HEIGHT: f32 = 128.0;
@@ -34,6 +46,7 @@ pub struct Knob<'a> {
     pub default_norm: f32,
     /// The owning pedal's identity color (arc + glow).
     pub accent: Color,
+    pub midi: MidiTag,
     pub cache: &'a canvas::Cache,
 }
 
@@ -96,6 +109,18 @@ impl canvas::Program<Message> for Knob<'_> {
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.drag.take()?;
                 Some(canvas::Action::capture())
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                // MIDI learn (PRD 008): arm this knob (or cancel, if it is
+                // already armed — the update handler toggles).
+                cursor.position_in(bounds)?;
+                Some(
+                    canvas::Action::publish(Message::MidiLearn {
+                        slot: self.slot.clone(),
+                        param: self.param.clone(),
+                    })
+                    .and_capture(),
+                )
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 cursor.position_in(bounds)?;
@@ -187,6 +212,31 @@ impl canvas::Program<Message> for Knob<'_> {
 
             // Name above, recessed value readout below.
             frame.fill_text(label(self.name.to_uppercase(), 2.0, TEXT_DIM, 11.0));
+
+            // MIDI badge in the corner: a lit dot + CC number when bound,
+            // a hollow ring + "?" while learn is armed (PRD 008).
+            let badge_dot = Point::new(frame.width() - 8.0, 16.0);
+            let badge_text_at = Point::new(frame.width() - 4.0, 2.0);
+            let badge_text = move |content: String, color: Color| canvas::Text {
+                content,
+                position: badge_text_at,
+                color,
+                size: Pixels(9.0),
+                font: Font::MONOSPACE,
+                align_x: TextAlign::Right,
+                ..canvas::Text::default()
+            };
+            match self.midi {
+                MidiTag::None => {}
+                MidiTag::Mapped(cc) => {
+                    frame.fill(&canvas::Path::circle(badge_dot, 2.5), ACCENT);
+                    frame.fill_text(badge_text(format!("{cc}"), dim(ACCENT, 0.9)));
+                }
+                MidiTag::Learning => {
+                    frame.stroke(&canvas::Path::circle(badge_dot, 3.5), stroke(ACCENT, 1.5));
+                    frame.fill_text(badge_text("?".into(), ACCENT));
+                }
+            }
             let pill = Size::new(80.0, 19.0);
             let pill_at = Point::new(center.x - pill.width / 2.0, 104.0);
             frame.fill(

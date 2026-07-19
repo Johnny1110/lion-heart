@@ -111,7 +111,9 @@ impl canvas::Program<Message> for Meters<'_> {
         let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
             let label_w = 30.0;
             let bar_w = frame.width() - label_w;
-            let bar_h = 11.0;
+            // Header meters are slim; the live view's tall canvas gets
+            // stage-readable bars.
+            let bar_h = if frame.height() > 55.0 { 22.0 } else { 11.0 };
             let mid = norm_of(MID_DB);
             let hot = norm_of(HOT_DB);
 
@@ -171,8 +173,9 @@ impl canvas::Program<Message> for Meters<'_> {
                     dim(TEXT_DIM, 0.5),
                 );
             };
+            let gap = if bar_h > 15.0 { 10.0 } else { 7.0 };
             draw_bar(4.0, "IN", self.norms.0, self.holds.0);
-            draw_bar(4.0 + bar_h + 7.0, "OUT", self.norms.1, self.holds.1);
+            draw_bar(4.0 + bar_h + gap, "OUT", self.norms.1, self.holds.1);
         });
         vec![geometry]
     }

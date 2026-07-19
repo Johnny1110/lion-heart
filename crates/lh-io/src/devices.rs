@@ -129,6 +129,37 @@ fn name_matches(name: &str, needle: &str, exact: bool) -> bool {
     }
 }
 
+/// Resolve a [`select`]-style spec against an [`enumerate`] snapshot without
+/// touching the backend: the name of the device `select` would pick, or
+/// `None` when nothing matches (or when `spec` is `None` — the system
+/// default is a policy, not a name). Lets a UI preselect the device a saved
+/// spec refers to, and fall back gracefully when it is unplugged.
+pub fn resolve_name(devices: &[DeviceDesc], spec: Option<&str>, dir: Direction) -> Option<String> {
+    let spec = spec?;
+    let has_port = |d: &&DeviceDesc| match dir {
+        Direction::Input => d.input.is_some(),
+        Direction::Output => d.output.is_some(),
+    };
+    if let Ok(index) = spec.parse::<usize>() {
+        return devices
+            .iter()
+            .filter(has_port)
+            .find(|d| d.index == index)
+            .map(|d| d.name.clone());
+    }
+    let needle = spec.to_lowercase();
+    for exact in [true, false] {
+        if let Some(found) = devices
+            .iter()
+            .filter(has_port)
+            .find(|d| name_matches(&d.name, &needle, exact))
+        {
+            return Some(found.name.clone());
+        }
+    }
+    None
+}
+
 fn supports(device: &cpal::Device, dir: Direction) -> bool {
     match dir {
         Direction::Input => device.supports_input(),
@@ -198,5 +229,51 @@ mod tests {
         assert_eq!(pick(&names, "scarlett"), Some(0));
         assert_eq!(pick(&names, "2i2 usb"), Some(0));
         assert_eq!(pick(&names, "umc"), None);
+    }
+
+    fn desc(index: usize, name: &str, ins: bool, outs: bool) -> DeviceDesc {
+        let port = || PortDesc {
+            channels: 2,
+            default_rate: 48_000,
+            min_rate: 44_100,
+            max_rate: 96_000,
+            sample_format: "f32".into(),
+            buffer_range: None,
+        };
+        DeviceDesc {
+            index,
+            name: name.into(),
+            is_default_input: false,
+            is_default_output: false,
+            input: ins.then(port),
+            output: outs.then(port),
+        }
+    }
+
+    #[test]
+    fn resolve_name_mirrors_select_over_a_snapshot() {
+        let devices = [
+            desc(0, "Built-in Microphone", true, false),
+            desc(1, "Built-in Output", false, true),
+            desc(2, "Scarlett 2i2 USB", true, true),
+        ];
+        // Substring + direction awareness.
+        assert_eq!(
+            resolve_name(&devices, Some("scarlett"), Direction::Input).as_deref(),
+            Some("Scarlett 2i2 USB")
+        );
+        assert_eq!(
+            resolve_name(&devices, Some("built-in"), Direction::Output).as_deref(),
+            Some("Built-in Output")
+        );
+        // Index selectors respect the port direction too.
+        assert_eq!(
+            resolve_name(&devices, Some("2"), Direction::Output).as_deref(),
+            Some("Scarlett 2i2 USB")
+        );
+        assert_eq!(resolve_name(&devices, Some("1"), Direction::Input), None);
+        // The unplugged interface and the default policy resolve to nothing.
+        assert_eq!(resolve_name(&devices, Some("umc"), Direction::Input), None);
+        assert_eq!(resolve_name(&devices, None, Direction::Input), None);
     }
 }

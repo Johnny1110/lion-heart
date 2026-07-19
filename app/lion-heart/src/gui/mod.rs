@@ -34,7 +34,10 @@ use lh_io::devices::DeviceDesc;
 
 use crate::cli::GuiArgs;
 pub use crate::session::AssetKind;
-use crate::session::{FAMILY_REGISTRY, Session, SessionOpts, list_presets, load_config};
+use crate::session::{
+    FAMILY_REGISTRY, PresetInfo, Session, SessionOpts, list_presets, load_config, preset_info,
+    save_preset_order,
+};
 use browser::Browser;
 use eq::EqPanel;
 use lh_core::global_eq::{Band, BandKind};
@@ -96,6 +99,23 @@ pub enum Message {
         param: String,
         norm: f32,
     },
+    /// Right-click on a knob: arm MIDI learn for it (or cancel, when it is
+    /// the armed one) — the next CC binds and persists (PRD 008).
+    MidiLearn {
+        slot: String,
+        param: String,
+    },
+    MidiLearnCancel,
+    /// Clear the armed knob's CC binding (banner button).
+    MidiClearBinding {
+        slot: String,
+        param: String,
+    },
+    /// Click a snapshot chip (PRD 009): switch to it if populated, else
+    /// store the current scene into it.
+    SnapshotChip(String),
+    /// The ⤓ button: (over)write the active scene from the live board.
+    SnapshotStore(String),
     /// Tap-tempo button on a delay faceplate (PRD 004): each press is timed
     /// on arrival; two-plus in rhythm set the delay time.
     TapTempo(String),
@@ -124,11 +144,50 @@ pub enum Message {
     SettingsChannel(u16),
     SettingsBuffer(BufferChoice),
     /// Restart the audio session with the draft settings (handled at the
-    /// [`App`] level: the running state is consumed and rebuilt).
+    /// [`App`] level: the running state is consumed and rebuilt). On the
+    /// setup screen this is the "start audio" button.
     SettingsApply,
+    /// Re-enumerate devices on the setup screen (interface plugged in
+    /// after launch).
+    SetupRescan,
     PresetNameChanged(String),
     SavePreset,
     LoadPreset(String),
+    /// Preset management page (opened from the preset bar's "manage" button):
+    /// list / save-as / load / rename / duplicate / delete.
+    Preset(PresetMsg),
+}
+
+/// Messages for the preset management page. Nested under [`Message::Preset`]
+/// to keep the whole CRUD surface in one place rather than a dozen flat
+/// variants.
+#[derive(Debug, Clone)]
+pub enum PresetMsg {
+    /// Open the management page (loads the on-disk digest).
+    Open,
+    /// Close it, back to the board.
+    Close,
+    /// The "save current board as…" field.
+    NewNameChanged(String),
+    SaveNew,
+    /// Row press/hover/release for the click-to-load, drag-to-reorder gesture
+    /// (same disambiguation the chain strip uses: release on the same row is a
+    /// click → load; release on another row is a drag → reorder).
+    RowPress(usize),
+    RowEnter(usize),
+    RowExit(usize),
+    RowRelease(usize),
+    /// Start a rename / duplicate edit on a row (seeds the input field).
+    BeginRename(String),
+    BeginDuplicate(String),
+    /// The in-flight rename/duplicate input.
+    EditChanged(String),
+    CommitEdit,
+    CancelEdit,
+    /// Ask for / carry out / abandon a delete confirmation on a row.
+    AskDelete(String),
+    ConfirmDelete,
+    CancelDelete,
 }
 
 /// The view tabs in the header, in display order.
@@ -153,6 +212,50 @@ enum View {
     Browser(Browser),
     /// Audio I/O settings: devices, input channel, buffer size.
     Settings(SettingsDraft),
+    /// Preset management: list every saved preset with CRUD + duplicate.
+    Presets(PresetManager),
+}
+
+/// State for the preset management page (opened from the preset bar). Owns a
+/// digest of every preset on disk plus one in-flight edit — a rename or
+/// duplicate input, or a delete confirmation — and is rebuilt after every
+/// mutation.
+struct PresetManager {
+    items: Vec<PresetInfo>,
+    /// The "save current board as…" field.
+    new_name: String,
+    /// At most one row is mid-edit at a time.
+    pending: Option<PendingEdit>,
+    /// A row drag in progress (reuses the chain strip's [`DragState`]): press
+    /// a row to start, release on itself to load it, on another to reorder.
+    drag: Option<DragState>,
+}
+
+/// The single in-flight management action, if any. `target` is the preset the
+/// action applies to; `input` is the new-name field for rename/duplicate.
+enum PendingEdit {
+    Rename { target: String, input: String },
+    Duplicate { target: String, input: String },
+    Delete { target: String },
+}
+
+impl PresetManager {
+    /// Build the page state from the current on-disk preset set.
+    fn load() -> Self {
+        Self {
+            items: list_presets().iter().map(|n| preset_info(n)).collect(),
+            new_name: String::new(),
+            pending: None,
+            drag: None,
+        }
+    }
+
+    /// Re-read the digests after a mutation, dropping any in-flight edit/drag.
+    fn reload(&mut self) {
+        self.items = list_presets().iter().map(|n| preset_info(n)).collect();
+        self.pending = None;
+        self.drag = None;
+    }
 }
 
 /// A device selection in the settings panel.
@@ -311,6 +414,91 @@ impl SettingsDraft {
     }
 }
 
+/// The device / channel / buffer rows shared by the running settings panel
+/// and the audio-down setup screen.
+fn draft_controls<'a>(draft: &'a SettingsDraft) -> iced::widget::Column<'a, Message> {
+    let label = |s: &'static str| {
+        text(s)
+            .size(13)
+            .color(theme::TEXT_DIM)
+            .width(Length::Fixed(64.0))
+    };
+    let caps = |desc: Option<&DeviceDesc>,
+                dir: fn(&DeviceDesc) -> Option<&lh_io::devices::PortDesc>| {
+        desc.and_then(dir)
+            .map(|p| {
+                let buffers = match p.buffer_range {
+                    Some((min, max)) => format!(" · buffer {min}–{max}"),
+                    None => String::new(),
+                };
+                format!("{} ch @ {} Hz{}", p.channels, p.default_rate, buffers)
+            })
+            .unwrap_or_default()
+    };
+    let pick_row = |name, list, element: Element<'a, Message>| {
+        row![
+            label(name),
+            element,
+            text(list).size(12).color(theme::TEXT_DIM)
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center)
+    };
+
+    let input = pick_list(
+        draft.input_options(),
+        Some(draft.input.clone()),
+        Message::SettingsInput,
+    )
+    .style(theme::pick)
+    .menu_style(theme::menu)
+    .text_size(13)
+    .width(Length::Fixed(320.0));
+    let output = pick_list(
+        draft.output_options(),
+        Some(draft.output.clone()),
+        Message::SettingsOutput,
+    )
+    .style(theme::pick)
+    .menu_style(theme::menu)
+    .text_size(13)
+    .width(Length::Fixed(320.0));
+    let channel = pick_list(
+        draft.channel_options(),
+        Some(draft.in_channel),
+        Message::SettingsChannel,
+    )
+    .style(theme::pick)
+    .menu_style(theme::menu)
+    .text_size(13)
+    .width(Length::Fixed(90.0));
+    let buffer = pick_list(
+        draft.buffer_options(),
+        Some(draft.buffer),
+        Message::SettingsBuffer,
+    )
+    .style(theme::pick)
+    .menu_style(theme::menu)
+    .text_size(13)
+    .width(Length::Fixed(180.0));
+
+    column![
+        pick_row(
+            "input",
+            caps(draft.input_desc(), |d| d.input.as_ref()),
+            input.into()
+        ),
+        pick_row("channel", String::new(), channel.into()),
+        pick_row(
+            "output",
+            caps(draft.output_desc(), |d| d.output.as_ref()),
+            output.into()
+        ),
+        pick_row("buffer", String::new(), buffer.into()),
+    ]
+    .spacing(12)
+}
+
 /// One chain slot as the UI sees it, rebuilt from the engine snapshot.
 struct SlotUi {
     /// Instance handle ("drive", "drive2", …) — the engine address.
@@ -359,8 +547,163 @@ struct ParamUi {
 
 enum App {
     Running(Box<Running>),
-    /// Audio startup failed: show the error and the known fixes.
-    Failed(String),
+    /// Audio is not running (the saved interface is unplugged, startup
+    /// failed, or a settings apply lost both configurations). The window
+    /// stays up with a device picker so audio can be brought up without
+    /// relaunching.
+    Setup(Box<Setup>),
+}
+
+/// The audio-down state: why the stream is not running plus a device draft
+/// to try again with. Applying here deliberately does **not** persist to
+/// config.json — the saved preference (the usual interface) must win again
+/// on the next launch; a temporary session on built-in devices is not a
+/// change of setup. Persistent changes belong to the settings panel of a
+/// running session.
+struct Setup {
+    error: String,
+    draft: SettingsDraft,
+    /// The options of the failed attempt; draft edits apply on top (gain,
+    /// prefill, MIDI, and taps all carry over).
+    opts: SessionOpts,
+    /// Preset to load once audio comes up (CLI override or the session's
+    /// last active one).
+    preset: Option<String>,
+}
+
+impl Setup {
+    fn new(error: String, opts: SessionOpts, preset: Option<String>) -> Self {
+        let devices = lh_io::devices::enumerate().unwrap_or_default();
+        // Preselect whatever the failed spec still resolves to; anything
+        // missing (the unplugged interface) falls back to system default,
+        // so a plain "start audio" always means something sensible.
+        let resolved_in = lh_io::devices::resolve_name(
+            &devices,
+            opts.input.as_deref(),
+            lh_io::devices::Direction::Input,
+        );
+        let resolved_out = lh_io::devices::resolve_name(
+            &devices,
+            opts.output.as_deref(),
+            lh_io::devices::Direction::Output,
+        );
+        let probe = SessionOpts {
+            input: resolved_in.clone(),
+            output: resolved_out.clone(),
+            ..opts.clone()
+        };
+        let mut draft = SettingsDraft::with_devices(
+            devices,
+            &probe,
+            resolved_in.as_deref().unwrap_or(""),
+            resolved_out.as_deref().unwrap_or(""),
+        );
+        if draft.in_channel > draft.input_channels() {
+            draft.in_channel = 1;
+        }
+        Self {
+            error,
+            draft,
+            opts,
+            preset,
+        }
+    }
+
+    /// Momentary value for `mem::replace` while a restart consumes the
+    /// running state; never rendered.
+    fn placeholder() -> Box<Self> {
+        let opts = SessionOpts {
+            input: None,
+            output: None,
+            sample_rate: 0,
+            buffer: None,
+            in_channel: 1,
+            gain_db: 0.0,
+            prefill_blocks: 1,
+            tuner_tap: false,
+            spectrum_tap: false,
+            midi_port: None,
+        };
+        Box::new(Self {
+            error: String::new(),
+            draft: SettingsDraft::with_devices(Vec::new(), &opts, "", ""),
+            opts,
+            preset: None,
+        })
+    }
+
+    /// Fresh device list, keeping the current choices where they survive.
+    fn rescan(&mut self) {
+        self.draft.devices = lh_io::devices::enumerate().unwrap_or_default();
+        if self.draft.in_channel > self.draft.input_channels() {
+            self.draft.in_channel = 1;
+        }
+    }
+
+    /// Draft edits; everything session-bound is inert here.
+    fn update(&mut self, message: Message) {
+        match message {
+            Message::SettingsInput(choice) => {
+                self.draft.input = choice;
+                if self.draft.in_channel > self.draft.input_channels() {
+                    self.draft.in_channel = 1;
+                }
+            }
+            Message::SettingsOutput(choice) => self.draft.output = choice,
+            Message::SettingsChannel(channel) => self.draft.in_channel = channel,
+            Message::SettingsBuffer(choice) => self.draft.buffer = choice,
+            Message::SetupRescan => self.rescan(),
+            _ => {}
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        container(
+            column![
+                row![
+                    text("LION").size(19).color(theme::TEXT_BRIGHT),
+                    text("-HEART").size(19).color(theme::ACCENT),
+                ],
+                text("audio is not running")
+                    .size(20)
+                    .color(theme::METER_HOT),
+                container(
+                    text(&self.error)
+                        .size(13)
+                        .color(theme::TEXT)
+                        .font(iced::Font::MONOSPACE),
+                )
+                .padding([12, 14])
+                .width(Length::Fill)
+                .style(theme::inset),
+                text("AUDIO I/O").size(11).color(theme::TEXT_DIM),
+                draft_controls(&self.draft),
+                row![
+                    button(text("start audio").size(13))
+                        .padding([6, 16])
+                        .on_press(Message::SettingsApply)
+                        .style(theme::primary),
+                    button(text("rescan devices").size(12))
+                        .padding([5, 12])
+                        .on_press(Message::SetupRescan)
+                        .style(theme::action),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+                text(
+                    "this choice is for this session only — the saved setup still \
+                     wins on the next launch (change it in settings once audio is up)"
+                )
+                .size(11)
+                .color(theme::dim(theme::TEXT_DIM, 0.9)),
+            ]
+            .spacing(14)
+            .max_width(760),
+        )
+        .center(Length::Fill)
+        .style(theme::root)
+        .into()
+    }
 }
 
 struct Running {
@@ -416,13 +759,77 @@ impl App {
             spectrum_tap: true,
             midi_port: args.midi.clone(),
         };
-        let mut session = match Session::start(&opts) {
-            Ok(session) => session,
-            Err(e) => return App::Failed(e.to_string()),
-        };
+        // No audio ⇒ no dead end: the setup screen owns recovery.
+        match Running::start(opts.clone(), args.preset.clone()) {
+            Ok(running) => App::Running(running),
+            Err(error) => App::Setup(Box::new(Setup::new(error, opts, args.preset.clone()))),
+        }
+    }
+
+    fn update(&mut self, message: Message) {
+        match message {
+            // Applying settings consumes/creates the running state (the
+            // session is torn down and rebuilt), so it is handled here at
+            // the App level for both states.
+            Message::SettingsApply => match self {
+                App::Running(_) => {
+                    let App::Running(running) =
+                        std::mem::replace(self, App::Setup(Setup::placeholder()))
+                    else {
+                        unreachable!("matched App::Running above");
+                    };
+                    *self = running.apply_settings();
+                }
+                App::Setup(setup) => {
+                    let opts = setup.draft.to_opts(&setup.opts);
+                    match Running::start(opts.clone(), setup.preset.clone()) {
+                        Ok(running) => *self = App::Running(running),
+                        Err(error) => {
+                            setup.error = error;
+                            setup.opts = opts;
+                            // The world may have changed since the last try
+                            // (that is usually *why* it failed).
+                            setup.rescan();
+                        }
+                    }
+                }
+            },
+            message => match self {
+                App::Running(running) => running.update(message),
+                App::Setup(setup) => setup.update(message),
+            },
+        }
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        match self {
+            App::Running(running) => running.view(),
+            App::Setup(setup) => setup.view(),
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        match self {
+            App::Running(_) => window::frames().map(Message::Frame),
+            App::Setup(_) => Subscription::none(),
+        }
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Dark
+    }
+}
+
+impl Running {
+    /// Start the audio session and build the running state around it —
+    /// shared by launch, the setup screen's "start audio", and (via
+    /// [`Session::resume`]) the settings apply path. `Err` is the
+    /// user-facing reason audio could not come up.
+    fn start(opts: SessionOpts, preset_override: Option<String>) -> Result<Box<Self>, String> {
+        let mut session = Session::start(&opts).map_err(|e| e.to_string())?;
 
         let mut status = format!("{} · {}", session.description(), session.midi_status);
-        if let Some(name) = session.initial_preset(args.preset.clone()) {
+        if let Some(name) = session.initial_preset(preset_override) {
             match session.load_preset(&name) {
                 Ok(lines) => {
                     for line in &lines {
@@ -468,69 +875,9 @@ impl App {
             tuner_cache: canvas::Cache::new(),
         };
         running.refresh_slots();
-        App::Running(Box::new(running))
+        Ok(Box::new(running))
     }
 
-    fn update(&mut self, message: Message) {
-        match message {
-            // Applying settings consumes the running state (the session is
-            // torn down and rebuilt), so it is handled at the App level.
-            Message::SettingsApply => {
-                if matches!(self, App::Running(_)) {
-                    let App::Running(running) =
-                        std::mem::replace(self, App::Failed("restarting audio…".into()))
-                    else {
-                        unreachable!("matched App::Running above");
-                    };
-                    *self = running.apply_settings();
-                }
-            }
-            message => {
-                if let App::Running(running) = self {
-                    running.update(message);
-                }
-            }
-        }
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        match self {
-            App::Running(running) => running.view(),
-            App::Failed(error) => container(
-                column![
-                    text("audio startup failed")
-                        .size(20)
-                        .color(theme::METER_HOT),
-                    text(error.clone())
-                        .size(14)
-                        .color(theme::TEXT_BRIGHT)
-                        .font(iced::Font::MONOSPACE),
-                    text("fix the device setup and start Lion-Heart again")
-                        .size(13)
-                        .color(theme::TEXT_DIM),
-                ]
-                .spacing(16)
-                .max_width(720),
-            )
-            .center(Length::Fill)
-            .style(theme::root)
-            .into(),
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        match self {
-            App::Running(_) => window::frames().map(Message::Frame),
-            App::Failed(_) => Subscription::none(),
-        }
-    }
-
-    fn theme(&self) -> Theme {
-        Theme::Dark
-    }
-}
-
-impl Running {
     /// Rebuild the UI mirror of the chain from the engine-side snapshot.
     fn refresh_slots(&mut self) {
         // families / handles / snapshot are all in chain order — one entry
@@ -787,6 +1134,9 @@ impl Running {
             Message::SelectPedal { slot, pedal } => {
                 match self.session.chain.select_pedal(&slot, &pedal) {
                     Ok(name) => {
+                        // The incoming pedal re-seats every param from its
+                        // shadow: pickup-gated controllers must re-engage.
+                        self.session.midi_desync_slot(&slot);
                         self.status = format!("{slot}: {name}");
                         self.refresh_slots();
                     }
@@ -803,8 +1153,13 @@ impl Running {
                     // A drag streams one message per mouse move: update the
                     // one dragged param in place instead of re-snapshotting
                     // the whole chain (and redrawing every knob) each event.
-                    Ok(applied) if !stepped => self.update_param_ui(&slot, &param, applied.real),
+                    Ok(applied) if !stepped => {
+                        // The knob moved out from under a pickup-gated pedal.
+                        self.session.midi_desync_param(&slot, &param);
+                        self.update_param_ui(&slot, &param, applied.real)
+                    }
                     Ok(_) => {
+                        self.session.midi_desync_param(&slot, &param);
                         self.refresh_slots();
                         // Flipping a delay's subdivision re-locks its echo to
                         // the last tapped tempo (PRD 004).
@@ -815,6 +1170,61 @@ impl Running {
                     Err(e) => self.status = e.to_string(),
                 }
             }
+            Message::MidiLearn { slot, param } => {
+                // Right-click toggles: arming the armed knob cancels it.
+                if self.session.midi_learn_target() == Some((slot.as_str(), param.as_str())) {
+                    self.session.cancel_midi_learn();
+                    self.status = "midi learn cancelled".into();
+                } else {
+                    match self.session.arm_midi_learn(&slot, &param) {
+                        Ok(msg) => self.status = msg,
+                        Err(e) => self.status = format!("midi learn: {e}"),
+                    }
+                }
+                for cache in &self.knob_caches {
+                    cache.clear(); // the armed badge moved
+                }
+            }
+            Message::MidiLearnCancel => {
+                if self.session.cancel_midi_learn() {
+                    self.status = "midi learn cancelled".into();
+                }
+                for cache in &self.knob_caches {
+                    cache.clear();
+                }
+            }
+            Message::MidiClearBinding { slot, param } => {
+                match self.session.clear_cc_binding(&slot, &param) {
+                    Ok(msg) => self.status = msg,
+                    Err(e) => self.status = format!("midi: {e}"),
+                }
+                self.session.cancel_midi_learn();
+                for cache in &self.knob_caches {
+                    cache.clear();
+                }
+            }
+            Message::SnapshotChip(letter) => {
+                // Populated → switch (may morph); empty → capture here.
+                let populated = self
+                    .session
+                    .snapshot_chips()
+                    .into_iter()
+                    .any(|c| c.letter == letter && c.populated);
+                let result = if populated {
+                    self.session.switch_snapshot(&letter)
+                } else {
+                    self.session.store_snapshot(&letter)
+                };
+                match result {
+                    Ok(msg) => self.status = msg,
+                    Err(e) => self.status = e,
+                }
+                self.refresh_slots();
+            }
+            Message::SnapshotStore(letter) => match self.session.store_snapshot(&letter) {
+                Ok(msg) => self.status = msg,
+                Err(e) => self.status = e,
+            },
             Message::TapTempo(slot) => self.tap(&slot, Instant::now()),
             Message::OpenBrowser(kind) => {
                 let remembered = match kind {
@@ -951,8 +1361,8 @@ impl Running {
                     draft.buffer = choice;
                 }
             }
-            // Handled at the App level; nothing to do if it ever lands here.
-            Message::SettingsApply => {}
+            // Handled at the App level / setup screen; nothing to do here.
+            Message::SettingsApply | Message::SetupRescan => {}
             Message::PresetNameChanged(name) => self.preset_name = name,
             Message::SavePreset => {
                 let name = self.preset_name.trim().to_string();
@@ -965,18 +1375,214 @@ impl Running {
                     Err(e) => self.status = format!("error: {e}"),
                 }
             }
-            Message::LoadPreset(name) => match self.session.load_preset(&name) {
-                Ok(lines) => {
-                    for line in &lines {
-                        eprintln!("{line}");
-                    }
-                    self.status = lines.last().cloned().unwrap_or_default();
-                    self.active_preset = Some(name.clone());
-                    self.preset_name = name;
-                    self.refresh_slots();
+            Message::LoadPreset(name) => self.apply_preset_load(name),
+            Message::Preset(msg) => self.update_preset(msg),
+        }
+    }
+
+    /// Load a preset by name and reflect it across the UI (shared by the
+    /// preset bar's picker and the management page).
+    fn apply_preset_load(&mut self, name: String) {
+        match self.session.load_preset(&name) {
+            Ok(lines) => {
+                for line in &lines {
+                    eprintln!("{line}");
                 }
-                Err(e) => self.status = format!("error: {e}"),
-            },
+                self.status = lines.last().cloned().unwrap_or_default();
+                self.active_preset = Some(name.clone());
+                self.preset_name = name;
+                self.refresh_slots();
+            }
+            Err(e) => self.status = format!("error: {e}"),
+        }
+    }
+
+    /// Drive the preset management page. Every disk mutation is done through
+    /// the session (so config/last-preset stay consistent), then the page's
+    /// digest is rebuilt and the preset bar's list refreshed.
+    fn update_preset(&mut self, msg: PresetMsg) {
+        match msg {
+            PresetMsg::Open => self.view = View::Presets(PresetManager::load()),
+            PresetMsg::Close => self.view = View::Board,
+            PresetMsg::RowPress(from) => {
+                if let View::Presets(pm) = &mut self.view {
+                    pm.drag = Some(DragState { from, over: None });
+                }
+            }
+            PresetMsg::RowEnter(position) => {
+                if let View::Presets(pm) = &mut self.view
+                    && let Some(drag) = &mut pm.drag
+                {
+                    drag.over = (position != drag.from).then_some(position);
+                }
+            }
+            PresetMsg::RowExit(position) => {
+                if let View::Presets(pm) = &mut self.view
+                    && let Some(drag) = &mut pm.drag
+                    && drag.over == Some(position)
+                {
+                    drag.over = None;
+                }
+            }
+            PresetMsg::RowRelease(to) => {
+                // Resolve the gesture against the current drag, then drop the
+                // view borrow before touching the session / other fields.
+                enum Gesture {
+                    Load(String),
+                    Reorder(Vec<String>),
+                    None,
+                }
+                let gesture = {
+                    let View::Presets(pm) = &mut self.view else {
+                        return;
+                    };
+                    let Some(drag) = pm.drag.take() else {
+                        return;
+                    };
+                    if drag.from >= pm.items.len() || to >= pm.items.len() {
+                        Gesture::None
+                    } else if drag.from == to {
+                        // Released where it started ⇒ a click: switch to it.
+                        Gesture::Load(pm.items[to].name.clone())
+                    } else {
+                        let item = pm.items.remove(drag.from);
+                        pm.items.insert(to, item);
+                        Gesture::Reorder(pm.items.iter().map(|i| i.name.clone()).collect())
+                    }
+                };
+                match gesture {
+                    // Load but stay on the page, so presets can be auditioned
+                    // one after another without leaving the manager.
+                    Gesture::Load(name) => self.apply_preset_load(name),
+                    Gesture::Reorder(order) => {
+                        save_preset_order(&order);
+                        self.presets = list_presets();
+                        self.status = "preset order updated".into();
+                    }
+                    Gesture::None => {}
+                }
+            }
+            PresetMsg::NewNameChanged(name) => {
+                if let View::Presets(pm) = &mut self.view {
+                    pm.new_name = name;
+                }
+            }
+            PresetMsg::SaveNew => {
+                let View::Presets(pm) = &self.view else {
+                    return;
+                };
+                let name = pm.new_name.trim().to_string();
+                match self.session.save_preset(&name) {
+                    Ok(status) => {
+                        self.status = status;
+                        self.active_preset = Some(name.clone());
+                        self.preset_name = name;
+                        self.presets = list_presets();
+                        if let View::Presets(pm) = &mut self.view {
+                            pm.new_name.clear();
+                            pm.reload();
+                        }
+                    }
+                    Err(e) => self.status = format!("error: {e}"),
+                }
+            }
+            PresetMsg::BeginRename(target) => {
+                if let View::Presets(pm) = &mut self.view {
+                    pm.pending = Some(PendingEdit::Rename {
+                        input: target.clone(),
+                        target,
+                    });
+                }
+            }
+            PresetMsg::BeginDuplicate(target) => {
+                if let View::Presets(pm) = &mut self.view {
+                    let input = format!("{target}-copy");
+                    pm.pending = Some(PendingEdit::Duplicate { target, input });
+                }
+            }
+            PresetMsg::EditChanged(text) => {
+                if let View::Presets(pm) = &mut self.view {
+                    match &mut pm.pending {
+                        Some(PendingEdit::Rename { input, .. })
+                        | Some(PendingEdit::Duplicate { input, .. }) => *input = text,
+                        _ => {}
+                    }
+                }
+            }
+            PresetMsg::CommitEdit => {
+                // Snapshot the edit (owned) before borrowing the session mutably.
+                let edit = match &self.view {
+                    View::Presets(pm) => match &pm.pending {
+                        Some(PendingEdit::Rename { target, input }) => {
+                            Some((true, target.clone(), input.trim().to_string()))
+                        }
+                        Some(PendingEdit::Duplicate { target, input }) => {
+                            Some((false, target.clone(), input.trim().to_string()))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let Some((is_rename, target, new)) = edit else {
+                    return;
+                };
+                let result = if is_rename {
+                    self.session.rename_preset(&target, &new)
+                } else {
+                    self.session.duplicate_preset(&target, &new)
+                };
+                match result {
+                    Ok(status) => {
+                        self.status = status;
+                        // A rename of the active preset carries the pointer.
+                        if is_rename && self.active_preset.as_deref() == Some(target.as_str()) {
+                            self.active_preset = Some(new.clone());
+                            self.preset_name = new;
+                        }
+                        self.presets = list_presets();
+                        if let View::Presets(pm) = &mut self.view {
+                            pm.pending = None;
+                            pm.reload();
+                        }
+                    }
+                    // Keep the editor open on error so the name can be fixed.
+                    Err(e) => self.status = format!("error: {e}"),
+                }
+            }
+            PresetMsg::CancelEdit | PresetMsg::CancelDelete => {
+                if let View::Presets(pm) = &mut self.view {
+                    pm.pending = None;
+                }
+            }
+            PresetMsg::AskDelete(target) => {
+                if let View::Presets(pm) = &mut self.view {
+                    pm.pending = Some(PendingEdit::Delete { target });
+                }
+            }
+            PresetMsg::ConfirmDelete => {
+                let target = match &self.view {
+                    View::Presets(pm) => match &pm.pending {
+                        Some(PendingEdit::Delete { target }) => target.clone(),
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                match self.session.delete_preset(&target) {
+                    Ok(status) => {
+                        self.status = status;
+                        if self.active_preset.as_deref() == Some(target.as_str()) {
+                            self.active_preset = None;
+                            self.preset_name.clear();
+                        }
+                        self.presets = list_presets();
+                        if let View::Presets(pm) = &mut self.view {
+                            pm.pending = None;
+                            pm.reload();
+                        }
+                    }
+                    Err(e) => self.status = format!("error: {e}"),
+                }
+            }
         }
     }
 
@@ -1030,6 +1636,14 @@ impl Running {
             if fresh != self.presets {
                 self.presets = fresh;
             }
+        }
+
+        // Advance a snapshot morph, then reflect its live values on the
+        // faceplate (knobs sweep with the scene change, PRD 009).
+        let morphing = self.session.is_morphing();
+        self.session.tick_morph(now);
+        if morphing {
+            self.refresh_slots();
         }
 
         // Foot controller: apply queued MIDI and mirror the result in the UI.
@@ -1128,7 +1742,8 @@ impl Running {
 
     /// Restart the audio session with the draft settings, carrying chain
     /// state and assets across. On failure the previous configuration is
-    /// restored; only when that also fails is audio truly gone (→ Failed).
+    /// restored; only when that also fails is audio truly gone — and then
+    /// the setup screen takes over instead of a dead end.
     fn apply_settings(self: Box<Self>) -> App {
         let mut this = *self;
         let View::Settings(draft) = &this.view else {
@@ -1161,9 +1776,16 @@ impl Running {
                     (session, lines, false)
                 }
                 Err(rollback) => {
-                    return App::Failed(format!(
-                        "{e}\n\nrestoring the previous configuration also failed: {rollback}"
-                    ));
+                    // The chain-state snapshot is gone with the session, but
+                    // recovery reloads the active preset, which rebuilds the
+                    // board.
+                    return App::Setup(Box::new(Setup::new(
+                        format!(
+                            "{e}\n\nrestoring the previous configuration also failed: {rollback}"
+                        ),
+                        old_opts,
+                        this.active_preset.clone(),
+                    )));
                 }
             },
         };
@@ -1298,6 +1920,12 @@ impl Running {
                 .text_size(13)
                 .width(Length::Fixed(230.0)),
                 step("▶", self.preset_neighbor(1)),
+                button(text("manage").size(12))
+                    .padding([4, 12])
+                    .on_press(Message::Preset(PresetMsg::Open))
+                    .style(theme::chip(matches!(self.view, View::Presets(_)))),
+                space().width(Length::Fixed(18.0)),
+                self.snapshot_chips_row(),
                 space().width(Length::Fill),
                 text_input("save as…", &self.preset_name)
                     .on_input(Message::PresetNameChanged)
@@ -1317,6 +1945,47 @@ impl Running {
         .width(Length::Fill)
         .style(theme::panel)
         .into()
+    }
+
+    /// The scene chips (PRD 009): A–D, click to switch (or store into an
+    /// empty one); the active scene glows, populated ones read solid and
+    /// empty ones dim, and a "*" marks unsaved drift. A ⤓ button beside the
+    /// group re-captures the active scene.
+    fn snapshot_chips_row(&self) -> Element<'_, Message> {
+        let chips = self.session.snapshot_chips();
+        let mut row = row![text("SCENE").size(11).color(theme::TEXT_DIM)]
+            .spacing(5)
+            .align_y(iced::Alignment::Center);
+        for chip in &chips {
+            let label = if chip.dirty {
+                format!("{}*", chip.letter)
+            } else {
+                chip.letter.to_string()
+            };
+            let color = if chip.active {
+                theme::ACCENT
+            } else if chip.populated {
+                theme::TEXT_BRIGHT
+            } else {
+                theme::dim(theme::TEXT_DIM, 0.7)
+            };
+            row = row.push(
+                button(text(label).size(12).color(color))
+                    .padding([3, 9])
+                    .on_press(Message::SnapshotChip(chip.letter.to_string()))
+                    .style(theme::chip(chip.active)),
+            );
+        }
+        if let Some(active) = chips.iter().find(|c| c.active && c.populated) {
+            let letter = active.letter.to_string();
+            row = row.push(
+                button(text("⤓").size(12))
+                    .padding([3, 8])
+                    .on_press(Message::SnapshotStore(letter))
+                    .style(theme::action),
+            );
+        }
+        row.into()
     }
 
     /// Families the "＋" menu offers right now (asset-mounting families stay
@@ -1432,8 +2101,258 @@ impl Running {
             View::Live => self.live_view(),
             View::Eq => self.eq_view(),
             View::Settings(draft) => self.settings_view(draft),
+            View::Presets(pm) => self.presets_view(pm),
             View::Board => self.params_panel(),
         }
+    }
+
+    /// The preset management page (opened from the preset bar). Lists every
+    /// saved preset with load / rename / duplicate / delete, plus a "save the
+    /// current board as a new preset" field. One row at a time can be mid-edit
+    /// (rename/duplicate input) or awaiting a delete confirmation.
+    fn presets_view<'a>(&self, pm: &'a PresetManager) -> Element<'a, Message> {
+        let header = row![
+            text("PRESETS").size(15).color(theme::TEXT_BRIGHT),
+            text(format!("{} saved", pm.items.len()))
+                .size(12)
+                .color(theme::TEXT_DIM),
+            space().width(Length::Fill),
+            text("click a preset to switch · drag ⠿ to reorder")
+                .size(11)
+                .color(theme::TEXT_DIM),
+            button(text("close").size(12))
+                .padding([4, 12])
+                .on_press(Message::Preset(PresetMsg::Close))
+                .style(theme::action),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
+
+        let can_save = !pm.new_name.trim().is_empty();
+        let save_new = row![
+            text("save current board as")
+                .size(12)
+                .color(theme::TEXT_DIM),
+            text_input("new name…", &pm.new_name)
+                .on_input(|s| Message::Preset(PresetMsg::NewNameChanged(s)))
+                .on_submit(Message::Preset(PresetMsg::SaveNew))
+                .style(theme::input)
+                .size(13)
+                .width(Length::Fixed(200.0)),
+            button(text("save as new").size(12))
+                .padding([4, 14])
+                .on_press_maybe(can_save.then_some(Message::Preset(PresetMsg::SaveNew)))
+                .style(theme::primary),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        let mut list = column![].spacing(6);
+        if pm.items.is_empty() {
+            list = list.push(
+                text("no presets yet — save the current board above")
+                    .size(13)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+        for (position, info) in pm.items.iter().enumerate() {
+            list =
+                list.push(self.preset_row(position, info, pm.pending.as_ref(), pm.drag.as_ref()));
+        }
+
+        let body = column![
+            header,
+            container(save_new)
+                .style(theme::inset)
+                .padding(10)
+                .width(Length::Fill),
+            scrollable(list).height(Length::Fill),
+        ]
+        .spacing(12);
+
+        container(body)
+            .style(theme::panel)
+            .padding(16)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// One management row: a draggable body (grip + identity + chain digest)
+    /// on the left, actions on the right. Pressing the body starts the
+    /// click-to-load / drag-to-reorder gesture; the action buttons sit outside
+    /// that zone so they stay independently clickable. When this row is the one
+    /// mid-edit, the right side becomes the rename/duplicate field or the
+    /// delete confirmation.
+    fn preset_row<'a>(
+        &self,
+        position: usize,
+        info: &'a PresetInfo,
+        pending: Option<&'a PendingEdit>,
+        drag: Option<&DragState>,
+    ) -> Element<'a, Message> {
+        let is_active = self.active_preset.as_deref() == Some(info.name.as_str());
+        let name_color = if is_active {
+            theme::ACCENT
+        } else {
+            theme::TEXT_BRIGHT
+        };
+        let dragged = drag.map(|d| d.from) == Some(position);
+        let target = drag.and_then(|d| d.over) == Some(position);
+
+        let mut meta = row![].spacing(6).align_y(iced::Alignment::Center);
+        if let Some(err) = &info.error {
+            meta = meta.push(text(format!("⚠ {err}")).size(11).color(theme::METER_HOT));
+        } else {
+            meta = meta.push(
+                text(info.chain.clone())
+                    .size(11)
+                    .color(theme::TEXT_DIM)
+                    .font(iced::Font::MONOSPACE),
+            );
+            if info.has_nam {
+                meta = meta.push(Self::preset_badge("NAM"));
+            }
+            if info.has_ir {
+                meta = meta.push(Self::preset_badge("IR"));
+            }
+            if info.scenes > 0 {
+                let plural = if info.scenes == 1 { "" } else { "s" };
+                meta = meta.push(Self::preset_badge(&format!(
+                    "{} scene{plural}",
+                    info.scenes
+                )));
+            }
+        }
+
+        let title = if is_active {
+            format!("{}  · active", info.name)
+        } else {
+            info.name.clone()
+        };
+        let identity = column![text(title).size(14).color(name_color), meta]
+            .spacing(3)
+            .width(Length::Fill);
+
+        // The grip + identity are the gesture zone: press to (potentially)
+        // drag, release on self to load, release elsewhere to reorder.
+        let body = mouse_area(
+            row![
+                text("⠿").size(14).color(theme::dim(theme::TEXT_DIM, 0.8)),
+                identity,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill),
+        )
+        .on_press(Message::Preset(PresetMsg::RowPress(position)));
+
+        let right: Element<'a, Message> = match pending {
+            Some(PendingEdit::Rename { target, input }) if target == &info.name => {
+                Self::edit_affordance("rename to", input)
+            }
+            Some(PendingEdit::Duplicate { target, input }) if target == &info.name => {
+                Self::edit_affordance("copy to", input)
+            }
+            Some(PendingEdit::Delete { target }) if target == &info.name => row![
+                text("delete?").size(12).color(theme::METER_HOT),
+                button(text("yes").size(12))
+                    .padding([4, 12])
+                    .on_press(Message::Preset(PresetMsg::ConfirmDelete))
+                    .style(theme::danger),
+                button(text("no").size(12))
+                    .padding([4, 10])
+                    .on_press(Message::Preset(PresetMsg::CancelDelete))
+                    .style(theme::action),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            _ => {
+                let mut actions = row![].spacing(6).align_y(iced::Alignment::Center);
+                // A broken file can only be removed — not renamed or copied
+                // (loading it is still offered via the row click, which surfaces
+                // the parse error).
+                if info.error.is_none() {
+                    actions = actions
+                        .push(Self::preset_action(
+                            "rename",
+                            PresetMsg::BeginRename(info.name.clone()),
+                        ))
+                        .push(Self::preset_action(
+                            "duplicate",
+                            PresetMsg::BeginDuplicate(info.name.clone()),
+                        ));
+                }
+                actions
+                    .push(
+                        button(text("delete").size(12))
+                            .padding([4, 12])
+                            .on_press(Message::Preset(PresetMsg::AskDelete(info.name.clone())))
+                            .style(theme::danger),
+                    )
+                    .into()
+            }
+        };
+
+        // The outer area spans the whole row, so hovering or releasing
+        // anywhere on it tracks/commits a drag; the drop target frames in the
+        // accent and the row being dragged mutes.
+        mouse_area(
+            container(
+                row![body, right]
+                    .spacing(12)
+                    .align_y(iced::Alignment::Center),
+            )
+            .style(theme::preset_row(target, dragged))
+            .padding([8, 12])
+            .width(Length::Fill),
+        )
+        .on_enter(Message::Preset(PresetMsg::RowEnter(position)))
+        .on_exit(Message::Preset(PresetMsg::RowExit(position)))
+        .on_release(Message::Preset(PresetMsg::RowRelease(position)))
+        .into()
+    }
+
+    /// The inline rename/duplicate editor: a name field plus commit/cancel.
+    fn edit_affordance<'a>(label: &'static str, input: &'a str) -> Element<'a, Message> {
+        row![
+            text(label).size(11).color(theme::TEXT_DIM),
+            text_input("name…", input)
+                .on_input(|s| Message::Preset(PresetMsg::EditChanged(s)))
+                .on_submit(Message::Preset(PresetMsg::CommitEdit))
+                .style(theme::input)
+                .size(13)
+                .width(Length::Fixed(150.0)),
+            button(text("ok").size(12))
+                .padding([4, 12])
+                .on_press(Message::Preset(PresetMsg::CommitEdit))
+                .style(theme::primary),
+            button(text("cancel").size(12))
+                .padding([4, 10])
+                .on_press(Message::Preset(PresetMsg::CancelEdit))
+                .style(theme::action),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    /// A small dim pill (NAM / IR / scene count) for the digest line.
+    fn preset_badge(label: &str) -> Element<'static, Message> {
+        container(text(label.to_string()).size(10).color(theme::TEXT_DIM))
+            .style(theme::inset)
+            .padding([1, 6])
+            .into()
+    }
+
+    /// A secondary row-action button wired to a [`PresetMsg`].
+    fn preset_action(label: &'static str, msg: PresetMsg) -> Element<'static, Message> {
+        button(text(label).size(12))
+            .padding([4, 12])
+            .on_press(Message::Preset(msg))
+            .style(theme::action)
+            .into()
     }
 
     /// Global output EQ (PRD 003): the spectrum-backed band editor plus a
@@ -1513,106 +2432,38 @@ impl Running {
     /// Audio I/O settings: pick devices/channel/buffer, apply restarts the
     /// stream (chain state and assets carry over).
     fn settings_view<'a>(&'a self, draft: &'a SettingsDraft) -> Element<'a, Message> {
-        let label = |s: &'static str| {
-            text(s)
-                .size(13)
-                .color(theme::TEXT_DIM)
-                .width(Length::Fixed(64.0))
-        };
-        let caps = |desc: Option<&DeviceDesc>,
-                    dir: fn(&DeviceDesc) -> Option<&lh_io::devices::PortDesc>| {
-            desc.and_then(dir)
-                .map(|p| {
-                    let buffers = match p.buffer_range {
-                        Some((min, max)) => format!(" · buffer {min}–{max}"),
-                        None => String::new(),
-                    };
-                    format!("{} ch @ {} Hz{}", p.channels, p.default_rate, buffers)
-                })
-                .unwrap_or_default()
-        };
-        let pick_row = |name, list, element: Element<'a, Message>| {
-            row![
-                label(name),
-                element,
-                text(list).size(12).color(theme::TEXT_DIM)
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center)
-        };
-
-        let input = pick_list(
-            draft.input_options(),
-            Some(draft.input.clone()),
-            Message::SettingsInput,
-        )
-        .style(theme::pick)
-        .menu_style(theme::menu)
-        .text_size(13)
-        .width(Length::Fixed(320.0));
-        let output = pick_list(
-            draft.output_options(),
-            Some(draft.output.clone()),
-            Message::SettingsOutput,
-        )
-        .style(theme::pick)
-        .menu_style(theme::menu)
-        .text_size(13)
-        .width(Length::Fixed(320.0));
-        let channel = pick_list(
-            draft.channel_options(),
-            Some(draft.in_channel),
-            Message::SettingsChannel,
-        )
-        .style(theme::pick)
-        .menu_style(theme::menu)
-        .text_size(13)
-        .width(Length::Fixed(90.0));
-        let buffer = pick_list(
-            draft.buffer_options(),
-            Some(draft.buffer),
-            Message::SettingsBuffer,
-        )
-        .style(theme::pick)
-        .menu_style(theme::menu)
-        .text_size(13)
-        .width(Length::Fixed(180.0));
-
         let body = column![
-            pick_row(
-                "input",
-                caps(draft.input_desc(), |d| d.input.as_ref()),
-                input.into()
-            ),
-            pick_row("channel", String::new(), channel.into()),
-            pick_row(
-                "output",
-                caps(draft.output_desc(), |d| d.output.as_ref()),
-                output.into()
-            ),
-            pick_row("buffer", String::new(), buffer.into()),
+            text("AUDIO I/O").size(11).color(theme::TEXT_DIM),
+            draft_controls(draft),
             row![
                 button(text("apply — restarts audio").size(13))
+                    .padding([6, 16])
                     .on_press(Message::SettingsApply)
-                    .style(theme::action),
+                    .style(theme::primary),
                 space().width(Length::Fill),
                 button(text("close").size(12))
+                    .padding([5, 12])
                     .on_press(Message::ToggleSettings)
                     .style(theme::action),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
-            text("running:").size(12).color(theme::TEXT_DIM),
-            text(self.session.description())
-                .size(12)
-                .color(theme::TEXT_DIM)
-                .font(iced::Font::MONOSPACE),
+            text("RUNNING").size(11).color(theme::TEXT_DIM),
+            container(
+                text(self.session.description())
+                    .size(12)
+                    .color(theme::TEXT)
+                    .font(iced::Font::MONOSPACE),
+            )
+            .padding([10, 12])
+            .width(Length::Fill)
+            .style(theme::inset),
         ]
-        .spacing(12);
+        .spacing(14);
 
         container(scrollable(body))
             .style(theme::panel)
-            .padding(14)
+            .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1788,6 +2639,9 @@ impl Running {
             );
         }
 
+        let learn_target = self.session.midi_learn_target().map(|(s, p)| {
+            (s.to_string(), p.to_string()) // owned: the borrow must not hold
+        });
         let mut knobs = row![].spacing(6);
         for (i, param) in slot
             .params
@@ -1796,6 +2650,17 @@ impl Running {
             .enumerate()
             .take(MAX_KNOBS)
         {
+            let learning = learn_target
+                .as_ref()
+                .is_some_and(|(s, p)| *s == slot.key && p == param.key);
+            let midi = if learning {
+                knob::MidiTag::Learning
+            } else {
+                match self.session.cc_binding(&slot.key, param.key) {
+                    Some(cc) => knob::MidiTag::Mapped(cc),
+                    None => knob::MidiTag::None,
+                }
+            };
             knobs = knobs.push(
                 Canvas::new(knob::Knob {
                     slot: slot.key.clone(),
@@ -1805,6 +2670,7 @@ impl Running {
                     norm: param.norm,
                     default_norm: param.default_norm,
                     accent: slot.color,
+                    midi,
                     cache: &self.knob_caches[i],
                 })
                 .width(knob::WIDTH)
@@ -1821,8 +2687,34 @@ impl Running {
             body = body.push(selectors);
         }
         body = body.push(knobs);
+        // MIDI learn banner (PRD 008): armed target, cancel, clear-binding.
+        if let Some((ls, lp)) = &learn_target {
+            let mut banner = row![
+                text(format!("MIDI learn: move a controller for {ls}.{lp}"))
+                    .size(12)
+                    .color(theme::ACCENT),
+                button(text("cancel").size(11))
+                    .padding([2, 10])
+                    .on_press(Message::MidiLearnCancel)
+                    .style(theme::action),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+            if let Some(cc) = self.session.cc_binding(ls, lp) {
+                banner = banner.push(
+                    button(text(format!("clear CC {cc}")).size(11))
+                        .padding([2, 10])
+                        .on_press(Message::MidiClearBinding {
+                            slot: ls.clone(),
+                            param: lp.clone(),
+                        })
+                        .style(theme::danger),
+                );
+            }
+            body = body.push(banner);
+        }
         body = body.push(
-            text("drag: set · wheel: nudge · double-click: default")
+            text("drag: set · wheel: nudge · double-click: default · right-click: midi learn")
                 .size(11)
                 .color(theme::dim(theme::TEXT_DIM, 0.8)),
         );

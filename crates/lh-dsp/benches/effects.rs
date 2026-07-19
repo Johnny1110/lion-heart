@@ -89,6 +89,13 @@ fn bench_effects(c: &mut Criterion) {
     comp.prepare(SR);
     bench_stereo!(group, "comp", comp, buf, buf_r);
 
+    for (index, pedal) in lh_dsp::filter::FAMILY.pedals.iter().enumerate() {
+        let mut filter = lh_dsp::filter::Filter::new();
+        filter.prepare(SR);
+        filter.select_pedal(index);
+        bench_stereo!(group, format!("filter_{}", pedal.key), filter, buf, buf_r);
+    }
+
     let mut eq = Eq::new();
     eq.prepare(SR);
     bench_stereo!(group, "eq_3band", eq, buf, buf_r);
@@ -100,9 +107,15 @@ fn bench_effects(c: &mut Criterion) {
         bench_stereo!(group, format!("mod_{}", pedal.key), modulation, buf, buf_r);
     }
 
-    let mut reverb = Reverb::new();
-    reverb.prepare(SR);
-    bench_stereo!(group, "reverb_fdn8", reverb, buf, buf_r);
+    for (index, pedal) in lh_dsp::time::reverb::FAMILY.pedals.iter().enumerate() {
+        let mut reverb = Reverb::new();
+        reverb.prepare(SR);
+        reverb.select_pedal(index);
+        for (i, p) in pedal.params.iter().enumerate() {
+            reverb.set_param(i, p.default_norm());
+        }
+        bench_stereo!(group, format!("reverb_{}", pedal.key), reverb, buf, buf_r);
+    }
 
     // The always-on output stage EQ with a representative four bands live.
     let mut global_eq = lh_dsp::eq::global::GlobalEq::new();

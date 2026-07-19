@@ -2136,6 +2136,7 @@ dependencies = [
 name = "lh-engine"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "lh-core",
  "lh-dsp",
  "rtrb",

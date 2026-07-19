@@ -16,9 +16,21 @@ pub mod preset;
 /// source of truth for "the full rig": the app's session registry and the
 /// plugin's fixed chain are both pinned to it by tests, so the two binaries
 /// cannot drift apart.
-pub const DEFAULT_CHAIN: [&str; 10] = [
-    "gate", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
+///
+/// `filter` sits before the compressor on purpose: its envelope follower
+/// feeds on playing dynamics, which the compressor exists to squash.
+pub const DEFAULT_CHAIN: [&str; 11] = [
+    "gate", "filter", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
 ];
+
+/// Whether a family's slot ships **active** on the default board. Almost
+/// everything does — their defaults are transparent (gate low, comp gentle,
+/// limiter above the music). A filter has no transparent knob position (it
+/// colors the signal wherever it sits), so it ships bypassed and lights up
+/// when the player engages it (PRD 007).
+pub fn default_active(family_key: &str) -> bool {
+    family_key != "filter"
+}
 
 /// Decibels → linear amplitude.
 pub fn db_to_lin(db: f32) -> f32 {

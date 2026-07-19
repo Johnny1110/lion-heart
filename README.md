@@ -116,6 +116,18 @@ docs/
 
 Requires stable Rust (macOS; Linux also builds, given `libasound2-dev` + `pkg-config`).
 
+The `Makefile` wraps the common flows — run `make` (or `make help`) for the list:
+
+```sh
+make install   # release build + install the `lh` launcher into ~/.cargo/bin
+make run       # launch the GUI (cargo run, release)
+make test      # workspace tests
+make check     # fmt + clippy + test — the pre-commit gate
+lh             # …then start it from anywhere
+```
+
+Or drive cargo directly:
+
 ```sh
 cargo build --release
 
@@ -138,6 +150,9 @@ cargo run -p lion-heart --release -- jam --buffer 64
 #   > off gate / on gate                # crossfaded bypass
 #   > order drive gate amp cab delay    # reorder (fades through silence)
 #   > save lead / load preset lead      # presets in ~/.lion-heart/presets/
+#   > presets / copy lead lead2         # list / duplicate a preset
+#   > rename lead2 solo / delete solo   # rename / delete a preset
+#   (the GUI's "manage" page does all this — plus click-to-load and drag-reorder)
 
 # measure round-trip latency (needs a loopback cable: interface out → in)
 cargo run -p lion-heart --release -- latency --buffer 64 --markdown

@@ -38,6 +38,7 @@ use lh_dsp::dynamics::Compressor;
 use lh_dsp::dynamics::Limiter;
 use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
+use lh_dsp::filter::Filter;
 use lh_dsp::modulation::Modulation;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
@@ -75,6 +76,7 @@ impl Default for LionHeartPlugin {
         let (cab, cab_handle) = CabIr::new();
         let effects: Vec<Box<dyn Effect>> = vec![
             Box::new(NoiseGate::new()),
+            Box::new(Filter::new()),
             Box::new(Compressor::new()),
             Box::new(Drive::new()),
             Box::new(nam_amp),
@@ -303,7 +305,13 @@ impl LionParams {
             }
             bypasses.push(SlotBypass {
                 slot: family.key,
-                param: BoolParam::new(format!("{} · Active", family.name), true),
+                // Filters ship bypassed — no transparent knob position
+                // (lh-core owns the flag, shared with the app's default
+                // board).
+                param: BoolParam::new(
+                    format!("{} · Active", family.name),
+                    lh_core::default_active(family.key),
+                ),
             });
         }
         let preset_names = Arc::new(list_presets());
@@ -538,5 +546,14 @@ mod tests {
         let plugin = LionHeartPlugin::default();
         let keys: Vec<&str> = plugin.handle.families().iter().map(|f| f.key).collect();
         assert_eq!(keys, lh_core::DEFAULT_CHAIN);
+        // The filter slot ships bypassed (PRD 007) — same flag as the app.
+        for sb in plugin.params.bypasses.iter() {
+            assert_eq!(
+                sb.param.value(),
+                lh_core::default_active(sb.slot),
+                "{} bypass default",
+                sb.slot
+            );
+        }
     }
 }

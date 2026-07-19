@@ -14,12 +14,28 @@
 //! v4 (PRD 004): the delay slot became a family (digital/tape/vintage); its
 //! lone v3 pedal `delay` is renamed to `digital`, whose faceplate is a
 //! superset of the old one — old files sound the same (a hair brighter).
+//!
+//! v5 (PRD 005): the reverb slot became a twelve-machine family; its lone v4
+//! pedal `reverb` is renamed to `hall`, whose faceplate is a superset of the
+//! old one (`decay`/`tone`/`predelay`/`mix` keep their keys, ranges, and
+//! defaults) — old files sound the same.
+//!
+//! v6 (PRD 009): a preset may carry up to four **snapshots** (A–D) — value
+//! and bypass overlays on the one board — plus the scene that was active at
+//! save time. Both fields default to empty, so a v5 file is a v6 file with
+//! no scenes: it loads and sounds identical. The version still bumps so an
+//! older build rejects a scene-bearing file outright instead of silently
+//! dropping the scenes it cannot represent.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 4;
+pub const PRESET_SCHEMA_VERSION: u32 = 6;
+
+/// Snapshot slot letters, in order (PRD 009). A preset stores at most this
+/// many scenes; the GUI shows one chip per letter.
+pub const SNAPSHOT_SLOTS: [&str; 4] = ["A", "B", "C", "D"];
 
 /// Stepped index of the "classic" model in the v2 drive registry, the target
 /// of the v1 migration. The v2→v3 migration then resolves indices through
@@ -30,7 +46,7 @@ pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
 /// pedals past index 4 postdate v2 and are unreachable from the migration).
 /// The registry lives in `lh-dsp` (which this crate cannot see); a test over
 /// there pins the two together so they cannot drift.
-pub const DRIVE_PEDALS: [&str; 8] = [
+pub const DRIVE_PEDALS: [&str; 9] = [
     "ts9",
     "bd2",
     "classic",
@@ -39,6 +55,7 @@ pub const DRIVE_PEDALS: [&str; 8] = [
     "red-charlie",
     "monster5150",
     "angry-charlie",
+    "jan-ray",
 ];
 
 /// v2 modulation type indices → v3 pedal keys, same pinning contract.
@@ -49,6 +66,26 @@ pub const MOD_PEDALS: [&str; 4] = ["chorus", "flanger", "phaser", "tremolo"];
 /// test over in `lh-dsp` pins this to `delay::FAMILY.pedals`.
 pub const DELAY_PEDALS: [&str; 3] = ["digital", "tape", "vintage"];
 
+/// The reverb family's pedal keys in registry order (PRD 005). `hall` leads
+/// because it *is* the old M5 FDN voicing: the v4→v5 migration renames the
+/// single `reverb` pedal onto it, and sparse slots (no pedal recorded)
+/// default to the family's first pedal — both paths must land on the old
+/// sound. A test in `lh-dsp` pins this to `reverb::FAMILY.pedals`.
+pub const REVERB_PEDALS: [&str; 12] = [
+    "hall",
+    "room",
+    "plate",
+    "spring",
+    "swell",
+    "bloom",
+    "cloud",
+    "chorale",
+    "shimmer",
+    "magneto",
+    "nonlinear",
+    "reflections",
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
     pub schema_version: u32,
@@ -57,6 +94,42 @@ pub struct Preset {
     pub chain: Vec<SlotState>,
     #[serde(default)]
     pub assets: PresetAssets,
+    /// Scenes (PRD 009), keyed by letter ("A".."D"); sparse. Value+bypass
+    /// overlays on `chain` — never structure. Empty in v1–v5 files.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub snapshots: BTreeMap<String, Snapshot>,
+    /// The scene active at save time; re-applied on load if it still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_snapshot: Option<String>,
+}
+
+/// One scene within a preset (PRD 009): value + bypass overrides on the
+/// preset's fixed board. Keyed by slot handle so a reorder keeps scenes
+/// aligned to the right slots. A snapshot never changes structure or pedal
+/// selection — only the selected pedal's knob values and per-slot active.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// Slot handle ("drive", "drive2", …) → the slot's scene state.
+    #[serde(default)]
+    pub slots: BTreeMap<String, SnapshotSlot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotSlot {
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// The selected pedal's param key → real value.
+    #[serde(default)]
+    pub values: BTreeMap<String, f32>,
+}
+
+impl Default for SnapshotSlot {
+    fn default() -> Self {
+        Self {
+            active: true,
+            values: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +212,9 @@ impl Preset {
         }
         if preset.schema_version < 4 {
             migrate_v3_delay_pedal(&mut preset);
+        }
+        if preset.schema_version < 5 {
+            migrate_v4_reverb_pedal(&mut preset);
         }
         preset.schema_version = PRESET_SCHEMA_VERSION;
         Ok(preset)
@@ -272,6 +348,24 @@ fn migrate_v3_delay_pedal(preset: &mut Preset) {
     }
 }
 
+/// v4 → v5 (PRD 005): the reverb slot became a multi-pedal family, so its
+/// lone v4 pedal `reverb` is renamed to the family's first pedal, `hall`.
+/// That faceplate is a superset — `decay`/`tone`/`predelay`/`mix` carry over
+/// verbatim (same keys, same ranges), the new knobs (`mod`/`size`/`lowend`)
+/// default to neutral — so old files sound the same.
+fn migrate_v4_reverb_pedal(preset: &mut Preset) {
+    const OLD: &str = "reverb";
+    let new = REVERB_PEDALS[0];
+    for slot in preset.chain.iter_mut().filter(|s| s.key == "reverb") {
+        if slot.pedal.as_deref() == Some(OLD) || slot.pedal.is_none() {
+            slot.pedal = Some(new.to_string());
+        }
+        if let Some(values) = slot.pedals.remove(OLD) {
+            slot.pedals.entry(new.to_string()).or_insert(values);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +403,8 @@ mod tests {
                 }),
                 ir: None,
             },
+            snapshots: BTreeMap::new(),
+            active_snapshot: None,
         }
     }
 
@@ -322,6 +418,51 @@ mod tests {
         assert_eq!(back.chain[1].pedals["ts9"]["drive"], 6.0);
         assert_eq!(back.chain[1].pedals["evva"]["gain"], 4.0);
         assert!(back.assets.ir.is_none());
+    }
+
+    /// v6 (PRD 009): scenes round-trip, and a scene-less preset serializes
+    /// without the snapshot fields (a v5 file stays clean bar the version).
+    #[test]
+    fn snapshots_round_trip_and_stay_optional() {
+        let mut p = sample();
+        p.snapshots.insert(
+            "A".into(),
+            Snapshot {
+                slots: BTreeMap::from([(
+                    "drive".into(),
+                    SnapshotSlot {
+                        active: true,
+                        values: BTreeMap::from([("gain".into(), 8.0)]),
+                    },
+                )]),
+            },
+        );
+        p.active_snapshot = Some("A".into());
+        let back = Preset::from_json(&p.to_json_pretty()).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.snapshots["A"].slots["drive"].values["gain"], 8.0);
+
+        // No scenes → the fields are absent from the JSON.
+        let json = sample().to_json_pretty();
+        assert!(!json.contains("snapshots"), "{json}");
+        assert!(!json.contains("active_snapshot"), "{json}");
+    }
+
+    /// A v5 file (no snapshot fields) upgrades to v6 with empty scenes and
+    /// an otherwise identical chain — old presets are untouched.
+    #[test]
+    fn v5_upgrades_to_v6_without_scenes() {
+        let v5 = r#"{
+            "schema_version": 5,
+            "name": "old",
+            "chain": [{"key": "reverb", "pedal": "hall",
+                       "pedals": {"hall": {"decay": 3.0}}}]
+        }"#;
+        let p = Preset::from_json(v5).unwrap();
+        assert_eq!(p.schema_version, 6);
+        assert!(p.snapshots.is_empty());
+        assert!(p.active_snapshot.is_none());
+        assert_eq!(p.chain[0].pedals["hall"]["decay"], 3.0);
     }
 
     #[test]
@@ -496,5 +637,69 @@ mod tests {
         let p = Preset::from_json(v4).unwrap();
         assert_eq!(p.chain[0].pedal.as_deref(), Some("tape"));
         assert_eq!(p.chain[0].pedals["tape"]["wow"], 0.4);
+    }
+
+    #[test]
+    fn v4_reverb_pedal_migrates_to_hall() {
+        // The v4 reverb slot (single `reverb` pedal) becomes the `hall`
+        // voice of the new family, its values intact under the new key.
+        let v4 = r#"{
+            "schema_version": 4,
+            "name": "wash",
+            "chain": [{"key": "reverb", "pedal": "reverb",
+                       "pedals": {"reverb": {"decay": 3.5, "tone": 4200.0,
+                                             "predelay": 60.0, "mix": 0.4}}}]
+        }"#;
+        let p = Preset::from_json(v4).unwrap();
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("hall"));
+        assert!(!slot.pedals.contains_key("reverb"), "old key renamed");
+        let h = &slot.pedals["hall"];
+        assert_eq!(h["decay"], 3.5);
+        assert_eq!(h["tone"], 4200.0);
+        assert_eq!(h["predelay"], 60.0);
+        assert_eq!(h["mix"], 0.4);
+    }
+
+    #[test]
+    fn v4_sparse_reverb_slot_selects_hall() {
+        // A bare reverb slot (no pedal, no values) still lands on hall.
+        let v4 = r#"{"schema_version": 4, "name": "s", "chain": [{"key": "reverb"}]}"#;
+        let p = Preset::from_json(v4).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("hall"));
+    }
+
+    #[test]
+    fn v3_reverb_values_migrate_through_both_hops() {
+        // v3 → v4 wraps nothing (reverb was already per-pedal keyed by the
+        // family name); v4 → v5 then renames it — one old file, two hops.
+        let v3 = r#"{
+            "schema_version": 3,
+            "name": "old wash",
+            "chain": [{"key": "reverb",
+                       "pedals": {"reverb": {"decay": 1.2, "mix": 0.25}}}]
+        }"#;
+        let p = Preset::from_json(v3).unwrap();
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("hall"));
+        assert_eq!(slot.pedals["hall"]["decay"], 1.2);
+        assert_eq!(slot.pedals["hall"]["mix"], 0.25);
+    }
+
+    #[test]
+    fn v5_reverb_slots_are_not_remapped() {
+        // Native v5: the other machines survive untouched.
+        let v5 = r#"{
+            "schema_version": 5,
+            "name": "new",
+            "chain": [{"key": "reverb", "pedal": "shimmer",
+                       "pedals": {"shimmer": {"amount": 0.6},
+                                  "spring": {"dwell": 0.4}}}]
+        }"#;
+        let p = Preset::from_json(v5).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("shimmer"));
+        assert_eq!(p.chain[0].pedals["shimmer"]["amount"], 0.6);
+        assert_eq!(p.chain[0].pedals["spring"]["dwell"], 0.4);
     }
 }
