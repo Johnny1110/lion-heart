@@ -44,7 +44,7 @@ impl Browser {
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
         match self.kind {
             AssetKind::Nam => ext.as_deref() == Some("nam"),
-            AssetKind::Ir => ext.as_deref() == Some("wav"),
+            AssetKind::Ir | AssetKind::IrB => ext.as_deref() == Some("wav"),
         }
     }
 
@@ -76,7 +76,8 @@ impl Browser {
     pub fn view(&self) -> Element<'_, Message> {
         let title = match self.kind {
             AssetKind::Nam => "load amp capture (.nam)",
-            AssetKind::Ir => "load cabinet IR (.wav)",
+            AssetKind::Ir => "load cabinet IR — mic A (.wav)",
+            AssetKind::IrB => "load blend IR — mic B (.wav)",
         };
         let header = row![
             text(title).size(15).color(theme::TEXT_BRIGHT),

@@ -67,10 +67,20 @@ pub struct AppConfig {
     /// switch or slot removal instead of being cut. On by default.
     #[serde(default = "spillover_default")]
     pub spillover: bool,
+    /// Global tempo in BPM (ADR 014): drives every effect whose `sync`
+    /// selector is locked to a note division. App-global — one tempo for the
+    /// rig, like `morph_ms`. Persisted so the tapped/typed tempo survives a
+    /// restart.
+    #[serde(default = "tempo_default")]
+    pub tempo_bpm: f32,
 }
 
 fn spillover_default() -> bool {
     true
+}
+
+fn tempo_default() -> f32 {
+    lh_core::tempo::DEFAULT_BPM
 }
 
 impl Default for AppConfig {
@@ -87,6 +97,7 @@ impl Default for AppConfig {
             in_channel: None,
             morph_ms: 0,
             spillover: spillover_default(),
+            tempo_bpm: tempo_default(),
         }
     }
 }
@@ -115,6 +126,7 @@ pub struct CarryOver {
     chain: Vec<lh_core::preset::SlotState>,
     nam: Option<AssetRef>,
     ir: Option<AssetRef>,
+    ir_b: Option<AssetRef>,
     snapshots: BTreeMap<String, lh_core::preset::Snapshot>,
     active_snapshot: Option<String>,
 }
@@ -167,6 +179,8 @@ pub struct Session {
     pub cab: AssetHandle<IrAsset>,
     pub nam_ref: Option<AssetRef>,
     pub ir_ref: Option<AssetRef>,
+    /// The cab's optional blend IR (a second mic/cabinet, ADR 015).
+    pub ir_b_ref: Option<AssetRef>,
     pub sample_rate: u32,
     pub config: AppConfig,
     runner: DuplexRunner,
@@ -277,11 +291,14 @@ impl Morph {
     }
 }
 
-/// The session asset a chain family mounts (hot-swapped off-thread).
+/// The session asset a chain family mounts (hot-swapped off-thread). `IrB` is
+/// not a family mount — it is the cab's optional blend IR (ADR 015), used by
+/// the browser/unload routing only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
     Nam,
     Ir,
+    IrB,
 }
 
 /// One buildable chain family: its descriptor (the key, display name, and
@@ -462,6 +479,7 @@ impl Session {
             cab: cab_handle,
             nam_ref: None,
             ir_ref: None,
+            ir_b_ref: None,
             sample_rate: runner.sample_rate,
             config: load_config(),
             runner,
@@ -482,6 +500,7 @@ impl Session {
             chain: self.chain.snapshot_chain(),
             nam: self.nam_ref.clone(),
             ir: self.ir_ref.clone(),
+            ir_b: self.ir_b_ref.clone(),
             snapshots: self.snapshots.clone(),
             active_snapshot: self.active_snapshot.clone(),
         }
@@ -505,7 +524,12 @@ impl Session {
         // NAM validation and IR resampling against the new stream.
         let fallback = presets_dir().unwrap_or_default();
         session.apply_asset(carry.nam.as_ref(), &fallback, AssetKind::Nam, &mut lines);
-        session.apply_asset(carry.ir.as_ref(), &fallback, AssetKind::Ir, &mut lines);
+        session.apply_cab(
+            carry.ir.as_ref(),
+            carry.ir_b.as_ref(),
+            &fallback,
+            &mut lines,
+        );
         // Scenes ride across the restart (a device change must not wipe them).
         session.snapshots = carry.snapshots.clone();
         session.active_snapshot = carry.active_snapshot.clone();
@@ -1049,6 +1073,30 @@ impl Session {
         format!("morph time {} ms", self.config.morph_ms)
     }
 
+    /// The rig's global tempo (ADR 014).
+    pub fn tempo_bpm(&self) -> f32 {
+        self.config.tempo_bpm
+    }
+
+    /// Set the global tempo (clamped to the musical range) and persist it.
+    /// Application to the locked controls happens on the next
+    /// [`Session::tick_tempo`] (the control loop runs it every tick; the REPL
+    /// calls it explicitly).
+    pub fn set_tempo_bpm(&mut self, bpm: f32) -> String {
+        self.config.tempo_bpm = lh_core::tempo::clamp_bpm(bpm);
+        save_config(&self.config);
+        format!("tempo ♩ = {:.0} bpm", self.config.tempo_bpm)
+    }
+
+    /// Re-derive every tempo-locked control from the global BPM. Called on the
+    /// control loop (GUI frame tick / REPL poll) after [`Session::tick_morph`].
+    /// Delegates to [`lh_engine::ChainHandle::apply_tempo_sync`]; returns
+    /// whether any control moved, so the GUI can refresh just the faceplate
+    /// that changed.
+    pub fn tick_tempo(&mut self) -> bool {
+        self.chain.apply_tempo_sync(self.config.tempo_bpm)
+    }
+
     /// Per-letter chip state for the GUI (PRD 009): populated, active, and
     /// (for the active one) whether the live scene has drifted from stored.
     pub fn snapshot_chips(&self) -> Vec<SnapshotChip> {
@@ -1090,13 +1138,12 @@ impl Session {
 
     /// Loaded asset file names for display, `"-"` when empty.
     pub fn asset_names(&self) -> (String, String) {
-        let name = |r: &Option<AssetRef>| {
-            r.as_ref()
-                .and_then(|a| Path::new(&a.path).file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "-".into())
-        };
-        (name(&self.nam_ref), name(&self.ir_ref))
+        (asset_name(&self.nam_ref), asset_name(&self.ir_ref))
+    }
+
+    /// The cab's blend-IR file name, or `"-"` when none is loaded (ADR 015).
+    pub fn ir_b_name(&self) -> String {
+        asset_name(&self.ir_b_ref)
     }
 
     // --- assets ---
@@ -1122,15 +1169,33 @@ impl Session {
         ))
     }
 
-    pub fn load_ir(&mut self, path: &Path) -> Result<String, String> {
-        let (asset, info) =
-            lh_assets::load_ir(path, self.sample_rate).map_err(|e| e.to_string())?;
-        if self.cab.install(asset).is_err() {
+    /// (Re)decode the cab from its current primary + blend IR refs and install
+    /// the combined asset in one hot-swap (ADR 015). Both files are re-read
+    /// (control-thread, cheap) so whichever IRs are set ride the single swap;
+    /// no primary IR clears the cab. Returns the primary IR's info for status.
+    fn rebuild_cab(&mut self) -> Result<Option<lh_assets::IrInfo>, String> {
+        let Some(a_ref) = self.ir_ref.clone() else {
+            self.cab.clear();
+            return Ok(None);
+        };
+        let (a, info) = lh_assets::load_ir_pair(Path::new(&a_ref.path), self.sample_rate)
+            .map_err(|e| e.to_string())?;
+        let b = match &self.ir_b_ref {
+            Some(b_ref) => Some(
+                lh_assets::load_ir_pair(Path::new(&b_ref.path), self.sample_rate)
+                    .map_err(|e| e.to_string())?
+                    .0,
+            ),
+            None => None,
+        };
+        if self.cab.install(Box::new(IrAsset { a, b })).is_err() {
             return Err("install queue full, try again".into());
         }
-        self.ir_ref = asset_ref_for(path);
-        self.config.ir_dir = parent_dir(path);
-        save_config(&self.config);
+        Ok(Some(info))
+    }
+
+    /// Human-readable load note for an IR (resample/trim caveats).
+    fn ir_note(path: &Path, info: &lh_assets::IrInfo) -> String {
         let mut notes = Vec::new();
         if info.resampled {
             notes.push(format!(
@@ -1146,13 +1211,95 @@ impl Session {
         } else {
             format!(" ({})", notes.join(", "))
         };
-        Ok(format!(
-            "ir: {} loaded, {} samples = {:.0} ms{}",
+        format!(
+            "{}, {} samples = {:.0} ms{}",
             file_name(path),
             info.used_samples,
             info.seconds() * 1e3,
             notes,
-        ))
+        )
+    }
+
+    /// Load the cab's **primary** IR. Any loaded blend IR is preserved and
+    /// re-installed alongside it.
+    pub fn load_ir(&mut self, path: &Path) -> Result<String, String> {
+        let prev = self.ir_ref.clone();
+        self.ir_ref = asset_ref_for(path);
+        match self.rebuild_cab() {
+            Ok(Some(info)) => {
+                self.config.ir_dir = parent_dir(path);
+                save_config(&self.config);
+                Ok(format!("ir: {} loaded", Self::ir_note(path, &info)))
+            }
+            Ok(None) => Ok("ir cleared".into()),
+            Err(e) => {
+                self.ir_ref = prev; // roll back on failure — keep the old cab
+                Err(e)
+            }
+        }
+    }
+
+    /// Load the cab's **blend** IR (a second mic/cabinet, ADR 015). Requires a
+    /// primary IR already loaded; the `blend` knob crossfades between them.
+    pub fn load_ir_b(&mut self, path: &Path) -> Result<String, String> {
+        if self.ir_ref.is_none() {
+            return Err("load a primary cab IR first, then add a blend IR".into());
+        }
+        let prev = self.ir_b_ref.clone();
+        self.ir_b_ref = asset_ref_for(path);
+        match self.rebuild_cab() {
+            Ok(_) => {
+                self.config.ir_dir = parent_dir(path);
+                save_config(&self.config);
+                Ok(format!(
+                    "ir blend: {} loaded — dial the cab `blend` knob",
+                    file_name(path)
+                ))
+            }
+            Err(e) => {
+                self.ir_b_ref = prev; // roll back on failure
+                Err(e)
+            }
+        }
+    }
+
+    /// Restore the cab from a preset / carry-over: set both IR refs (resolving
+    /// each against `fallback_dir`) and install them together. No primary IR
+    /// clears the cab; a blend IR without a primary is dropped.
+    fn apply_cab(
+        &mut self,
+        ir: Option<&AssetRef>,
+        ir_b: Option<&AssetRef>,
+        fallback_dir: &Path,
+        lines: &mut Vec<String>,
+    ) {
+        let Some(a_ref) = ir else {
+            self.unload_ir(); // clears both refs + the cab
+            return;
+        };
+        match lh_assets::resolve_asset(a_ref, Some(fallback_dir)) {
+            Ok((a_path, warnings)) => {
+                lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+                // Set the blend ref first so the primary's load installs both
+                // in one swap.
+                self.ir_b_ref =
+                    ir_b.and_then(|r| match lh_assets::resolve_asset(r, Some(fallback_dir)) {
+                        Ok((p, w)) => {
+                            lines.extend(w.into_iter().map(|w| format!("warning: {w}")));
+                            asset_ref_for(&p)
+                        }
+                        Err(e) => {
+                            lines.push(format!("error: blend ir: {e}"));
+                            None
+                        }
+                    });
+                match self.load_ir(&a_path) {
+                    Ok(msg) => lines.push(msg),
+                    Err(e) => lines.push(format!("error: {e}")),
+                }
+            }
+            Err(e) => lines.push(format!("error: {e}")),
+        }
     }
 
     /// Returns true when there was something to unload.
@@ -1164,12 +1311,22 @@ impl Session {
         had
     }
 
+    /// Unload the whole cab (both the primary and any blend IR).
     pub fn unload_ir(&mut self) -> bool {
         let had = self.cab.clear();
-        if had {
-            self.ir_ref = None;
-        }
+        self.ir_ref = None;
+        self.ir_b_ref = None;
         had
+    }
+
+    /// Unload only the blend IR, leaving the primary cab in place.
+    pub fn unload_ir_b(&mut self) -> bool {
+        if self.ir_b_ref.is_none() {
+            return false;
+        }
+        self.ir_b_ref = None;
+        let _ = self.rebuild_cab(); // reinstall the primary alone
+        true
     }
 
     // --- presets ---
@@ -1187,6 +1344,7 @@ impl Session {
             assets: PresetAssets {
                 nam: self.nam_ref.clone(),
                 ir: self.ir_ref.clone(),
+                ir_b: self.ir_b_ref.clone(),
             },
             snapshots: self.snapshots.clone(),
             active_snapshot: self.active_snapshot.clone(),
@@ -1214,7 +1372,12 @@ impl Session {
         lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
 
         self.apply_asset(preset.assets.nam.as_ref(), &dir, AssetKind::Nam, &mut lines);
-        self.apply_asset(preset.assets.ir.as_ref(), &dir, AssetKind::Ir, &mut lines);
+        self.apply_cab(
+            preset.assets.ir.as_ref(),
+            preset.assets.ir_b.as_ref(),
+            &dir,
+            &mut lines,
+        );
 
         // Scenes come with the preset (PRD 009); apply the saved active one
         // instantly (no morph on load — it re-asserts values the baseline
@@ -1257,6 +1420,7 @@ impl Session {
                     let loaded = match kind {
                         AssetKind::Nam => self.load_nam(&path),
                         AssetKind::Ir => self.load_ir(&path),
+                        AssetKind::IrB => self.load_ir_b(&path),
                     };
                     match loaded {
                         Ok(msg) => lines.push(msg),
@@ -1269,6 +1433,7 @@ impl Session {
                 match kind {
                     AssetKind::Nam => self.unload_nam(),
                     AssetKind::Ir => self.unload_ir(),
+                    AssetKind::IrB => self.unload_ir_b(),
                 };
             }
         }
@@ -1572,6 +1737,15 @@ fn save_config(config: &AppConfig) {
     if let Err(e) = write() {
         eprintln!("warning: could not save config: {e}");
     }
+}
+
+/// An asset ref's file name for display, or `"-"` when unset.
+fn asset_name(reference: &Option<AssetRef>) -> String {
+    reference
+        .as_ref()
+        .and_then(|a| Path::new(&a.path).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".into())
 }
 
 fn asset_ref_for(path: &Path) -> Option<AssetRef> {

@@ -76,6 +76,47 @@ fn params_travel_through_the_queue() {
     assert!((clamped.real - 0.9).abs() < 1e-6);
 }
 
+/// The active pedal's `key` param as a real-world value.
+fn real(handle: &lh_engine::ChainHandle, slot: &str, key: &str) -> f32 {
+    let desc = handle.param_desc(slot, key).unwrap();
+    desc.range.to_real(handle.param_norm(slot, key).unwrap())
+}
+
+/// Tempo sync (ADR 014): a delay's `sync` selector locks its `time` to the rig
+/// BPM (a note length); a tremolo's locks its `rate` (one cycle per note).
+/// *Free* leaves the knobs alone.
+#[test]
+fn tempo_sync_locks_delay_time_and_tremolo_rate() {
+    let (_chain, mut handle) = build_chain(vec![
+        Box::new(Delay::new()),
+        Box::new(lh_dsp::modulation::Modulation::new()),
+    ]);
+    // The mod slot's `sync` drives `rate` only on a rate pedal — pick tremolo.
+    handle.select_pedal("mod", "tremolo").unwrap();
+
+    // Sync defaults to Free: apply is a no-op and touches nothing.
+    let time_before = handle.param_norm("delay", "time").unwrap();
+    assert!(!handle.apply_tempo_sync(120.0), "Free rig moves nothing");
+    assert_eq!(handle.param_norm("delay", "time").unwrap(), time_before);
+
+    // Lock the delay to a quarter note ("1/4" = index 4) at 120 BPM → 500 ms.
+    handle.set_param("delay", "sync", 4.0).unwrap();
+    assert!(handle.apply_tempo_sync(120.0));
+    assert!((real(&handle, "delay", "time") - 500.0).abs() < 1.0);
+
+    // Idempotent at the same tempo — a settled rig makes no queue traffic.
+    assert!(!handle.apply_tempo_sync(120.0));
+
+    // A tempo change retunes it: a quarter at 90 BPM = 666.7 ms.
+    assert!(handle.apply_tempo_sync(90.0));
+    assert!((real(&handle, "delay", "time") - 60_000.0 / 90.0).abs() < 1.0);
+
+    // Tremolo locked to an eighth ("1/8" = index 7) at 120 BPM → 4 Hz.
+    handle.set_param("mod", "sync", 7.0).unwrap();
+    assert!(handle.apply_tempo_sync(120.0));
+    assert!((real(&handle, "mod", "rate") - 4.0).abs() < 0.05);
+}
+
 /// Snapshots (PRD 009): `capture_scene` reflects the *selected* pedal's
 /// live values and the bypass flag, so a scene stored now re-applies later.
 #[test]

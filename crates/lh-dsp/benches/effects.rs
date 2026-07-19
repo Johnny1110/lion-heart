@@ -79,8 +79,11 @@ fn bench_effects(c: &mut Criterion) {
     };
     cab_handle
         .install(Box::new(lh_dsp::cab::IrAsset {
-            left: build(),
-            right: build(),
+            a: lh_dsp::cab::IrPair {
+                left: build(),
+                right: build(),
+            },
+            b: None,
         }))
         .unwrap();
     bench_stereo!(group, "cab_ir_100ms", cab, buf, buf_r);

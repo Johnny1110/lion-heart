@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use fft_convolver::FFTConvolver;
-use lh_dsp::cab::IrAsset;
+use lh_dsp::cab::{IrAsset, IrPair};
 use thiserror::Error;
 
 /// Cab IRs are 20–200 ms; anything longer is reverb, which this block is not.
@@ -58,9 +58,17 @@ impl IrInfo {
     }
 }
 
-/// Decode a WAV impulse response and build a ready-to-swap convolver.
-/// Control-thread only: allocates freely.
+/// Decode a WAV impulse response and build a single ready-to-swap cabinet
+/// (`b` empty). Control-thread only: allocates freely.
 pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), AssetError> {
+    let (pair, info) = load_ir_pair(path, engine_rate)?;
+    Ok((Box::new(IrAsset { a: pair, b: None }), info))
+}
+
+/// Decode a WAV impulse response into one channel-pair of convolvers — the
+/// unit the cab's primary or blend IR is built from (ADR 015). Control-thread
+/// only: allocates freely.
+pub fn load_ir_pair(path: &Path, engine_rate: u32) -> Result<(IrPair, IrInfo), AssetError> {
     let display = path.display().to_string();
     let mut reader = hound::WavReader::open(path).map_err(|source| AssetError::Wav {
         path: display.clone(),
@@ -140,7 +148,7 @@ pub fn load_ir(path: &Path, engine_rate: u32) -> Result<(Box<IrAsset>, IrInfo), 
         resampled,
         trimmed,
     };
-    Ok((Box::new(IrAsset { left, right }), info))
+    Ok((IrPair { left, right }, info))
 }
 
 // --- ~/.lion-heart disk layout -----------------------------------------------
@@ -382,7 +390,7 @@ mod tests {
             v
         };
         let mut out = vec![0.0f32; 128];
-        asset.left.process(&input, &mut out).unwrap();
+        asset.a.left.process(&input, &mut out).unwrap();
         let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!((peak - 1.0).abs() < 1e-3, "energy-normalized, got {peak}");
     }

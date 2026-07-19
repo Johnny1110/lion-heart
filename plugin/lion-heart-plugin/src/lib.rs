@@ -493,14 +493,34 @@ fn load_preset_assets(assets: &mut AssetRuntime, index: usize, sample_rate: u32)
             assets.nam.clear();
         }
     }
-    match &preset.assets.ir {
-        Some(reference) => match lh_assets::resolve_asset(reference, Some(&dir))
+    // Cab: primary IR plus an optional blend IR (a second mic, ADR 015).
+    let load_pair = |reference: &lh_core::preset::AssetRef| {
+        lh_assets::resolve_asset(reference, Some(&dir))
             .map_err(|e| e.to_string())
-            .and_then(|(p, _)| lh_assets::load_ir(&p, sample_rate).map_err(|e| e.to_string()))
-        {
-            Ok((asset, info)) => {
-                if assets.cab.install(asset).is_ok() {
-                    nih_log!("lion-heart: ir loaded ({} samples)", info.used_samples);
+            .and_then(|(p, _)| lh_assets::load_ir_pair(&p, sample_rate).map_err(|e| e.to_string()))
+    };
+    match &preset.assets.ir {
+        Some(reference) => match load_pair(reference) {
+            Ok((a, info)) => {
+                // A blend IR that fails to load just leaves the cab single-mic.
+                let b = preset
+                    .assets
+                    .ir_b
+                    .as_ref()
+                    .and_then(|r| match load_pair(r) {
+                        Ok((pair, _)) => Some(pair),
+                        Err(e) => {
+                            nih_log!("lion-heart: ir blend: {e}");
+                            None
+                        }
+                    });
+                let blended = b.is_some();
+                if assets.cab.install(Box::new(IrAsset { a, b })).is_ok() {
+                    nih_log!(
+                        "lion-heart: ir loaded ({} samples{})",
+                        info.used_samples,
+                        if blended { " + blend" } else { "" }
+                    );
                 }
             }
             Err(e) => nih_log!("lion-heart: ir: {e}"),

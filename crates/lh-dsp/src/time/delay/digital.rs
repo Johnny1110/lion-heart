@@ -5,14 +5,15 @@
 
 use lh_core::{EffectDesc, ParamDesc};
 
-use super::{Ctl, SUBDIVISION, VoiceDef, feedback_param, mix_param, time_param, tone_param};
+use super::{Ctl, SUBDIVISION, SYNC, VoiceDef, feedback_param, mix_param, time_param, tone_param};
 
-static PARAMS: [ParamDesc; 5] = [
+static PARAMS: [ParamDesc; 6] = [
     time_param(2_000.0, 350.0),
     feedback_param(0.9, 0.35),
     mix_param(0.25),
     tone_param(0.7), // bright by default — old `delay` presets stay open
     SUBDIVISION,
+    SYNC,
 ];
 
 pub static DESC: EffectDesc = EffectDesc {
@@ -29,6 +30,7 @@ pub const VOICE: VoiceDef = VoiceDef {
         Ctl::Mix,
         Ctl::Tone,
         Ctl::Subdivision,
+        Ctl::Sync,
     ],
     saturate: false,
     drive: 1.0,

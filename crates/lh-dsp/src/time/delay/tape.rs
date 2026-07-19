@@ -8,10 +8,11 @@
 use lh_core::{EffectDesc, ParamDesc};
 
 use super::{
-    Ctl, SUBDIVISION, VoiceDef, depth_param, feedback_param, mix_param, time_param, tone_param,
+    Ctl, SUBDIVISION, SYNC, VoiceDef, depth_param, feedback_param, mix_param, time_param,
+    tone_param,
 };
 
-static PARAMS: [ParamDesc; 7] = [
+static PARAMS: [ParamDesc; 8] = [
     time_param(1_200.0, 350.0),
     feedback_param(1.0, 0.4),
     mix_param(0.28),
@@ -19,6 +20,7 @@ static PARAMS: [ParamDesc; 7] = [
     depth_param("wow", "Wow", 0.25),
     depth_param("flutter", "Flutter", 0.2),
     SUBDIVISION,
+    SYNC,
 ];
 
 pub static DESC: EffectDesc = EffectDesc {
@@ -37,6 +39,7 @@ pub const VOICE: VoiceDef = VoiceDef {
         Ctl::ModA, // Wow
         Ctl::ModB, // Flutter
         Ctl::Subdivision,
+        Ctl::Sync,
     ],
     saturate: true,
     drive: 1.4,

@@ -119,6 +119,13 @@ pub enum Message {
     /// Tap-tempo button on a delay faceplate (PRD 004): each press is timed
     /// on arrival; two-plus in rhythm set the delay time.
     TapTempo(String),
+    /// Global tap-tempo button in the preset bar (ADR 014): sets the rig BPM
+    /// that every `sync`-locked effect follows.
+    TempoTap,
+    /// The BPM field text changed (ADR 014).
+    TempoInput(String),
+    /// Commit the BPM field (Enter) as the new rig tempo (ADR 014).
+    TempoSubmit,
     OpenBrowser(AssetKind),
     BrowserNav(PathBuf),
     BrowserPick(PathBuf),
@@ -723,6 +730,10 @@ struct Running {
     drag: Option<DragState>,
     /// Tap-tempo state per delay instance handle (PRD 004).
     taps: BTreeMap<String, TapState>,
+    /// Global tap-tempo clock for the rig BPM (ADR 014).
+    tempo_tap: TapState,
+    /// The editable BPM field in the preset bar (ADR 014).
+    tempo_field: String,
     view: View,
     preset_name: String,
     presets: Vec<String>,
@@ -846,6 +857,7 @@ impl Running {
         let tuner = Tuner::new(session.sample_rate);
         let spectrum_tap = session.take_spectrum_tap();
         let analyzer = SpectrumAnalyzer::new(session.sample_rate);
+        let tempo_field = format!("{:.0}", session.tempo_bpm());
         let mut running = Running {
             session,
             opts,
@@ -860,6 +872,8 @@ impl Running {
             selected: String::new(),
             drag: None,
             taps: BTreeMap::new(),
+            tempo_tap: TapState::default(),
+            tempo_field,
             view: View::Board,
             preset_name: active_preset.clone().unwrap_or_default(),
             presets: list_presets(),
@@ -1016,6 +1030,38 @@ impl Running {
         if let Ok(applied) = self.session.chain.set_param(slot_key, "time", clamped) {
             self.update_param_ui(slot_key, "time", applied.real);
             self.status = format!("{slot_key} tap: ♩ = {:.0} bpm", 60.0 / period);
+        }
+    }
+
+    /// Global tap tempo (ADR 014): time taps into a rig BPM. Taps more than
+    /// [`TAP_TIMEOUT`] apart start fresh; the rest are averaged, then applied
+    /// as the global tempo that every `sync`-locked effect follows.
+    fn record_tempo_tap(&mut self, now: Instant) {
+        let period = {
+            let state = &mut self.tempo_tap;
+            let period = match state.last {
+                Some(last) if now.duration_since(last) < TAP_TIMEOUT => {
+                    state.history.push(now.duration_since(last).as_secs_f32());
+                    if state.history.len() > TAP_HISTORY {
+                        state.history.remove(0);
+                    }
+                    let sum: f32 = state.history.iter().sum();
+                    let p = sum / state.history.len() as f32;
+                    state.period = Some(p);
+                    Some(p)
+                }
+                _ => {
+                    state.history.clear();
+                    state.period = None;
+                    None
+                }
+            };
+            state.last = Some(now);
+            period
+        };
+        if let Some(period) = period.filter(|p| *p > 0.0) {
+            self.status = self.session.set_tempo_bpm(60.0 / period);
+            self.tempo_field = format!("{:.0}", self.session.tempo_bpm());
         }
     }
 
@@ -1226,10 +1272,19 @@ impl Running {
                 Err(e) => self.status = e,
             },
             Message::TapTempo(slot) => self.tap(&slot, Instant::now()),
+            Message::TempoTap => self.record_tempo_tap(Instant::now()),
+            Message::TempoInput(s) => self.tempo_field = s,
+            Message::TempoSubmit => {
+                if let Ok(v) = self.tempo_field.trim().parse::<f32>() {
+                    self.status = self.session.set_tempo_bpm(v);
+                }
+                // Snap the field to the accepted (clamped) tempo.
+                self.tempo_field = format!("{:.0}", self.session.tempo_bpm());
+            }
             Message::OpenBrowser(kind) => {
                 let remembered = match kind {
                     AssetKind::Nam => self.session.config.nam_dir.clone(),
-                    AssetKind::Ir => self.session.config.ir_dir.clone(),
+                    AssetKind::Ir | AssetKind::IrB => self.session.config.ir_dir.clone(),
                 };
                 let start = remembered
                     .map(PathBuf::from)
@@ -1247,6 +1302,7 @@ impl Running {
                     let result = match browser.kind {
                         AssetKind::Nam => self.session.load_nam(&path),
                         AssetKind::Ir => self.session.load_ir(&path),
+                        AssetKind::IrB => self.session.load_ir_b(&path),
                     };
                     match result {
                         Ok(msg) => {
@@ -1262,6 +1318,7 @@ impl Running {
                 let (had, label) = match kind {
                     AssetKind::Nam => (self.session.unload_nam(), "nam"),
                     AssetKind::Ir => (self.session.unload_ir(), "ir"),
+                    AssetKind::IrB => (self.session.unload_ir_b(), "ir blend"),
                 };
                 if had {
                     self.status = format!("{label}: unloaded");
@@ -1646,6 +1703,12 @@ impl Running {
             self.refresh_slots();
         }
 
+        // Re-derive tempo-locked controls (ADR 014); refresh the faceplate
+        // only when a locked time/rate actually moved.
+        if self.session.tick_tempo() {
+            self.refresh_slots();
+        }
+
         // Foot controller: apply queued MIDI and mirror the result in the UI.
         let midi_lines = self.session.drain_midi();
         if !midi_lines.is_empty() {
@@ -1926,6 +1989,8 @@ impl Running {
                     .style(theme::chip(matches!(self.view, View::Presets(_)))),
                 space().width(Length::Fixed(18.0)),
                 self.snapshot_chips_row(),
+                space().width(Length::Fixed(16.0)),
+                self.tempo_row(),
                 space().width(Length::Fill),
                 text_input("save as…", &self.preset_name)
                     .on_input(Message::PresetNameChanged)
@@ -1986,6 +2051,28 @@ impl Running {
             );
         }
         row.into()
+    }
+
+    /// The rig tempo control (ADR 014): an editable BPM field plus a tap
+    /// button. Feeds every effect whose `sync` selector is locked to a note
+    /// division; a *Free* rig ignores it.
+    fn tempo_row(&self) -> Element<'_, Message> {
+        row![
+            text("♩=").size(14).color(theme::TEXT_DIM),
+            text_input("120", &self.tempo_field)
+                .on_input(Message::TempoInput)
+                .on_submit(Message::TempoSubmit)
+                .style(theme::input)
+                .size(13)
+                .width(Length::Fixed(42.0)),
+            button(text("tap").size(12))
+                .padding([4, 11])
+                .on_press(Message::TempoTap)
+                .style(theme::action),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     /// Families the "＋" menu offers right now (asset-mounting families stay
@@ -2745,44 +2832,20 @@ impl Running {
         }
         if let Some(kind) = crate::session::asset_kind(&slot.key) {
             let (nam_name, ir_name) = self.session.asset_names();
-            let (label, file) = match kind {
-                AssetKind::Nam => ("CAPTURE", nam_name),
-                AssetKind::Ir => ("IMPULSE", ir_name),
-            };
-            let loaded = file != "-";
-            body = body.push(
-                container(
-                    row![
-                        text(label).size(10).color(theme::TEXT_DIM),
-                        text(if loaded {
-                            file
-                        } else {
-                            "— nothing loaded —".to_string()
-                        })
-                        .size(13)
-                        .color(if loaded {
-                            theme::TEXT_BRIGHT
-                        } else {
-                            theme::TEXT_DIM
-                        })
-                        .font(iced::Font::MONOSPACE),
-                        space().width(Length::Fill),
-                        button(text("load…").size(12))
-                            .padding([3, 10])
-                            .on_press(Message::OpenBrowser(kind))
-                            .style(theme::action),
-                        button(text("unload").size(12))
-                            .padding([3, 10])
-                            .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
-                            .style(theme::danger),
-                    ]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center),
-                )
-                .padding([8, 12])
-                .width(Length::Fill)
-                .style(theme::inset),
-            );
+            match kind {
+                AssetKind::Nam => body = body.push(self.asset_row("CAPTURE", nam_name, kind)),
+                AssetKind::Ir => {
+                    // The cab shows both mics; its `blend` knob crosses A⇄B
+                    // (ADR 015). Mic B is optional — load it to blend.
+                    body = body.push(self.asset_row("MIC A", ir_name, AssetKind::Ir));
+                    body = body.push(self.asset_row(
+                        "MIC B",
+                        self.session.ir_b_name(),
+                        AssetKind::IrB,
+                    ));
+                }
+                AssetKind::IrB => {} // never a family mount
+            }
         }
 
         container(body)
@@ -2791,6 +2854,48 @@ impl Running {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// One loaded-asset "LCD" row: label, file name, and load/unload buttons.
+    fn asset_row(
+        &self,
+        label: &'static str,
+        file: String,
+        kind: AssetKind,
+    ) -> Element<'_, Message> {
+        let loaded = file != "-";
+        container(
+            row![
+                text(label).size(10).color(theme::TEXT_DIM),
+                text(if loaded {
+                    file
+                } else {
+                    "— nothing loaded —".to_string()
+                })
+                .size(13)
+                .color(if loaded {
+                    theme::TEXT_BRIGHT
+                } else {
+                    theme::TEXT_DIM
+                })
+                .font(iced::Font::MONOSPACE),
+                space().width(Length::Fill),
+                button(text("load…").size(12))
+                    .padding([3, 10])
+                    .on_press(Message::OpenBrowser(kind))
+                    .style(theme::action),
+                button(text("unload").size(12))
+                    .padding([3, 10])
+                    .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
+                    .style(theme::danger),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(theme::inset)
+        .into()
     }
 
     fn footer(&self) -> Element<'_, Message> {

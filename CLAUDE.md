@@ -387,6 +387,57 @@ criterion harness. Engine tail suite (rings-then-evicts, hard-cut contrast,
 forced-decay cap, lane exhaustion) uses a deterministic feedback-resonator
 test effect. **Plugin unchanged** — hosts own their tail handling.
 
+**M14 (global tempo sync) — code landed (uncommitted).** Recorded as ADR 014;
+closes the "no host-tempo sync in v1" gap. One **app-global BPM**
+(`AppConfig.tempo_bpm`, default 120, clamp 30–300, config.json — environment,
+not preset), set by a preset-bar **tap** button / editable field / REPL
+`tempo`. Sync is a **per-pedal stepped `sync` param** (`Free · 1/1 · 1/2 · 1/4.
+· 1/4 · 1/8. · 1/8T · 1/8 · 1/16` from `lh_core::tempo::SYNC_DIVISIONS`,
+default Free) **appended** to the 3 delay voices + tremolo — append-only, so
+**no preset schema bump** (old files lack it → Free → identical) and it rides
+presets/MIDI/plugin for free; in the DSP it is a **control-side no-op** like
+delay's `subdivision` (`Ctl::Sync`). Pure math in `lh_core::tempo`
+(`synced_time_ms`/`synced_rate_hz` = note length / its reciprocal period,
+quarter-note-beat units). Derivation is control-side:
+**`ChainHandle::apply_tempo_sync(bpm) -> bool`** (lh-engine) locks a slot's
+`time` (delay) or `rate` (LFO) when its `sync` ≠ Free, via the normal
+`set_param` smoother; idempotent (re-sends only on tempo/division/pedal
+change → no settled queue traffic), returns whether anything moved so the GUI
+refreshes just that faceplate. `Session::tick_tempo` delegates, called each
+control tick after `tick_morph`. Family-agnostic (keys off `sync` + a
+`time`/`rate` param), so adding sync to another rate mod later is a one-line
+param append. Per-slot **tap + `subdivision` stay as-is** (a distinct
+per-delay workflow). **Zero DSP/RT cost** (no audio-thread change; no new
+bench). Engine test `tempo_sync_locks_delay_time_and_tremolo_rate` + lh-core
+math tests. Plugin: `sync` appears but is **inert in v1** (consistent with the
+already-inert `subdivision`); host-transport wiring is a follow-up — plugin
+ids gain `delay_*_sync`/`mod_tremolo_sync` (**pre-v0.1 additive break, re-run
+clap-validator**).
+
+**M15 (dual-IR cab / mic blend) — code landed (uncommitted).** Recorded as
+ADR 015; deepens the NAM+IR tone core. The cab convolves a **primary IR `a`
+plus an optional blend IR `b`** (a second mic) with a new **`blend` knob**
+(0 = all A, 1 = all B) — a **linear** crossfade (the two mics are correlated,
+so level stays put while the top-end/comb difference sweeps; identical mics
+sum to unity). `IrAsset` grew `{ a: IrPair, b: Option<IrPair> }`; the blend +
+level trajectories are snapshotted once per block and shared L/R. **One asset
+handle** kept (`CabIr::new()` unchanged — the family-builder signature is
+shared by all 11 families): the control side owns both files and composes the
+combined asset — `lh_assets::load_ir_pair` decodes one IR; the session's
+`rebuild_cab` reloads whichever of `ir_ref`/`ir_b_ref` are set and installs
+them together (changing one re-decodes both — cheap/rare). Preset **schema v7**
+(`assets.ir_b`, `#[serde(default)]`; a v6 file is a single-mic v7, sounds
+identical; bumped so an old build rejects a dual-IR preset); `ir_b` rides
+`CarryOver`. Surfaces: REPL `load ir_b`/`unload ir_b`; GUI cab faceplate shows
+**MIC A**/**MIC B** rows (new `AssetKind::IrB` routes browser/unload) around
+the auto-rendered `blend` knob; blend IR needs a primary; unloading the
+primary clears both. Plugin loads both from a preset + exposes `cab_blend`
+(**pre-v0.1 additive break, re-run clap-validator**); it can't load a blend IR
+interactively (assets come from presets there). ~2× cab CPU only when a blend
+IR is loaded (~7 µs, 0.5 %); single-mic cabs pay nothing. RT-safe (all scratch
+in `prepare`). Tests: `blend_crossfades_between_the_two_irs`,
+`blend_is_inert_without_a_second_ir`, preset `ir_b` round-trip.
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -445,8 +496,17 @@ switch to B: the A tail rings out while B is instantly playable; pull a
 ringing reverb off the board — tail continues; rapid A/B between two
 space-heavy presets doesn't click; `spillover off` cuts tails immediately
 for contrast; **and confirm `assert_no_alloc` stays quiet** in a debug
-build while spilling — a preset switch mid-note must not SIGABRT), plus the
-standing M7 items
+build while spilling — a preset switch mid-note must not SIGABRT),
+**tempo sync by ear** (set a delay's `sync` to dotted 1/8, tap the preset-bar
+tempo — the echo locks to the beat and re-locks when you re-tap or type a BPM;
+a synced tremolo pulses in time; `sync` back to *Free* returns the Time/Rate
+knob; a synced delay saved/reloaded stays synced; no click when the tempo
+changes — the smoother glides the time),
+**dual-IR cab by ear** (load MIC A, then MIC B — a different cab/mic; sweep the
+`blend` knob A⇄B and hear the mic mix / comb; the level shouldn't jump across
+the sweep; a dual-IR preset saved/reloaded keeps both mics + the blend; unload
+MIC B returns to A-only; the plugin loads both from that preset and `cab_blend`
+automates), plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
 after that.

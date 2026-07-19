@@ -874,6 +874,46 @@ impl ChainHandle {
         Some(shadow.norms[shadow.pedal][param])
     }
 
+    /// Re-derive every tempo-locked control from `bpm` (ADR 014). A slot whose
+    /// `sync` selector is *Free* is left alone; a delay locks its `time` to the
+    /// note length, an LFO effect (tremolo) locks its `rate` so one cycle spans
+    /// the note. Control-side and idempotent — a locked control is re-sent only
+    /// when its target actually changes (tempo, division, or a pedal switch),
+    /// so a settled rig produces no queue traffic. Returns whether any control
+    /// moved, so a UI can refresh just the faceplate that changed.
+    pub fn apply_tempo_sync(&mut self, bpm: f32) -> bool {
+        let mut changed = false;
+        for handle in self.order_handles() {
+            // Only pedals exposing a `sync` selector participate.
+            let (Some(desc), Some(norm)) = (
+                self.param_desc(&handle, "sync"),
+                self.param_norm(&handle, "sync"),
+            ) else {
+                continue;
+            };
+            let div = desc.range.to_real(norm) as usize;
+            let (key, target) = if self.param_desc(&handle, "time").is_some() {
+                ("time", lh_core::tempo::synced_time_ms(bpm, div))
+            } else if self.param_desc(&handle, "rate").is_some() {
+                ("rate", lh_core::tempo::synced_rate_hz(bpm, div))
+            } else {
+                continue;
+            };
+            // Free (or an effect with no lockable control) leaves the knob in
+            // charge.
+            let (Some(target), Some(desc)) = (target, self.param_desc(&handle, key)) else {
+                continue;
+            };
+            let target_norm = desc.range.to_norm(target);
+            let current = self.param_norm(&handle, key).unwrap_or(target_norm);
+            if (current - target_norm).abs() > 1e-4 {
+                let _ = self.set_param(&handle, key, target);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The active pedal's key for a slot.
     pub fn active_pedal(&self, handle: &str) -> Result<&'static str, EngineError> {
         let slot = self.slot_index(handle)?;

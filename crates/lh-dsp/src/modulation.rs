@@ -154,6 +154,21 @@ const WAVE: ParamDesc = ParamDesc {
     smoothing_ms: 0.0,
 };
 
+/// Global-tempo lock (ADR 014): **Free** = the Rate knob rules; any note
+/// division locks the LFO `rate` to the rig's BPM so one cycle spans that note
+/// (the standalone session derives it each control tick). Control-side only —
+/// a no-op in the audio path, like [`crate::time::delay`]'s `sync`.
+const SYNC: ParamDesc = ParamDesc {
+    key: "sync",
+    name: "Sync",
+    unit: "",
+    range: Range::Stepped {
+        labels: lh_core::tempo::SYNC_DIVISIONS,
+    },
+    default: 0.0, // Free
+    smoothing_ms: 0.0,
+};
+
 const SPEED: ParamDesc = ParamDesc {
     key: "speed",
     name: "Speed",
@@ -199,7 +214,7 @@ static PHASER_DESC: EffectDesc = EffectDesc {
     params: &PHASER_PARAMS,
 };
 
-static TREMOLO_PARAMS: [ParamDesc; 4] = [rate(5.0), depth(0.65), WAVE, SPREAD];
+static TREMOLO_PARAMS: [ParamDesc; 5] = [rate(5.0), depth(0.65), WAVE, SPREAD, SYNC];
 static TREMOLO_DESC: EffectDesc = EffectDesc {
     key: "tremolo",
     name: "Tremolo",
@@ -265,6 +280,9 @@ enum Ctl {
     Spread,
     Speed,
     Balance,
+    /// Global-tempo lock selector (control-side only; the session derives the
+    /// LFO rate from the rig BPM).
+    Sync,
 }
 
 /// Param→control routing, aligned with [`FAMILY`]`.pedals`.
@@ -272,7 +290,7 @@ static CONTROLS: [&[Ctl]; 8] = [
     &[Ctl::Rate, Ctl::Depth, Ctl::Feedback, Ctl::Mix], // chorus
     &[Ctl::Rate, Ctl::Depth, Ctl::Feedback, Ctl::Mix], // flanger
     &[Ctl::Rate, Ctl::Depth, Ctl::Feedback, Ctl::Mix], // phaser
-    &[Ctl::Rate, Ctl::Depth, Ctl::Wave, Ctl::Spread],  // tremolo
+    &[Ctl::Rate, Ctl::Depth, Ctl::Wave, Ctl::Spread, Ctl::Sync], // tremolo
     &[Ctl::Rate, Ctl::Depth],                          // vibrato
     &[Ctl::Rate, Ctl::Depth],                          // harmonic
     &[Ctl::Speed, Ctl::Depth, Ctl::Balance],           // rotary
@@ -578,6 +596,7 @@ impl Effect for Modulation {
                     .set_target(if fast { DRUM_FAST_HZ } else { DRUM_SLOW_HZ });
             }
             Ctl::Balance => self.balance.set_target(real),
+            Ctl::Sync => {} // control-side only (the session derives rate)
         }
     }
 
@@ -808,7 +827,10 @@ mod tests {
         // v2 fold positions); the new pedals wear their own faces.
         let captions =
             |i: usize| -> Vec<&str> { FAMILY.pedals[i].params.iter().map(|p| p.name).collect() };
-        assert_eq!(captions(TREMOLO), ["Rate", "Depth", "Wave", "Spread"]);
+        assert_eq!(
+            captions(TREMOLO),
+            ["Rate", "Depth", "Wave", "Spread", "Sync"]
+        );
         assert_eq!(captions(VIBRATO), ["Rate", "Depth"]);
         assert_eq!(captions(HARMONIC), ["Rate", "Depth"]);
         assert_eq!(captions(ROTARY), ["Speed", "Depth", "Balance"]);

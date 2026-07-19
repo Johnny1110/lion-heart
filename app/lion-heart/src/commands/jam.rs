@@ -18,9 +18,10 @@ use crate::session::{Session, SessionOpts, list_presets};
 const HELP: &str = "\
 commands:
   load nam <path.nam>          load an amp capture (rate must match engine)
-  load ir <path.wav>           load a cabinet impulse response
+  load ir <path.wav>           load a cabinet impulse response (primary mic)
+  load ir_b <path.wav>         load a blend IR (2nd mic; cab `blend` mixes A⇄B)
   load preset <name>           load a saved preset (chain + assets)
-  unload nam | unload ir       remove the capture / IR
+  unload nam|ir|ir_b           remove the capture / cab IR / blend IR
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
   delete <name>                delete a saved preset
@@ -36,6 +37,7 @@ commands:
   snapshot <A-D>               switch scene (morphs over `morph`)
   snapshot save <A-D>          store the current scene into a slot
   morph <ms>                   scene morph time, 0–2000 ms
+  tempo <bpm>                  global tempo for synced delay/tremolo (`sync`)
   spillover on|off             let delay/reverb tails ring out on switch
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
@@ -100,6 +102,7 @@ pub fn run(args: JamArgs) -> Result<()> {
         }
         session.collect_garbage();
         session.tick_morph(Instant::now());
+        session.tick_tempo();
         for line in session.drain_midi() {
             println!("  {line}");
         }
@@ -267,8 +270,14 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     Ok(msg) => println!("  {msg}"),
                     Err(e) => println!("  error: {e}"),
                 },
+                Some("ir_b") | Some("irb") => match session.load_ir_b(Path::new(&target)) {
+                    Ok(msg) => println!("  {msg}"),
+                    Err(e) => println!("  error: {e}"),
+                },
                 Some("preset") => load_preset(session, &target),
-                _ => println!("usage: load nam <path> | load ir <path> | load preset <name>"),
+                _ => println!(
+                    "usage: load nam <path> | load ir <path> | load ir_b <path> | load preset <name>"
+                ),
             }
         }
         Some("unload") => match parts.next() {
@@ -282,7 +291,12 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     println!("  ir: unloaded");
                 }
             }
-            _ => println!("usage: unload nam | unload ir"),
+            Some("ir_b") | Some("irb") => {
+                if session.unload_ir_b() {
+                    println!("  ir blend: unloaded");
+                }
+            }
+            _ => println!("usage: unload nam | unload ir | unload ir_b"),
         },
         Some(toggle @ ("on" | "off")) => match parts.next() {
             Some(slot) => match session.chain.set_active(slot, toggle == "on") {
@@ -403,6 +417,16 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 "  spillover is {} — usage: spillover on|off",
                 if session.spillover() { "on" } else { "off" }
             ),
+        },
+        Some("tempo") | Some("bpm") => match parts.next() {
+            Some(bpm) => match bpm.parse::<f32>() {
+                Ok(v) => {
+                    println!("  {}", session.set_tempo_bpm(v));
+                    session.tick_tempo();
+                }
+                Err(_) => println!("  not a number: {bpm}"),
+            },
+            None => println!("  tempo is ♩ = {:.0} bpm", session.tempo_bpm()),
         },
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }
