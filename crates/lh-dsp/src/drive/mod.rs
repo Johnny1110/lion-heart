@@ -1447,6 +1447,68 @@ mod tests {
         );
     }
 
+    /// A low two-note chord (112 + 176 Hz) at nominal guitar level. Their
+    /// 64 Hz difference tone is absent from the input, so any energy there is
+    /// pure nonlinear intermodulation — the "boom" of drive stacking.
+    fn low_chord(len: usize) -> Vec<f32> {
+        let mut x = vec![0.0f32; len];
+        for (i, s) in x.iter_mut().enumerate() {
+            let t = i as f32 / SR as f32;
+            *s = 0.05 * (std::f32::consts::TAU * 112.0 * t).sin()
+                + 0.05 * (std::f32::consts::TAU * 176.0 * t).sin();
+        }
+        x
+    }
+
+    #[test]
+    fn centaur_boost_is_mid_forward() {
+        // The real Klon tightens the low end — as a boost it must not lift the
+        // lows as much as the mids, or stacked in front of a high-gain pedal
+        // the bass farts out in the next clipper. Probe 80 Hz vs 800 Hz with
+        // the Centaur set as a clean boost (drive 10%, output 100%).
+        let x = tones(&[80.0, 800.0], SR as usize);
+        let mut c = prepared(3);
+        set_pos(&mut c, 0, 1.0);
+        set_pos(&mut c, 2, 10.0);
+        let y = process_in_blocks(&mut c, &x, 256);
+        let tilt_in = tone_at(&x, 80.0) / tone_at(&x, 800.0);
+        let tilt_out = tone_at(&y, 80.0) / tone_at(&y, 800.0);
+        assert!(
+            tilt_out < 0.8 * tilt_in,
+            "centaur boost must tighten lows (mid-forward): out {tilt_out:.3} vs in {tilt_in:.3}"
+        );
+    }
+
+    #[test]
+    fn drive_stacking_stays_tight() {
+        // The integration guard for drive stacking. A low chord (112 + 176 Hz)
+        // has an odd-order intermod at 2·112−176 = 48 Hz — deep sub-bass,
+        // absent from the input, generated only by clipping: the boom. Putting
+        // a Centaur boost (drive 10%, output 100%) in front of an Angry Charlie
+        // must not raise that sub-bass above the Angry Charlie played alone —
+        // i.e. a mid-forward boost pours no extra bass into the clipper. (Before
+        // the Centaur low-shelf and the pedals' tightening high-passes, the
+        // boost lifted this intermod ~25 % over solo — the reported "boom".)
+        let x = low_chord(SR as usize);
+        let mut angry = prepared(7);
+        let solo = process_in_blocks(&mut angry, &x, 256);
+
+        let mut centaur = prepared(3);
+        set_pos(&mut centaur, 0, 1.0); // drive 10%
+        set_pos(&mut centaur, 2, 10.0); // output 100%
+        let mut angry2 = prepared(7);
+        let mid = process_in_blocks(&mut centaur, &x, 256);
+        let stacked = process_in_blocks(&mut angry2, &mid, 256);
+
+        let sub = |y: &[f32]| tone_at(y, 48.0);
+        assert!(
+            sub(&stacked) <= 1.15 * sub(&solo),
+            "stacked boost must not add sub-bass boom: stacked {:.5} vs solo {:.5}",
+            sub(&stacked),
+            sub(&solo)
+        );
+    }
+
     /// A plucked note: a sine under an exponential decay envelope, at nominal
     /// guitar level. `tau` is the decay time constant in seconds.
     fn plucked(freq: f32, tau: f32, len: usize) -> Vec<f32> {

@@ -3,6 +3,12 @@
 //! 250 Hz-high-passed path squashed by germanium diodes (soft ~0.35 V
 //! knees). Low gain is the famous transparent boost; the knobs follow the
 //! original face: Gain / Treble / Output.
+//!
+//! The clean path carries a gentle low-shelf cut (~−6 dB below 130 Hz): the
+//! real Klon is a mid-forward boost that *tightens* the low end, not a flat
+//! full-range lift. This is what keeps it usable stacked in front of a
+//! high-gain pedal — a flat boost pours bass into the next stage's clipper
+//! and the lows fart out (see `drive_stacking_stays_tight`).
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
@@ -25,11 +31,16 @@ const KNEE: f32 = 0.35;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs` and
 /// `centaur_low_gain_is_a_transparent_boost`.
 const MAKEUP: f32 = 0.65;
+/// Clean-path low-shelf depth: `x + LOW_TILT·lp` cuts the sub-130 Hz band by
+/// ~6 dB (LOW_TILT −0.5 → half the low content), tightening the boost.
+const LOW_TILT: f32 = -0.5;
 
 pub(super) struct Centaur {
+    low_lp: OnePole,
     hp250: OnePole,
     treble_hp: OnePole,
     dc: OnePole,
+    c_low: f32,
     c250: f32,
     c1200: f32,
     c_dc: f32,
@@ -38,9 +49,11 @@ pub(super) struct Centaur {
 impl Centaur {
     pub(super) fn new() -> Self {
         Self {
+            low_lp: OnePole::default(),
             hp250: OnePole::default(),
             treble_hp: OnePole::default(),
             dc: OnePole::default(),
+            c_low: 0.0,
             c250: 0.0,
             c1200: 0.0,
             c_dc: 0.0,
@@ -58,6 +71,7 @@ impl Centaur {
 
 impl Circuit for Centaur {
     fn prepare(&mut self, base_rate: f32, os_rate: f32) {
+        self.c_low = lp_coeff(130.0, os_rate);
         self.c250 = lp_coeff(250.0, os_rate);
         self.c1200 = lp_coeff(1_200.0, base_rate);
         self.c_dc = lp_coeff(10.0, base_rate);
@@ -65,6 +79,7 @@ impl Circuit for Centaur {
     }
 
     fn reset(&mut self) {
+        self.low_lp.reset();
         self.hp250.reset();
         self.treble_hp.reset();
         self.dc.reset();
@@ -79,9 +94,11 @@ impl Circuit for Centaur {
         for (s, d) in block.iter_mut().zip(drive) {
             let b = d * 0.1;
             let x = *s;
+            // Clean path, low-shelf-tightened: the mid-forward Klon boost.
+            let clean = x + LOW_TILT * self.low_lp.lp(x, self.c_low);
             let dirty_in = x - self.hp250.lp(x, self.c250);
             let dirty = Self::germanium(gain.tick() * dirty_in);
-            *s = (1.2 + 0.8 * b) * x + b * b * dirty;
+            *s = (1.2 + 0.8 * b) * clean + b * b * dirty;
         }
     }
 

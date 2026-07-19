@@ -132,6 +132,24 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    (h2 ≫ ts9), no-clean-floor, cleans-up-at-low-input. Livery: Dallas Arbiter
    turquoise. `DRIVE_PEDALS` is now 10; plugin ids `drive_fuzz-face_*` appear
    (additive, re-run clap-validator). ~11 µs per block.
+2e. **Drive-stacking low-end fix.** Reported: a Centaur (drive 10 %, output
+   100 %) boosting an Angry Charlie booms/farts on the lows. Diagnosis — the
+   engine cascades slots raw (no coupling-cap high-pass between stages, unlike
+   real gear), and the two loosest links were stacked: the Centaur's clean
+   path was a *flat, full-range* boost, and the Angry Charlie / Fuzz Face pass
+   full lows into a hard clip. Measured with a 112+176 Hz low chord's 48 Hz
+   odd-order intermod (2·112−176, absent from the input = pure clipping boom):
+   stacking lifted it ~25 % over the Angry Charlie alone. Fixes (voicing, all
+   above ~130 Hz so single-pedal tone is untouched — the 220 Hz character
+   tests never move): Centaur clean path gained a ~−6 dB low-shelf below
+   130 Hz (the real Klon is a **mid-forward** boost that tightens lows, not a
+   flat lift); Angry Charlie's subsonic HP 25→50 Hz and the Fuzz Face's 20→50
+   Hz (shed sub-bass flab, keep the body). After: the stacked 48 Hz intermod
+   sits *below* solo (no added boom). Pinned by `centaur_boost_is_mid_forward`
+   (80 vs 800 Hz tilt) and the integration guard `drive_stacking_stays_tight`.
+   Most of the family already tightens pre-gain (TS9 720 Hz, red-charlie /
+   monster5150 carve, jan-ray 70 Hz) — this brings the deliberate full-range
+   outliers into line for stacking without gutting their solo voice.
 3. **GUI v2.** Header = view tabs (board · tuner · eq · live) with
    settings set apart top-right; a **persistent preset bar** (◀ picker ▶,
    save-as field — replaces the presets overlay, rescans the dir ~1 Hz);
@@ -381,6 +399,9 @@ mids, Bass/Treble reach, gentle amp-like warmth, unity at defaults),
 a held note, cleans up rolling the guitar volume back, no-tone-knob thick
 germanium voice, Fuzz/Volume interaction; and confirm it does *not* gate a
 deliberately-quiet steady signal — that should stay clean, not stutter),
+**drive stacking by ear** (Centaur drive-low/output-high boosting an Angry
+Charlie or Fuzz Face — low chords should stay tight, no bass fart/boom; and
+check the Centaur still sounds full, not thin, on its own),
 the reworked GUI (tabs, preset bar prev/next/save, chain-click landing
 on the board from every view), board editing while playing (drag/
 add/remove — tails keep ringing through the fade), a 3-drive board saved

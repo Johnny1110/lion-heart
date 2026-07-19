@@ -105,7 +105,7 @@ impl Circuit for FuzzFace {
     fn prepare(&mut self, _base_rate: f32, os_rate: f32) {
         // Everything runs at the oversampled rate: the clip is brutal and the
         // gating envelope shares its clock.
-        self.c_sub = lp_coeff(20.0, os_rate);
+        self.c_sub = lp_coeff(50.0, os_rate);
         self.c_dark = lp_coeff(5_500.0, os_rate);
         self.c_dc = lp_coeff(10.0, os_rate);
         // Envelope ~4 ms, gate smoothing ~3 ms (declicked), peak-hold bleed
@@ -133,8 +133,10 @@ impl Circuit for FuzzFace {
         let mut gain = Ramp::over(drive, |d| db_to_lin(20.0 + 35.0 * (d * 0.1).powf(1.5)));
         for s in block.iter_mut() {
             let x = *s;
-            // Subsonic trim, then the woolly germanium high-cut feeding the
-            // clipper — dark in, so the fuzz is smooth, not fizzy.
+            // Tightening high-pass at 50 Hz (a fuzz's huge gain turns any
+            // sub-bass into flub, worst when a boost is stacked in front),
+            // then the woolly germanium high-cut feeding the clipper — dark
+            // in, so the fuzz is smooth, not fizzy.
             let x = x - self.hp_in.lp(x, self.c_sub);
 
             // Gate key on the (clean, pre-gain) input: fast envelope vs a

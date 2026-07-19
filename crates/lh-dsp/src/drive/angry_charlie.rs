@@ -52,7 +52,7 @@ pub(super) struct AngryCharlie {
     bright: OnePole,
     dc_os: OnePole,
     stack: ToneStack,
-    c25: f32,
+    c_hp: f32,
     c1800: f32,
     c12: f32,
 }
@@ -64,7 +64,7 @@ impl AngryCharlie {
             bright: OnePole::default(),
             dc_os: OnePole::default(),
             stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
-            c25: 0.0,
+            c_hp: 0.0,
             c1800: 0.0,
             c12: 0.0,
         }
@@ -73,7 +73,7 @@ impl AngryCharlie {
 
 impl Circuit for AngryCharlie {
     fn prepare(&mut self, base_rate: f32, os_rate: f32) {
-        self.c25 = lp_coeff(25.0, os_rate);
+        self.c_hp = lp_coeff(50.0, os_rate);
         self.c1800 = lp_coeff(1_800.0, os_rate);
         self.c12 = lp_coeff(12.0, os_rate);
         self.stack.prepare(base_rate);
@@ -94,8 +94,10 @@ impl Circuit for AngryCharlie {
         let mut gain = Ramp::over(drive, |d| db_to_lin(14.0 + 46.0 * (d * 0.1).powf(1.5)));
         for s in block.iter_mut() {
             let x = *s;
-            // Subsonic block at 25 Hz — the lows otherwise stay full.
-            let x = x - self.hp_in.lp(x, self.c25);
+            // Tightening high-pass at 50 Hz — keeps the thick body but sheds
+            // the sub-bass flab that farts out when a boost drives the clip
+            // hard (drive stacking); the lows above it stay full.
+            let x = x - self.hp_in.lp(x, self.c_hp);
             // Fixed bright pre-emphasis into the clipper.
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1800));
             // The two clean gain stages, then a genuine hard clip to ground
