@@ -35,6 +35,7 @@ mod bd2;
 mod centaur;
 mod classic;
 mod evva;
+mod fuzz_face;
 mod jan_ray;
 mod monster5150;
 mod red_charlie;
@@ -76,10 +77,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &monster5150::DESC,
         &angry_charlie::DESC,
         &jan_ray::DESC,
+        &fuzz_face::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 9;
+pub const MODEL_COUNT: usize = 10;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -146,6 +148,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &jan_ray::DESC,
         controls: &[Ctl::Drive, Ctl::Low, Ctl::High, Ctl::Level],
         build: || Box::new(jan_ray::JanRay::new()),
+    },
+    ModelDef {
+        desc: &fuzz_face::DESC,
+        controls: &[Ctl::Drive, Ctl::Level],
+        build: || Box::new(fuzz_face::FuzzFace::new()),
     },
 ];
 
@@ -567,6 +574,7 @@ mod tests {
         assert_eq!(captions(6), ["Pre Gain", "Low", "Mid", "High", "Post Gain"]);
         assert_eq!(captions(7), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
         assert_eq!(captions(8), ["Gain", "Bass", "Treble", "Volume"]);
+        assert_eq!(captions(9), ["Fuzz", "Volume"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -720,7 +728,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -1436,6 +1444,100 @@ mod tests {
         assert!(
             cut_lo < 0.7 * flat_lo,
             "bass cut: {cut_lo:.3} vs flat {flat_lo:.3}"
+        );
+    }
+
+    /// A plucked note: a sine under an exponential decay envelope, at nominal
+    /// guitar level. `tau` is the decay time constant in seconds.
+    fn plucked(freq: f32, tau: f32, len: usize) -> Vec<f32> {
+        let mut x = sine(SR, freq, len);
+        for (i, s) in x.iter_mut().enumerate() {
+            let t = i as f32 / SR as f32;
+            *s *= 0.126 * (-t / tau).exp();
+        }
+        x
+    }
+
+    #[test]
+    fn fuzz_face_gates_the_decay() {
+        // The germanium signature: blocking distortion cuts the note off as it
+        // fades, so the late tail collapses to near-silence — where the ts9
+        // (a plain clipper) compresses the same decay and keeps ringing. The
+        // metric is tail-energy relative to body-energy: the fuzz's is far
+        // smaller.
+        let x = plucked(220.0, 0.25, SR as usize);
+        let tail_over_body = |model: usize| -> f64 {
+            let mut d = prepared(model);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let body = f64::from(rms(&y[3 * y.len() / 8..y.len() / 2]));
+            let tail = f64::from(rms(&y[7 * y.len() / 8..]));
+            tail / body.max(1e-9)
+        };
+        let fuzz = tail_over_body(9);
+        let ts9 = tail_over_body(0);
+        assert!(
+            ts9 > 3.0 * fuzz,
+            "fuzz-face must gate its decay far harder than the ts9 sustains: \
+             fuzz tail/body {fuzz:.4} vs ts9 {ts9:.4}"
+        );
+    }
+
+    #[test]
+    fn fuzz_face_is_strongly_asymmetric() {
+        // One transistor saturates soft, the other cuts off hard: a big even
+        // harmonic, unlike the ts9's matched (symmetric, even-starved) diodes.
+        let x = guitar(220.0, SR as usize);
+        let h2 = |model: usize| -> f64 {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, 6.0);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, 440.0) / tone_at(&y, 220.0)
+        };
+        let fuzz_h2 = h2(9);
+        assert!(
+            fuzz_h2 > 0.08,
+            "fuzz-face asymmetry must throw a strong 2nd harmonic, got {fuzz_h2:.4}"
+        );
+        assert!(
+            fuzz_h2 > 5.0 * h2(0),
+            "fuzz-face must be far more asymmetric than the symmetric ts9"
+        );
+    }
+
+    #[test]
+    fn fuzz_face_has_no_clean_floor() {
+        // A fuzz is dirty top to bottom — even with Fuzz all the way down the
+        // stage is slammed (it cleans up from the guitar, not this knob).
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(9);
+        set_pos(&mut d, 0, 1.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let residual = harmonic_residual(&y, 220.0);
+        assert!(
+            residual > 0.12,
+            "fuzz-face must stay dirty at minimum fuzz, got {residual:.3}"
+        );
+    }
+
+    #[test]
+    fn fuzz_face_cleans_up_at_low_input() {
+        // The low-input-impedance trick, heard as level sensitivity: rolled
+        // back to a whisper the fuzz rides under its knee and comes out nearly
+        // clean, where at full level it is all splat.
+        let residual = |scale: f32| -> f64 {
+            let mut x = guitar(220.0, SR as usize);
+            for s in &mut x {
+                *s *= scale;
+            }
+            let mut d = prepared(9);
+            harmonic_residual(&process_in_blocks(&mut d, &x, 256), 220.0)
+        };
+        let hot = residual(1.0);
+        let rolled_back = residual(0.03);
+        assert!(hot > 0.2, "full-level fuzz must be all splat, got {hot:.3}");
+        assert!(
+            rolled_back < 0.3 * hot,
+            "rolled-back fuzz must clean up: {rolled_back:.3} vs hot {hot:.3}"
         );
     }
 }

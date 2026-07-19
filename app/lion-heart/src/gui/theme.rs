@@ -67,6 +67,9 @@ const ANGRY_CHARLIE: Color = Color::from_rgb(0.97, 0.44, 0.20);
 /// Fender chime it chases. Darker and more coppery than the centaur's gold so
 /// the two transparent boosts don't read as the same box.
 const JAN_RAY: Color = Color::from_rgb(0.82, 0.60, 0.30);
+/// Dallas Arbiter turquoise — the round enclosure everyone pictures. Cyan
+/// enough that no other drive box comes near it.
+const FUZZ_FACE: Color = Color::from_rgb(0.15, 0.65, 0.70);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -133,6 +136,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "monster5150" => MONSTER5150,
             "angry-charlie" => ANGRY_CHARLIE,
             "jan-ray" => JAN_RAY,
+            "fuzz-face" => FUZZ_FACE,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

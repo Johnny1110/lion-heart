@@ -112,6 +112,26 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    (append-only: angry-charlie 8, jan-ray 9); plugin params expand
    automatically (`drive_jan-ray_*` appear + the `drive_pedal` selector
    gains a step — additive, re-run clap-validator). ~10 µs per block.
+2d. **fuzz-face drive pedal** (Dallas Arbiter Fuzz Face — germanium): nothing
+   like the op-amp/diode pedals — a two-transistor feedback-pair fuzz.
+   Three signatures modelled: (1) **asymmetric clip** — soft `tanh` up, a
+   *hard flat clamp* down (KNEE 0.9/0.5), plus a **pre-gain** bias offset
+   (Q1 ≈ 1.3 V, off mid-supply) that shifts the clip's zero-crossing so the
+   flat-topped square keeps an asymmetric *duty cycle* → strong even
+   harmonics that survive the DC blocker (a post-gain offset would just be a
+   DC level the blocker erases → symmetric square, no evens — a bug caught in
+   testing); (2) **gated/spluttering decay** — the blocking-distortion
+   cutoff, reproduced as a **ratio gate**: a fast input envelope vs a slow
+   (~0.6 s) peak-hold, gate shuts when env falls below ¼ of the recent peak,
+   so a fading note gates but a merely-quiet *steady* one never does; (3)
+   **cleans up from the input** — inherent to the very high gain (+20..+55 dB,
+   no clean floor) and left alone by the ratio gate. Dark/thick voicing
+   (5.5 kHz pre-clip high-cut = the woolly germanium top); **two knobs** Fuzz
+   / Volume (family's smallest face, `controls [Drive, Level]`). Character
+   tests: gates-the-decay (tail/body ≪ the ts9's), strongly-asymmetric
+   (h2 ≫ ts9), no-clean-floor, cleans-up-at-low-input. Livery: Dallas Arbiter
+   turquoise. `DRIVE_PEDALS` is now 10; plugin ids `drive_fuzz-face_*` appear
+   (additive, re-run clap-validator). ~11 µs per block.
 3. **GUI v2.** Header = view tabs (board · tuner · eq · live) with
    settings set apart top-right; a **persistent preset bar** (◀ picker ▶,
    save-as field — replaces the presets overlay, rescans the dir ~1 Hz);
@@ -136,7 +156,8 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
    `gui/theme.rs`: warm-charcoal palette, one tube-amber accent, and a
    **signature color per pedal** (TS9 green, BD-2 blue, Centaur gold, evva
    crimson-pink, red-charlie crimson, monster5150 ivory, angry-charlie
-   scarlet, jan-ray bronze, delay voices digital/tape/vintage) that runs through the chain
+   scarlet, jan-ray bronze, fuzz-face turquoise, delay voices
+   digital/tape/vintage) that runs through the chain
    card stripe, the faceplate identity rule, and the knob arcs — a theme
    test pins that every selectable pedal has a distinct livery. Chain cards
    have LED bypass dots and signal-flow chevrons; knobs grew a tick ring,
@@ -356,6 +377,10 @@ post-distortion thickness, no-clean floor acceptable),
 **jan-ray by ear** (transparent/dynamic clean-up rolling back the guitar
 volume, Fender chime/sparkle, full un-scooped lows breaking up with the
 mids, Bass/Treble reach, gentle amp-like warmth, unity at defaults),
+**fuzz-face by ear** (splatty asymmetric attack, the gated/velcro decay on
+a held note, cleans up rolling the guitar volume back, no-tone-knob thick
+germanium voice, Fuzz/Volume interaction; and confirm it does *not* gate a
+deliberately-quiet steady signal — that should stay clean, not stutter),
 the reworked GUI (tabs, preset bar prev/next/save, chain-click landing
 on the board from every view), board editing while playing (drag/
 add/remove — tails keep ringing through the fade), a 3-drive board saved
