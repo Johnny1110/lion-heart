@@ -438,6 +438,33 @@ IR is loaded (~7 µs, 0.5 %); single-mic cabs pay nothing. RT-safe (all scratch
 in `prepare`). Tests: `blend_crossfades_between_the_two_irs`,
 `blend_is_inert_without_a_second_ir`, preset `ir_b` round-trip.
 
+**Pitch family (octaver) — code landed (uncommitted).** Recorded as ADR 016;
+fills the one missing effect category (octave/pitch). New chain family
+**`pitch`** (key broad for a future harmonizer/whammy/detuner), first pedal
+**`octaver`**: a POG-style granular doubler — a stereo **Dry** path mixed with a
+**Sub** (−1 oct) and **Oct** (+1 oct) voice taken off the *mono sum* (fat,
+centered octaves), a shared **Tone** lowpass (600 Hz–9 kHz) taming the granular
+fizz. Built on a new shared primitive **`blocks::grain::GrainShift`** (the
+no-FFT two-tap "doppler" shifter promoted from the shimmer reverb's math;
+reverb keeps its private copy — dedup deferred to a health pass to avoid
+pre-v0.1 churn). Feed-forward, so **no tail** (`tail_seconds()` 0, no spill) and
+bounded by construction. **Opt-in, not on the default board**: `pitch` is
+registered in `FAMILY_REGISTRY` (so ＋ menu / REPL `add pitch` reach it) but
+**absent from `DEFAULT_CHAIN`**, so the board stays 11/12 with a free slot. This
+decouples the registry from `DEFAULT_CHAIN` for the first time — the default
+board is now an in-order **subsequence** of the registry (pinning test relaxed
+accordingly; invariants unchanged). **No preset schema bump** (new family =
+vocabulary; old presets reconcile the absent slot away). Livery: orchid magenta,
+joined the distinct-livery test. Faceplate auto-renders (generic knobs); GUI/
+session/engine needed no per-family code beyond the registry entry + theme
+color. ~1.05 µs/block (0.08 %; `pitch_octaver` bench). Granular ⇒ polyphonic
+but warbly — *not* an OC-2 mono divider (accepted, ADR 016). **Plugin
+unchanged**: its fixed chain is `DEFAULT_CHAIN`, which did not move, so no new
+param ids and clap-validator is unaffected — plugin pitch is a follow-up. 12
+new tests (octave up/down land on the Goertzel bin, dry-path transparent,
+Tone darkens the up-voice, bounded/finite fuzz, silence→silence, plus
+`GrainShift`'s own).
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -506,7 +533,12 @@ changes — the smoother glides the time),
 `blend` knob A⇄B and hear the mic mix / comb; the level shouldn't jump across
 the sweep; a dual-IR preset saved/reloaded keeps both mics + the blend; unload
 MIC B returns to A-only; the plugin loads both from that preset and `cab_blend`
-automates), plus the standing M7 items
+automates),
+**the octaver by ear** (`add pitch` from the ＋ menu — it starts off the default
+board; Sub for a fat synth-bass under a riff, Oct for the 12-string/organ
+shimmer, roll Tone back to tuck the up-octave fizz; check chord tracking and the
+granular warble on held notes vs the tighter dry; drag it *before* the drive for
+cleaner tracking; confirm Dry-only is transparent), plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
 after that.
@@ -563,7 +595,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |
 | `lh-core`        | Param IDs & ranges, chain model, preset schema. No I/O, no threads | —             |
-| `lh-dsp`         | Effects, one module per category (dynamics, drive, eq, modulation, time, cab) over shared `blocks/`. Offline-testable, RT-safe | `lh-core`     |
+| `lh-dsp`         | Effects, one module per category (dynamics, drive, eq, modulation, pitch, time, cab) over shared `blocks/`. Offline-testable, RT-safe | `lh-core`     |
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |

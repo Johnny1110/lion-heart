@@ -342,6 +342,57 @@ fn structure_edits_fade_through_silence() {
     );
 }
 
+/// Projection magnitude onto `freq` over a slice (a Goertzel bin).
+fn tone_at(y: &[f32], freq: f32) -> f64 {
+    let n = y.len() as f64;
+    let (mut cs, mut cc) = (0.0f64, 0.0f64);
+    for (i, s) in y.iter().enumerate() {
+        let ph = 2.0 * std::f64::consts::PI * f64::from(freq) * i as f64 / f64::from(SR);
+        cs += f64::from(*s) * ph.sin();
+        cc += f64::from(*s) * ph.cos();
+    }
+    ((cs * 2.0 / n).powi(2) + (cc * 2.0 / n).powi(2)).sqrt()
+}
+
+/// The pitch family is opt-in (ADR 016): it reaches the chain through the
+/// dynamic install path (`add pitch`), not the default board. Prove the
+/// octaver composes with the real engine — installed mid-stream behind the
+/// gate, it rings a sub-octave into finite output.
+#[test]
+fn octaver_installs_and_rings_the_sub_octave() {
+    let (mut chain, mut handle) = build_chain(vec![Box::new(NoiseGate::new())]);
+    chain.prepare(SR);
+
+    let installed = handle
+        .install_slot(Box::new(lh_dsp::pitch::Pitch::new()), usize::MAX)
+        .unwrap();
+    assert_eq!(installed, "pitch");
+
+    // Sub-octave only, bright tone (real values; the level range is 0..1).
+    handle.set_param("pitch", "dry", 0.0).unwrap();
+    handle.set_param("pitch", "sub", 1.0).unwrap();
+    handle.set_param("pitch", "oct", 0.0).unwrap();
+    handle.set_param("pitch", "tone", 1.0).unwrap();
+
+    // A 220 Hz sine: the install fade, the smoothers, and the grain buffer all
+    // settle well inside the first third; measure the octave in the tail.
+    let mut x = sine(SR, 220.0, SR as usize);
+    let mut xr = x.clone();
+    for (l, r) in x.chunks_mut(256).zip(xr.chunks_mut(256)) {
+        chain.process(l, r);
+    }
+    assert_finite("octaver output", &x);
+
+    let tail = &x[SR as usize * 2 / 3..];
+    let sub = tone_at(tail, 110.0);
+    let fund = tone_at(tail, 220.0);
+    assert!(sub > 0.05, "sub-octave rings through the engine: {sub:.3}");
+    assert!(
+        sub > fund,
+        "sub-octave dominates the original pitch: {sub:.3} vs {fund:.3}"
+    );
+}
+
 #[test]
 fn chain_capacity_is_enforced() {
     let (_chain, mut handle) = probe_chain();

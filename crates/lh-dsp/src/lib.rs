@@ -14,6 +14,7 @@
 //! - [`eq`] — the in-chain tone EQ and the global output EQ
 //! - [`filter`] — envelope-driven filters (auto-wah)
 //! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
+//! - [`pitch`] — octave / interval shifters (granular, one shared engine)
 //! - [`time`] — delay, reverb
 //! - [`cab`] — cabinet IR convolution
 //! - [`tuner`] — pitch analysis (not an effect; feeds the GUI)
@@ -26,6 +27,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod filter;
 pub mod modulation;
+pub mod pitch;
 pub mod testutil;
 pub mod time;
 pub mod tuner;

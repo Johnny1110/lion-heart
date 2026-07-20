@@ -21,6 +21,7 @@ use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
 use lh_dsp::filter::Filter;
 use lh_dsp::modulation::Modulation;
+use lh_dsp::pitch::Pitch;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{ChainHandle, build_chain};
@@ -317,15 +318,24 @@ pub struct FamilyEntry {
     ) -> Box<dyn Effect>,
 }
 
-/// Every chain family the session can build, in the default-chain (and add
-/// menu) order — the one place that knows the full rig. Pinned to
-/// [`lh_core::DEFAULT_CHAIN`] by a test, which also pins the plugin's fixed
-/// chain to the same constant.
-pub static FAMILY_REGISTRY: [FamilyEntry; 11] = [
+/// Every chain family the session can build, in add-menu order — the one
+/// place that knows the full rig. [`lh_core::DEFAULT_CHAIN`] (the board that
+/// ships) is an in-order **subsequence** of this: the registry may carry
+/// extra opt-in families that ship *off* the board and are added from the ＋
+/// menu (`pitch`, ADR 016). A test pins the subsequence relation and the
+/// invariants; the plugin's fixed chain is pinned to `DEFAULT_CHAIN` directly.
+pub static FAMILY_REGISTRY: [FamilyEntry; 12] = [
     FamilyEntry {
         desc: &lh_dsp::dynamics::gate::FAMILY,
         asset: None,
         build: |_, _, _| Box::new(NoiseGate::new()),
+    },
+    // `pitch` is opt-in: registered (so the ＋ menu and REPL can add it) but
+    // absent from DEFAULT_CHAIN, so it does not eat a default-board slot.
+    FamilyEntry {
+        desc: &lh_dsp::pitch::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Pitch::new()),
     },
     FamilyEntry {
         desc: &lh_dsp::filter::FAMILY,
@@ -1781,13 +1791,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_matches_the_default_chain_and_its_invariants() {
+    fn registry_covers_the_default_chain_and_its_invariants() {
         let keys: Vec<&str> = FAMILY_REGISTRY.iter().map(|e| e.desc.key).collect();
-        assert_eq!(
-            keys,
-            lh_core::DEFAULT_CHAIN,
-            "registry order is the default chain"
-        );
+        // The default board is an in-order subsequence of the registry: every
+        // shipped family is registered, in the same relative order, but the
+        // registry may carry extra opt-in families (e.g. `pitch`, ADR 016).
+        let mut cursor = keys.iter();
+        for want in lh_core::DEFAULT_CHAIN {
+            assert!(
+                cursor.any(|k| *k == want),
+                "default-chain family {want:?} missing from the registry (or out of order)"
+            );
+        }
         for (i, a) in keys.iter().enumerate() {
             // Trailing digits are reserved for instance handles ("drive2");
             // the engine's handle parser depends on it.

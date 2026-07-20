@@ -7,6 +7,19 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-19 (pitch family: octaver) — macOS, Apple Silicon (native)
+
+The new `pitch` slot's first pedal (ADR 016): a granular octaver. Per-sample
+cost is two `blocks::grain::GrainShift` reads (each a phasor advance + two
+interpolated taps + two sine windows) plus one block-rate Tone coefficient.
+Both shifters run every sample regardless of knob levels, so this is the true
+per-block cost. Opt-in family (off the default board), so it only costs when
+the player adds it.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| pitch — octaver (2 grain shifters) | ~1.05 µs    | 0.08 %                 |
+
 ## 2026-07-19 (M13 expression: manual wah) — macOS, Apple Silicon (native)
 
 The filter family's second pedal (PRD 008 / ADR 011): the manual wah drops
