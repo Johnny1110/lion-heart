@@ -63,6 +63,41 @@ fn bench_effects(c: &mut Criterion) {
         bench_stereo!(group, format!("delay_{}", pedal.key), delay, buf, buf_r);
     }
 
+    // Looper (PRD 013): the three steady states — record (write), play (read
+    // + seam fade), overdub (read + soft-clipped in-place write).
+    {
+        let rec_i = lh_dsp::looper::DESC.param_index("rec").unwrap();
+        let press = |lp: &mut lh_dsp::looper::Looper| {
+            lp.set_param(rec_i, 1.0);
+            lp.set_param(rec_i, 0.0);
+        };
+        let warm = |lp: &mut lh_dsp::looper::Looper, n: usize| {
+            let mut l = vec![0.2f32; n];
+            let mut r = vec![0.2f32; n];
+            lp.process(&mut l, &mut r);
+        };
+
+        let mut rec = lh_dsp::looper::Looper::new();
+        rec.prepare(SR);
+        press(&mut rec); // Empty -> Recording
+        bench_stereo!(group, "looper_record", rec, buf, buf_r);
+
+        let mut play = lh_dsp::looper::Looper::new();
+        play.prepare(SR);
+        press(&mut play);
+        warm(&mut play, SR as usize / 4); // record 250 ms
+        press(&mut play); // -> Playing
+        bench_stereo!(group, "looper_play", play, buf, buf_r);
+
+        let mut dub = lh_dsp::looper::Looper::new();
+        dub.prepare(SR);
+        press(&mut dub);
+        warm(&mut dub, SR as usize / 4);
+        press(&mut dub); // -> Playing
+        press(&mut dub); // -> Overdubbing
+        bench_stereo!(group, "looper_overdub", dub, buf, buf_r);
+    }
+
     // Cab with a realistic 100 ms IR (4800 taps at 48 kHz, 128-sample partitions).
     let (mut cab, mut cab_handle) = lh_dsp::cab::CabIr::new();
     cab.prepare(SR);
@@ -99,6 +134,23 @@ fn bench_effects(c: &mut Criterion) {
     let mut eq = Eq::new();
     eq.prepare(SR);
     bench_stereo!(group, "eq_3band", eq, buf, buf_r);
+
+    // The parametric pedal with the same four representative bands live as
+    // the output-stage bench below — settled, its cost must match.
+    let mut para = Eq::new();
+    para.prepare(SR);
+    para.select_pedal(1);
+    let desc = lh_dsp::eq::FAMILY.pedals[1];
+    for (band, freq) in [(0usize, 40.0), (2, 250.0), (5, 3_000.0), (7, 11_000.0)] {
+        let set = |eff: &mut Eq, key: &str, real: f32| {
+            let i = desc.param_index(key).unwrap();
+            eff.set_param(i, desc.params[i].range.to_norm(real));
+        };
+        set(&mut para, &format!("b{}_freq", band + 1), freq);
+        set(&mut para, &format!("b{}_gain", band + 1), 4.0);
+        set(&mut para, &format!("b{}_on", band + 1), 1.0);
+    }
+    bench_stereo!(group, "eq_parametric_4band", para, buf, buf_r);
 
     for (index, pedal) in lh_dsp::modulation::FAMILY.pedals.iter().enumerate() {
         let mut modulation = Modulation::new();

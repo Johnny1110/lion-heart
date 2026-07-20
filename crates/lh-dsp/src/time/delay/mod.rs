@@ -21,11 +21,12 @@
 //! (unity small-signal, bounded loud — repeats compress instead of running
 //! away); `digital` stays linear.
 //!
-//! **Tap tempo** (PRD 004) is a control-side feature: the `subdivision`
-//! stepped param is stored here and shown in the UI, but the tap button
-//! itself lives in the GUI and only ever sets the `time` param. The engine
-//! treats `subdivision` as a no-op — it is a modifier for the control-side
-//! tap→time math, not an audio parameter (there is no host-tempo sync in v1).
+//! **Tap tempo and sync** (PRD 004/012) are control-side features: the
+//! `subdivision` and `sync` stepped params are stored here and shown in the
+//! UI, but the tempo itself — tapped, MIDI-clocked, or (plugin) read from
+//! the host transport — lives one layer up (the session, or the plugin's
+//! forwarding code). The engine treats both params as no-ops — they modify
+//! control-side tap/clock→time math, never the audio path.
 
 mod digital;
 mod tape;
@@ -134,6 +135,20 @@ const SUBDIVISION: ParamDesc = ParamDesc {
     smoothing_ms: 0.0,
 };
 
+/// Follow the global tempo (PRD 012) — another control-side modifier: when
+/// on, the session (or the plugin's forwarding layer) rewrites `time` from
+/// the current tempo × `subdivision`; the audio path never reads it.
+const SYNC: ParamDesc = ParamDesc {
+    key: "sync",
+    name: "Sync",
+    unit: "",
+    range: Range::Stepped {
+        labels: &["off", "on"],
+    },
+    default: 0.0,
+    smoothing_ms: 0.0,
+};
+
 /// The delay family, in menu order. Pinned to `lh_core::preset::DELAY_PEDALS`
 /// (the v3→v4 migration) by a test below.
 pub static FAMILY: FamilyDesc = FamilyDesc {
@@ -158,6 +173,8 @@ enum Ctl {
     /// Fast LFO depth — tape Flutter.
     ModB,
     Subdivision,
+    /// Tempo-follow toggle (PRD 012) — control-side, like `Subdivision`.
+    Sync,
 }
 
 /// One voice's faceplate, param→control routing (same length as the
@@ -391,7 +408,7 @@ impl Effect for Delay {
             Ctl::Tone => self.tone.set_target(real),
             Ctl::ModA => self.mod_a.set_target(real),
             Ctl::ModB => self.mod_b.set_target(real),
-            Ctl::Subdivision => {} // control-side only (see module docs)
+            Ctl::Subdivision | Ctl::Sync => {} // control-side only (module docs)
         }
     }
 
@@ -493,21 +510,30 @@ mod tests {
         // Each voice wears its own faceplate.
         let captions =
             |i: usize| -> Vec<&str> { FAMILY.pedals[i].params.iter().map(|p| p.name).collect() };
-        assert_eq!(captions(0), ["Time", "Feedback", "Mix", "Tone", "Div"]);
+        assert_eq!(
+            captions(0),
+            ["Time", "Feedback", "Mix", "Tone", "Div", "Sync"]
+        );
         assert_eq!(
             captions(1),
-            ["Time", "Feedback", "Mix", "Tone", "Wow", "Flutter", "Div"]
+            [
+                "Time", "Feedback", "Mix", "Tone", "Wow", "Flutter", "Div", "Sync"
+            ]
         );
         assert_eq!(
             captions(2),
-            ["Time", "Feedback", "Mix", "Tone", "Mod", "Div"]
+            ["Time", "Feedback", "Mix", "Tone", "Mod", "Div", "Sync"]
         );
-        // Every voice shares the tap subdivision selector.
+        // Every voice shares the tap subdivision selector and the tempo
+        // sync toggle (PRD 012), both stepped, sync shipping off.
         for pedal in FAMILY.pedals {
             assert!(matches!(
                 pedal.params[pedal.param_index("subdivision").unwrap()].range,
                 Range::Stepped { .. }
             ));
+            let sync = &pedal.params[pedal.param_index("sync").unwrap()];
+            assert!(matches!(sync.range, Range::Stepped { .. }));
+            assert_eq!(sync.default, 0.0, "{}: sync ships off", pedal.key);
         }
         assert_eq!(subdivision_ratio(0), 1.0);
         assert!((subdivision_ratio(1) - 0.75).abs() < 1e-6);

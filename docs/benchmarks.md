@@ -7,6 +7,36 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-20 (M16 looper) — Linux dev container (relative)
+
+The looper (PRD 013 / ADR 016) is a chain slot with a preallocated 60-second
+double buffer. Its three steady states cost, in order: recording (a write per
+sample), playing (one interpolated read + a smoothstep seam gain), and
+overdubbing (read + soft-clipped in-place write, plus the undo-snapshot copy
+during the first pass). All are a small fraction of the 0.15 % target set in
+the PRD. Numbers from the Linux dev sandbox (read **relative**; re-measure
+native on the Mac for the absolute table):
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| looper_record                      | ~0.81 µs    | 0.06 %                 |
+| looper_play                        | ~0.65 µs    | 0.05 %                 |
+| looper_overdub                     | ~1.03 µs    | 0.08 %                 |
+
+## 2026-07-20 (M14 parametric EQ pedal) — Linux dev container (relative)
+
+The eq family's second pedal (PRD 011 / ADR 014) is the output-stage
+`GlobalEq` reused whole behind a 40-param façade, so its settled cost must
+match the global stage — and it does. Numbers below are from the Linux dev
+sandbox (same box, same run — read them **relative to each other**;
+re-measure native on the Mac for the absolute table):
+
+| Bench                              | Median      | Note                    |
+| ---------------------------------- | ----------- | ----------------------- |
+| eq_3band (tone pedal)              | ~684 ns     | unchanged path          |
+| eq_parametric_4band                | ~1.45 µs    | 4 bands live, settled   |
+| global_eq_4band (same box)         | ~1.46 µs    | parity: same engine     |
+
 ## 2026-07-19 (M13 expression: manual wah) — macOS, Apple Silicon (native)
 
 The filter family's second pedal (PRD 008 / ADR 011): the manual wah drops

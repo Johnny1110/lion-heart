@@ -31,11 +31,15 @@ commands:
   order <slot> <slot> ...      reorder the chain (all handles, new order)
   pedal <slot> <name>          switch the slot's pedal (e.g. `pedal drive ts9`)
   set <slot>.<param> <value>   e.g. `set drive2.drive 6`, `set drive.pedal evva`
+  looper <slot> rec|undo|clear fire a looper transport (add looper first)
   learn <slot>.<param>         bind the next MIDI CC to this knob
   unlearn <slot>.<param>       clear the knob's MIDI CC binding
   snapshot <A-D>               switch scene (morphs over `morph`)
   snapshot save <A-D>          store the current scene into a slot
   morph <ms>                   scene morph time, 0–2000 ms
+  tap                          tap the global tempo (two-plus in rhythm)
+  tempo                        show the global tempo
+  tempo <bpm>                  set the global tempo directly (30-300)
   spillover on|off             let delay/reverb tails ring out on switch
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
@@ -360,6 +364,28 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             }
             None => println!("usage: set <slot>.<param> <value>"),
         },
+        Some("looper") => {
+            // `looper <slot> rec|undo|clear` fires a momentary transport pulse
+            // (PRD 013). `<slot>` defaults to "looper"; reverse/half/level/mix
+            // are ordinary params via `set`.
+            let a = parts.next();
+            let b = parts.next();
+            let (slot, action) = match (a, b) {
+                (Some(x), Some(y)) => (x, Some(y)),
+                (Some(x @ ("rec" | "undo" | "clear")), None) => ("looper", Some(x)),
+                (Some(x), None) => (x, None),
+                (None, _) => ("looper", None),
+            };
+            match action {
+                Some(act @ ("rec" | "undo" | "clear")) => match session.looper_press(slot, act) {
+                    Ok(()) => println!("  {slot} {act}"),
+                    Err(e) => println!("  error: {e}"),
+                },
+                _ => println!(
+                    "usage: looper <slot> rec|undo|clear   (reverse/half/level/mix via `set`)"
+                ),
+            }
+        }
         Some("learn") => match parts.next().and_then(|p| p.split_once('.')) {
             Some((slot, param)) => match session.arm_midi_learn(slot, param) {
                 Ok(msg) => println!("  {msg}"),
@@ -395,6 +421,25 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 Err(_) => println!("  not a number: {ms}"),
             },
             None => println!("  morph time is {} ms", session.morph_ms()),
+        },
+        Some("tap") => {
+            for line in session.tap_tempo(None) {
+                println!("  {line}");
+            }
+        }
+        Some("tempo") => match parts.next() {
+            Some(bpm) => match bpm.parse::<f32>() {
+                Ok(v) => {
+                    for line in session.set_tempo_bpm(v) {
+                        println!("  {line}");
+                    }
+                }
+                Err(_) => println!("  not a number: {bpm}"),
+            },
+            None => match session.tempo_bpm() {
+                Some(bpm) => println!("  tempo: ♩ = {bpm:.0} bpm"),
+                None => println!("  tempo: not set yet — tap or `tempo <bpm>`"),
+            },
         },
         Some("spillover") => match parts.next() {
             Some("on") => println!("  {}", session.set_spillover(true)),

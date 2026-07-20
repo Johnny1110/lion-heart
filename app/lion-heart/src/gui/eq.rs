@@ -1,6 +1,10 @@
-//! The global EQ editor (PRD 003): a log-frequency canvas with two overlaid
+//! The 8-band EQ editor canvas: a log-frequency panel with two overlaid
 //! curves — the EQ's composite response (setting) and the live output
 //! spectrum (playing) — plus draggable band handles.
+//!
+//! Two targets share it (PRD 011): the **global** output EQ (PRD 003) and
+//! any chain slot whose active pedal is the `parametric` — the same canvas,
+//! publishing either the global messages or the slot-param ones.
 //!
 //! Interactions: drag a handle for freq/gain (cut bands: freq only), wheel
 //! over it for Q, double-click to enable/disable. The detail strip below
@@ -11,7 +15,7 @@ use std::time::{Duration, Instant};
 use iced::widget::canvas;
 use iced::widget::text::Alignment as TextAlign;
 use iced::{Color, Font, Pixels, Point, Rectangle, Renderer, Theme, mouse};
-use lh_core::global_eq::{FREQ_MAX, FREQ_MIN, GAIN_DB_MAX, GlobalEqState, Q_MAX, Q_MIN};
+use lh_core::global_eq::{Band, FREQ_MAX, FREQ_MIN, GAIN_DB_MAX, GlobalEqState, Q_MAX, Q_MIN};
 
 use super::Message;
 use super::spectrum::DB_FLOOR;
@@ -24,11 +28,25 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Wheel sensitivity: Q multiplier per scroll line.
 const Q_STEP: f32 = 1.12;
 
+/// Who owns the bands this panel edits.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EqTarget {
+    /// The app-global output EQ — edits persist to `global_eq.json`.
+    Global,
+    /// A chain slot's parametric pedal (by instance handle) — edits flow
+    /// through the slot param path like knob drags (PRD 011).
+    Slot(String),
+}
+
 pub struct EqPanel<'a> {
-    pub state: &'a GlobalEqState,
+    pub state: GlobalEqState,
+    pub target: EqTarget,
     pub selected: usize,
     /// Display bins from the spectrum analyzer (dBFS).
     pub spectrum: &'a [f32],
+    /// Corner note for the spectrum ("OUT" on slot panels: the tap sits on
+    /// the output stage, not at the slot).
+    pub spectrum_tag: Option<&'static str>,
     pub sample_rate: f32,
     pub cache: &'a canvas::Cache,
 }
@@ -62,6 +80,31 @@ fn y_of_spectrum(height: f32, db: f32) -> f32 {
 }
 
 impl EqPanel<'_> {
+    /// The band-edit message for this panel's target. `commit` marks a
+    /// persist point for the global EQ; the slot path applies live either
+    /// way (preset saving is explicit).
+    fn band_msg(&self, index: usize, band: Band, commit: bool) -> Message {
+        match &self.target {
+            EqTarget::Global => Message::EqBand {
+                index,
+                band,
+                commit,
+            },
+            EqTarget::Slot(slot) => Message::PedalEqBand {
+                slot: slot.clone(),
+                index,
+                band,
+            },
+        }
+    }
+
+    fn select_msg(&self, index: usize) -> Message {
+        match &self.target {
+            EqTarget::Global => Message::EqSelect(index),
+            EqTarget::Slot(_) => Message::PedalEqSelect(index),
+        }
+    }
+
     fn handle_position(&self, size: iced::Size, band: usize) -> Point {
         let b = self.state.bands[band];
         let gain = if b.kind.has_gain() { b.gain_db } else { 0.0 };
@@ -102,16 +145,11 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     let mut band = self.state.bands[hit];
                     band.enabled = !band.enabled;
                     return Some(
-                        canvas::Action::publish(Message::EqBand {
-                            index: hit,
-                            band,
-                            commit: true,
-                        })
-                        .and_capture(),
+                        canvas::Action::publish(self.band_msg(hit, band, true)).and_capture(),
                     );
                 }
                 state.drag = Some(hit);
-                Some(canvas::Action::publish(Message::EqSelect(hit)).and_capture())
+                Some(canvas::Action::publish(self.select_msg(hit)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let band_index = *state.drag.as_ref()?;
@@ -121,18 +159,18 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 if band.kind.has_gain() {
                     band.gain_db = gain_of_y(bounds.height, at.y);
                 }
-                Some(
-                    canvas::Action::publish(Message::EqBand {
-                        index: band_index,
-                        band,
-                        commit: false,
-                    })
-                    .and_capture(),
-                )
+                Some(canvas::Action::publish(self.band_msg(band_index, band, false)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.drag.take()?;
-                Some(canvas::Action::publish(Message::EqCommit).and_capture())
+                match self.target {
+                    // Drag release persists the global EQ; slot values are
+                    // already live in the chain shadow.
+                    EqTarget::Global => {
+                        Some(canvas::Action::publish(Message::EqCommit).and_capture())
+                    }
+                    EqTarget::Slot(_) => None,
+                }
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let at = cursor.position_in(bounds)?;
@@ -143,14 +181,7 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 };
                 let mut band = self.state.bands[target];
                 band.q = (band.q * Q_STEP.powf(lines)).clamp(Q_MIN, Q_MAX);
-                Some(
-                    canvas::Action::publish(Message::EqBand {
-                        index: target,
-                        band,
-                        commit: true,
-                    })
-                    .and_capture(),
-                )
+                Some(canvas::Action::publish(self.band_msg(target, band, true)).and_capture())
             }
             _ => None,
         }
@@ -247,6 +278,13 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     }
                 });
                 frame.stroke(&line, thin(Color { a: 0.6, ..METER_OK }, 1.0));
+                if let Some(tag) = self.spectrum_tag {
+                    frame.fill_text(label(
+                        tag.to_string(),
+                        Point::new(w - 18.0, 6.0),
+                        Color { a: 0.8, ..METER_OK },
+                    ));
+                }
             }
 
             // --- EQ response curve (the setting) ---
@@ -255,7 +293,7 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 for i in 0..CURVE_POINTS {
                     let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
                     let freq = freq_of_x(w, x);
-                    let db = lh_dsp::eq::global::response_db(self.state, self.sample_rate, freq);
+                    let db = lh_dsp::eq::global::response_db(&self.state, self.sample_rate, freq);
                     let p = Point::new(x, y_of_gain(h, db.clamp(-GAIN_DB_MAX, GAIN_DB_MAX)));
                     if i == 0 {
                         b.move_to(p);

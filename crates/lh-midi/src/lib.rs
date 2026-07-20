@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::mpsc::Sender;
 
-use midir::{MidiInput, MidiInputConnection};
+use midir::{Ignore, MidiInput, MidiInputConnection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -28,7 +28,9 @@ pub enum MidiError {
     Backend(String),
 }
 
-/// The two message kinds a foot controller sends. Channels are 0-based.
+/// The message kinds the control thread cares about: the two channel-voice
+/// messages a foot controller sends (channels are 0-based) and the system
+/// realtime clock family (PRD 012 — the global tempo's MIDI source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MidiEvent {
     ProgramChange {
@@ -40,11 +42,29 @@ pub enum MidiEvent {
         controller: u8,
         value: u8,
     },
+    /// 0xF8 timing tick, 24 per quarter note. `stamp_us` is the driver's
+    /// arrival timestamp — tick *intervals* carry the tempo, and the control
+    /// thread drains events in frame-sized batches, so wall-clock-at-drain
+    /// would quantize a 20 ms interval to nothing.
+    Clock {
+        stamp_us: u64,
+    },
+    /// 0xFA — the sender restarts; the tick phase begins fresh.
+    Start,
+    /// 0xFC — the clock pauses; tempo freezes at its last value.
+    Stop,
 }
 
-/// Parse one raw MIDI message; anything but PC/CC returns `None`.
-pub fn parse_message(bytes: &[u8]) -> Option<MidiEvent> {
+/// Parse one raw MIDI message; `stamp_us` is attached to clock ticks.
+/// Anything but PC/CC/realtime-clock returns `None`.
+pub fn parse_message(bytes: &[u8], stamp_us: u64) -> Option<MidiEvent> {
     let status = *bytes.first()?;
+    match status {
+        0xF8 => return Some(MidiEvent::Clock { stamp_us }),
+        0xFA => return Some(MidiEvent::Start),
+        0xFC => return Some(MidiEvent::Stop),
+        _ => {}
+    }
     let channel = status & 0x0F;
     match status & 0xF0 {
         0xC0 => Some(MidiEvent::ProgramChange {
@@ -194,6 +214,8 @@ impl MidiMap {
             MidiEvent::ProgramChange { channel, .. } | MidiEvent::ControlChange { channel, .. } => {
                 channel
             }
+            // System realtime has no channel — it always passes.
+            MidiEvent::Clock { .. } | MidiEvent::Start | MidiEvent::Stop => return true,
         };
         self.channel
             .is_none_or(|only| channel == only.saturating_sub(1))
@@ -204,6 +226,9 @@ impl MidiMap {
             return None;
         }
         match *event {
+            // Clock is tempo, not a mappable action — the session's drain
+            // loop consumes it before asking for an action.
+            MidiEvent::Clock { .. } | MidiEvent::Start | MidiEvent::Stop => None,
             MidiEvent::ProgramChange { program, .. } => {
                 match self.pc_presets.get(program as usize) {
                     Some(name) => Some(Action::LoadPreset(name.clone())),
@@ -287,7 +312,10 @@ pub struct MidiConnection {
 /// Connect to a MIDI input and forward parsed events into `tx`.
 /// `selector`: name substring or index; `None` takes the first port.
 pub fn connect(selector: Option<&str>, tx: Sender<MidiEvent>) -> Result<MidiConnection, MidiError> {
-    let input = MidiInput::new(CLIENT_NAME).map_err(|e| MidiError::Backend(e.to_string()))?;
+    let mut input = MidiInput::new(CLIENT_NAME).map_err(|e| MidiError::Backend(e.to_string()))?;
+    // Explicit: never filter system realtime — clock ticks are the tempo
+    // source (PRD 012).
+    input.ignore(Ignore::None);
     let ports = input.ports();
     if ports.is_empty() {
         return Err(MidiError::NoInputs);
@@ -311,8 +339,8 @@ pub fn connect(selector: Option<&str>, tx: Sender<MidiEvent>) -> Result<MidiConn
         .connect(
             &ports[index],
             CLIENT_NAME,
-            move |_timestamp, bytes, _| {
-                if let Some(event) = parse_message(bytes) {
+            move |timestamp, bytes, _| {
+                if let Some(event) = parse_message(bytes, timestamp) {
                     let _ = tx.send(event); // receiver gone = session over
                 }
             },
@@ -332,14 +360,14 @@ mod tests {
     #[test]
     fn parses_pc_and_cc_on_any_channel() {
         assert_eq!(
-            parse_message(&[0xC2, 5]),
+            parse_message(&[0xC2, 5], 0),
             Some(MidiEvent::ProgramChange {
                 channel: 2,
                 program: 5
             })
         );
         assert_eq!(
-            parse_message(&[0xB0, 11, 127]),
+            parse_message(&[0xB0, 11, 127], 0),
             Some(MidiEvent::ControlChange {
                 channel: 0,
                 controller: 11,
@@ -347,9 +375,31 @@ mod tests {
             })
         );
         // Note-on, truncated messages, empty: ignored.
-        assert_eq!(parse_message(&[0x90, 60, 100]), None);
-        assert_eq!(parse_message(&[0xC0]), None);
-        assert_eq!(parse_message(&[]), None);
+        assert_eq!(parse_message(&[0x90, 60, 100], 0), None);
+        assert_eq!(parse_message(&[0xC0], 0), None);
+        assert_eq!(parse_message(&[], 0), None);
+    }
+
+    /// System realtime (PRD 012): clock ticks carry their driver timestamp,
+    /// pass every channel filter, and map to no action.
+    #[test]
+    fn realtime_clock_parses_with_stamp_and_stays_actionless() {
+        assert_eq!(
+            parse_message(&[0xF8], 12_345),
+            Some(MidiEvent::Clock { stamp_us: 12_345 })
+        );
+        assert_eq!(parse_message(&[0xFA], 7), Some(MidiEvent::Start));
+        assert_eq!(parse_message(&[0xFC], 7), Some(MidiEvent::Stop));
+        // 0xFE active sense / 0xFB continue: not ours, ignored.
+        assert_eq!(parse_message(&[0xFE], 7), None);
+        assert_eq!(parse_message(&[0xFB], 7), None);
+
+        let m = map(); // channel-filtered map
+        let tick = MidiEvent::Clock { stamp_us: 1 };
+        assert!(m.on_channel(&tick), "realtime has no channel");
+        assert_eq!(m.action_for(&tick), None);
+        assert_eq!(m.action_for(&MidiEvent::Start), None);
+        assert_eq!(m.action_for(&MidiEvent::Stop), None);
     }
 
     fn map() -> MidiMap {

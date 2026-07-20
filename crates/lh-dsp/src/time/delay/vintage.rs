@@ -7,16 +7,18 @@
 use lh_core::{EffectDesc, ParamDesc};
 
 use super::{
-    Ctl, SUBDIVISION, VoiceDef, depth_param, feedback_param, mix_param, time_param, tone_param,
+    Ctl, SUBDIVISION, SYNC, VoiceDef, depth_param, feedback_param, mix_param, time_param,
+    tone_param,
 };
 
-static PARAMS: [ParamDesc; 6] = [
+static PARAMS: [ParamDesc; 7] = [
     time_param(600.0, 300.0),
     feedback_param(1.05, 0.4),
     mix_param(0.28),
     tone_param(0.3), // dark BBD voicing
     depth_param("mod", "Mod", 0.3),
     SUBDIVISION,
+    SYNC,
 ];
 
 pub static DESC: EffectDesc = EffectDesc {
@@ -34,6 +36,7 @@ pub const VOICE: VoiceDef = VoiceDef {
         Ctl::Tone,
         Ctl::ModA, // Mod
         Ctl::Subdivision,
+        Ctl::Sync,
     ],
     saturate: true,
     drive: 2.2,

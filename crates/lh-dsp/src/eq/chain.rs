@@ -1,12 +1,14 @@
-//! Post-amp EQ: low shelf (120 Hz) + sweepable mid peak + high shelf
-//! (3.2 kHz). Gains and mid frequency are smoothed; biquad coefficients are
-//! recomputed once per block from the smoothed values — at 48 kHz / 64
+//! The 3-band tone pedal: low shelf (120 Hz) + sweepable mid peak + high
+//! shelf (3.2 kHz). Gains and mid frequency are smoothed; biquad coefficients
+//! are recomputed once per block from the smoothed values — at 48 kHz / 64
 //! samples that is a 750 Hz update rate, far above audibility of zipper
 //! noise, and it keeps transcendental math out of the per-sample loop.
+//!
+//! Since PRD 011 this is the first pedal of the two-pedal `eq` family (the
+//! wrapper in [`super`] owns the `Effect` impl and dispatches here).
 
-use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
+use lh_core::{EffectDesc, ParamDesc, Range};
 
-use crate::Effect;
 use crate::blocks::biquad::Biquad;
 use crate::blocks::smooth::Smoothed;
 
@@ -67,14 +69,7 @@ pub static DESC: EffectDesc = EffectDesc {
     params: &PARAMS,
 };
 
-/// Single-pedal family: the pedal key doubles as the family key.
-pub static FAMILY: FamilyDesc = FamilyDesc {
-    key: "eq",
-    name: "EQ",
-    pedals: &[&DESC],
-};
-
-pub struct Eq {
+pub struct Tone {
     sample_rate: f32,
     low_db: Smoothed,
     mid_db: Smoothed,
@@ -89,13 +84,13 @@ pub struct Eq {
     high: [Biquad; 2],
 }
 
-impl Default for Eq {
+impl Default for Tone {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Eq {
+impl Tone {
     pub fn new() -> Self {
         Self {
             sample_rate: 48_000.0,
@@ -139,14 +134,8 @@ impl Eq {
             self.high[ch].set_high_shelf(self.sample_rate, HIGH_SHELF_HZ, self.high_db.current());
         }
     }
-}
 
-impl Effect for Eq {
-    fn family(&self) -> &'static FamilyDesc {
-        &FAMILY
-    }
-
-    fn prepare(&mut self, sample_rate: u32) {
+    pub fn prepare(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate as f32;
         for (smoothed, desc) in [
             (&mut self.low_db, &PARAMS[0]),
@@ -162,7 +151,7 @@ impl Effect for Eq {
         self.reset();
     }
 
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         for ch in 0..2 {
             self.low[ch].reset();
             self.mid[ch].reset();
@@ -170,7 +159,7 @@ impl Effect for Eq {
         }
     }
 
-    fn set_param(&mut self, index: usize, normalized: f32) {
+    pub fn set_param(&mut self, index: usize, normalized: f32) {
         let Some(param) = PARAMS.get(index) else {
             return;
         };
@@ -185,7 +174,7 @@ impl Effect for Eq {
         self.dirty = true;
     }
 
-    fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
+    pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         self.update_coeffs(left.len());
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let mut y = self.low[0].process_sample(*l);
@@ -206,18 +195,18 @@ mod tests {
 
     const SR: u32 = 48_000;
 
-    fn prepared() -> Eq {
-        let mut eq = Eq::new();
+    fn prepared() -> Tone {
+        let mut eq = Tone::new();
         eq.prepare(SR);
         eq
     }
 
-    fn set(eq: &mut Eq, index: usize, real: f32) {
+    fn set(eq: &mut Tone, index: usize, real: f32) {
         eq.set_param(index, PARAMS[index].range.to_norm(real));
     }
 
     /// Steady-state gain (dB) at `freq` through the whole EQ.
-    fn gain_at(eq: &mut Eq, freq: f32) -> f32 {
+    fn gain_at(eq: &mut Tone, freq: f32) -> f32 {
         let x = sine(SR, freq, SR as usize / 2);
         let mut y = x.clone();
         let mut yr = x.clone();
@@ -290,7 +279,7 @@ mod tests {
     #[test]
     fn survives_all_rates_and_block_sizes() {
         for sr in [44_100u32, 48_000, 96_000] {
-            let mut eq = Eq::new();
+            let mut eq = Tone::new();
             eq.prepare(sr);
             set(&mut eq, 0, 8.0);
             set(&mut eq, 1, -6.0);

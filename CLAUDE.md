@@ -387,6 +387,98 @@ criterion harness. Engine tail suite (rings-then-evicts, hard-cut contrast,
 forced-decay cap, lane exhaustion) uses a deterministic feedback-resonator
 test effect. **Plugin unchanged** — hosts own their tail handling.
 
+**M14 (parametric EQ pedal) — code landed (uncommitted).** Specced in
+PRD 011, recorded as ADR 014. First item of the 2026-07-20 nine-feature
+roadmap (user-picked: recorder/re-amp, looper, global tempo sync, comp
+family, power-amp sim, practice tools, setlists+leveling, pitch family,
+this). The `eq` slot became a **two-pedal family** (3-band keeps key
+`eq`; `parametric` appended — no schema bump). The parametric **is**
+`GlobalEq` reused as a core behind a 40-param façade (`b1_on`..`b8_q`,
+kinds pinned to `BandKind::ALL`, defaults = the global layout, all-off =
+bit-transparent fast path); slot bypass stays the engine crossfade (core
+master pinned 1.0). The 3-band demoted to `eq::chain::Tone` (inherent
+methods); **`eq::Eq` is now the family dispatcher** — session/plugin
+imports unchanged; engine/session/preset needed zero code. GUI: `EqPanel`
+gained `EqTarget::{Global, Slot}` — the parametric faceplate on the board
+renders the same canvas + detail strip (type/on-off/readout/flat), edits
+diff-and-send through the slot param path (shadow-live, MIDI-learnable via
+REPL `learn eq.b3_freq`, scene-morphable), spectrum overlay = the output
+tap tagged "OUT" (no per-slot taps); the FFT also runs while a parametric
+faceplate is showing. Livery: analyzer ice; eq joined the distinct-livery
+pin (6 families). Plugin: **pre-v0.1 id break** — eq now qualifies ids
+with the pedal key (`eq_low` → `eq_eq_low`), `eq_parametric_*` +
+`eq_pedal` appear; re-run clap-validator. Bench `eq_parametric_4band` ≈
+`global_eq_4band` (same-box parity ~1.45 µs — settled-skip inherited).
+
+**M15 (global tempo) — code landed (uncommitted).** Specced in PRD 012,
+recorded as ADR 015. Second item of the 2026-07-20 roadmap. Tap tempo,
+MIDI clock, and (plugin) host transport BPM now feed **one session-owned
+`TempoState`** instead of the GUI's per-slot `TapState` (deleted outright
+— session's `tap_tempo`/`apply_tempo`/`apply_tempo_to` are a straight
+port of the same math). Delay voices gained a second control-side-only
+param **`sync`** (`Ctl::Sync => {}`, ADR 007's `subdivision` pattern) —
+on, a slot's `time` is re-derived from the tempo × its subdivision
+whenever either changes; **zero engine/DSP-audio-path changes**.
+`lh-midi` parses realtime bytes (`Ignore::None` — midir filters them by
+default): `MidiEvent::Clock { stamp_us }` / `Start` / `Stop`, `stamp_us`
+being the driver's own timestamp (tick *intervals* carry the tempo; a
+control-thread wall-clock read at drain time would quantize it away).
+Session takes the **median** of the last 48 tick intervals (mean would
+let one USB hiccup bend the reading) with a plausibility gate (4–120 ms/
+tick) that restarts accumulation on a gap; a changed-BPM line and the
+per-slot resync are hysteresis-gated (<0.5% wobble is silent) so a
+steady external clock doesn't repaint the status bar or requeue chain
+messages every tick. GUI: footer grew a global **♩ BPM chip** (click =
+tap); the delay faceplate's TAP row now reads the session tempo and
+grew a **SYNC chip** next to it (the boolean gets a toggle, not the
+generic stepped-param dropdown). MIDI: virtual `tempo.tap` target
+(`SetParam` gated on `norm >= 0.5` — the press, not a momentary switch's
+release; PRD 008's `snapshot.select` pattern). REPL: `tap` / `tempo` /
+`tempo <bpm>`. **Plugin**: `apply_tempo_sync` runs once per block after
+the existing float-forwarding loop — while the active delay pedal's
+`sync` is on, `context.transport().tempo` (pure math split into
+`synced_time_ms`, unit-tested without a `ProcessContext` mock) overrides
+`time` and the host's own `time` automation is ignored until `sync` goes
+off again (the host param itself is never touched, so no restore logic
+is needed on the way back). No host tempo (or `sync` off) leaves `time`
+exactly where the normal forwarding loop already put it. Plugin gains
+`delay_{digital,tape,vintage}_sync` (**pre-v0.1 id addition**, purely
+additive — no renames this time), re-run clap-validator.
+
+**M16 (looper) — code landed (uncommitted).** Specced in PRD 013, recorded as
+ADR 016. First item of the 2026-07-20 nine-feature roadmap after tempo. New
+single-pedal family `looper` — the **first add-only family**: buildable +
+offered in the "＋" menu but **not** in `DEFAULT_CHAIN` and **not** in the
+plugin (standalone-only, ADR 013's reasoning). The registry↔default-chain
+test relaxed from "equal" to "default chain is the registry prefix; the rest
+are add-only." **Engine and session message set untouched**: transport
+(`rec`/`undo`/`clear`) are momentary linear params, rising-edge-through-0.5 in
+`set_param` (the `tempo.tap` idiom); the GUI/REPL/MIDI fire a **1.0→0.0
+pulse** (the FIFO ring keeps both edges; the shadow settles at 0 so a preset
+never stores a held button → no re-trigger on load). One-button state machine
+`Empty→Recording→Playing→Overdubbing→Playing…`. Two 60 s stereo banks
+preallocated in `prepare` (~46 MB @ 48 k, ~92 MB @ 96 k; the alloc rides
+`install_slot` on the control thread). `clear`/`reset` are **logical** (reset
+`loop_len`, never `memset` the multi-MB banks on the RT thread — reads stay in
+`[0,loop_len)`, recording overwrites from 0). **One-level undo/redo = a
+bank-index swap** (no audio-thread copy); the undo snapshot is filled by
+copy-*before*-sum during an overdub's first pass, valid once that pass
+completes; undo gated to `Playing`. Overdub sums in place with a `tanh` soft
+clip (bounded infinite stacking). Playback is a **single interpolated tap +
+smoothstep boundary fade** (~6 ms dip at the wrap kills seam clicks without
+the two-grain smear a single stored loop would suffer); `reverse`/`half` are
+`Playing`-only read modifiers, record/overdub run forward at an integer head.
+Faceplate: REC/UNDO/CLEAR buttons + reverse/half chips + level/mix knobs + a
+state LED (red/green/amber) driven by a **control-side session mirror** (the
+effect's state isn't tapped out of the engine; the mirror advances on the same
+presses the session forwards — best-effort, only ever mistints an LED).
+Livery: orchid/magenta. REPL `looper <slot> rec|undo|clear`. **No preset
+schema bump** (new vocabulary; transport stored as 0), **no plugin id change**.
+15 DSP tests (state machine, undo/redo swap, clear, reverse/half read,
+overdub soft-clip bound, seam delta bound, mix-0 bit-exact, 60 s @ 96 k cap,
+multi-rate). ~0.65–1.03 µs/block record/play/overdub (`looper_*` benches,
+≤0.08 % deadline). v2: tempo-quantized length, multi-undo, loop→WAV export.
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -445,8 +537,32 @@ switch to B: the A tail rings out while B is instantly playable; pull a
 ringing reverb off the board — tail continues; rapid A/B between two
 space-heavy presets doesn't click; `spillover off` cuts tails immediately
 for contrast; **and confirm `assert_no_alloc` stays quiet** in a debug
-build while spilling — a preset switch mid-note must not SIGABRT), plus the
-standing M7 items
+build while spilling — a preset switch mid-note must not SIGABRT),
+**the parametric EQ pedal** (switch the eq slot to Parametric, drag a bell
+while playing — curve, spectrum, and ear agree, no zipper; wheel = Q,
+double-click = band on/off, flat button; move the slot pre-drive vs
+post-cab and hear the position; `add eq` for a second instance with its
+own memory; save/reload a board with parametric values; an old preset
+still loads as the 3-band untouched; plugin ids re-checked — `eq_eq_*`
+rename plus `eq_parametric_*`),
+**global tempo** (tap the footer BPM chip a few times — it locks in and a
+sync-on delay's echo snaps to it; a sync-on slot also relocks the instant
+you flip its subdivision; feed MIDI clock from a DAW/drum machine — the
+chip tracks it, stop the clock and a manual tap immediately takes back
+over; `tempo.tap` bound to a momentary footswitch taps cleanly, not on
+release; plugin in a host — turn `sync` on a delay pedal, confirm it
+locks to the project tempo and the host's own `time` automation lane goes
+inert, then flip `sync` off and confirm `time` snaps back to whatever the
+host has stored; plugin ids re-checked — `delay_*_sync` appeared),
+**the looper by ear** (`add looper`; REC records a phrase, REC again plays
+it, REC again overdubs a layer, UNDO drops the layer and UNDO again brings it
+back, CLEAR empties it; drag the looper before the drive to loop a clean DI
+vs after the cab for the full wet tone; reverse plays it backward, half drops
+it an octave; the seam doesn't click; a foot CC on `looper.rec` punches the
+loop and the faceplate LED tracks it — red recording / green playing / amber
+overdub; **confirm `assert_no_alloc` stays quiet** in a debug build while
+recording/overdubbing/undoing — a transport press mid-note must not SIGABRT),
+plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
 after that.

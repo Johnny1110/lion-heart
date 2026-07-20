@@ -13,6 +13,7 @@
 //! - [`drive`] — the overdrive/distortion pedal family (one file per pedal)
 //! - [`eq`] — the in-chain tone EQ and the global output EQ
 //! - [`filter`] — envelope-driven filters (auto-wah)
+//! - [`looper`] — record / overdub / undo loop pedal (a chain slot)
 //! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
 //! - [`time`] — delay, reverb
 //! - [`cab`] — cabinet IR convolution
@@ -25,6 +26,7 @@ pub mod drive;
 pub mod dynamics;
 pub mod eq;
 pub mod filter;
+pub mod looper;
 pub mod modulation;
 pub mod testutil;
 pub mod time;

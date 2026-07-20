@@ -20,7 +20,6 @@ mod spectrum;
 mod theme;
 mod tuner;
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -39,7 +38,7 @@ use crate::session::{
     save_preset_order,
 };
 use browser::Browser;
-use eq::EqPanel;
+use eq::{EqPanel, EqTarget};
 use lh_core::global_eq::{Band, BandKind};
 use meter::{Ballistics, Meters};
 use spectrum::SpectrumAnalyzer;
@@ -56,10 +55,6 @@ const PRESET_SCAN_FRAMES: u32 = 60;
 /// Keep showing the last tuner reading this long after the note decays.
 const TUNER_HOLD: Duration = Duration::from_millis(800);
 const MAX_KNOBS: usize = 8;
-/// A gap longer than this between taps starts a fresh tempo (PRD 004).
-const TAP_TIMEOUT: Duration = Duration::from_millis(2_000);
-/// Inter-tap intervals averaged for the tempo estimate.
-const TAP_HISTORY: usize = 4;
 
 pub fn run(args: GuiArgs) -> anyhow::Result<()> {
     iced::application(move || App::new(&args), App::update, App::view)
@@ -116,9 +111,18 @@ pub enum Message {
     SnapshotChip(String),
     /// The ⤓ button: (over)write the active scene from the live board.
     SnapshotStore(String),
-    /// Tap-tempo button on a delay faceplate (PRD 004): each press is timed
-    /// on arrival; two-plus in rhythm set the delay time.
+    /// Global tap-tempo (PRD 012): the footer BPM chip. `Tap` has no slot
+    /// (the session-wide tempo); `TapTempo` is a delay faceplate's own TAP
+    /// button — that slot's time is set even with `sync` off (the pre-012
+    /// per-slot behavior, preserved).
+    Tap,
     TapTempo(String),
+    /// A looper transport momentary press (PRD 013): `action` is
+    /// `"rec"`/`"undo"`/`"clear"`, fired as a 1.0→0.0 pulse by the session.
+    LooperPress {
+        slot: String,
+        action: &'static str,
+    },
     OpenBrowser(AssetKind),
     BrowserNav(PathBuf),
     BrowserPick(PathBuf),
@@ -138,6 +142,17 @@ pub enum Message {
     EqKind(BandKind),
     EqMaster,
     EqFlat,
+    /// Live band edit of a slot's parametric pedal on the board faceplate
+    /// (PRD 011) — flows through the slot param path like a knob drag.
+    PedalEqBand {
+        slot: String,
+        index: usize,
+        band: Band,
+    },
+    PedalEqSelect(usize),
+    /// Reset every band of a slot's parametric pedal to the transparent
+    /// default layout.
+    PedalEqFlat(String),
     ToggleSettings,
     SettingsInput(DeviceChoice),
     SettingsOutput(DeviceChoice),
@@ -522,17 +537,6 @@ struct DragState {
     over: Option<usize>,
 }
 
-/// Per-delay tap-tempo state (PRD 004): the last tap's arrival and the
-/// running average of recent intervals, kept UI-side and never persisted.
-#[derive(Default)]
-struct TapState {
-    last: Option<Instant>,
-    /// Seconds per tapped beat (a quarter note), once two-plus taps land.
-    period: Option<f32>,
-    /// Recent inter-tap intervals (seconds), newest last.
-    history: Vec<f32>,
-}
-
 struct ParamUi {
     key: &'static str,
     name: &'static str,
@@ -718,11 +722,12 @@ struct Running {
     analyzer: SpectrumAnalyzer,
     eq_selected: usize,
     eq_cache: canvas::Cache,
+    /// Selected band of the board's parametric-pedal editor (PRD 011).
+    pedal_eq_selected: usize,
+    pedal_eq_cache: canvas::Cache,
     slots: Vec<SlotUi>,
     selected: String,
     drag: Option<DragState>,
-    /// Tap-tempo state per delay instance handle (PRD 004).
-    taps: BTreeMap<String, TapState>,
     view: View,
     preset_name: String,
     presets: Vec<String>,
@@ -856,10 +861,11 @@ impl Running {
             analyzer,
             eq_selected: 2,
             eq_cache: canvas::Cache::new(),
+            pedal_eq_selected: 2,
+            pedal_eq_cache: canvas::Cache::new(),
             slots: Vec::new(),
             selected: String::new(),
             drag: None,
-            taps: BTreeMap::new(),
             view: View::Board,
             preset_name: active_preset.clone().unwrap_or_default(),
             presets: list_presets(),
@@ -947,6 +953,7 @@ impl Running {
         for cache in &self.knob_caches {
             cache.clear();
         }
+        self.pedal_eq_cache.clear();
     }
 
     /// Refresh one param's UI mirror after a live knob move — the cheap
@@ -979,55 +986,91 @@ impl Running {
         }
     }
 
-    /// Record a tap and, once a tempo is known, set the delay time (PRD 004).
-    /// Taps more than [`TAP_TIMEOUT`] apart start a fresh tempo; the rest are
-    /// averaged for a steady reading.
-    fn tap(&mut self, slot_key: &str, now: Instant) {
-        let state = self.taps.entry(slot_key.to_string()).or_default();
-        if let Some(last) = state.last {
-            let elapsed = now.duration_since(last);
-            if elapsed < TAP_TIMEOUT {
-                state.history.push(elapsed.as_secs_f32());
-                if state.history.len() > TAP_HISTORY {
-                    state.history.remove(0);
-                }
-                let sum: f32 = state.history.iter().sum();
-                state.period = Some(sum / state.history.len() as f32);
-            } else {
-                state.history.clear();
-                state.period = None;
-            }
-        }
-        state.last = Some(now);
-        self.apply_tap_time(slot_key);
-    }
-
-    /// Set a delay slot's `time` from its tapped tempo × its subdivision.
-    fn apply_tap_time(&mut self, slot_key: &str) {
-        let Some(period) = self.taps.get(slot_key).and_then(|t| t.period) else {
-            return;
-        };
-        let ratio = self.subdivision_ratio_for(slot_key);
-        let time_ms = period * 1_000.0 * ratio;
-        let Some(desc) = self.session.chain.param_desc(slot_key, "time") else {
-            return;
-        };
-        let clamped = desc.range.clamp(time_ms);
-        if let Ok(applied) = self.session.chain.set_param(slot_key, "time", clamped) {
-            self.update_param_ui(slot_key, "time", applied.real);
-            self.status = format!("{slot_key} tap: ♩ = {:.0} bpm", 60.0 / period);
-        }
-    }
-
-    /// The subdivision ratio the delay slot's `subdivision` selector is on.
-    fn subdivision_ratio_for(&self, slot_key: &str) -> f32 {
-        self.slots
+    /// Apply one band of a slot's parametric pedal (PRD 011): diff against
+    /// the UI mirror and send only the changed params, so a drag costs the
+    /// same message traffic as a knob drag.
+    fn apply_pedal_eq_band(&mut self, slot_key: &str, index: usize, band: Band) {
+        use lh_dsp::eq::parametric::BAND_PARAMS;
+        self.pedal_eq_selected = index;
+        let band = band.clamped();
+        let kind_index = BandKind::ALL
+            .iter()
+            .position(|k| *k == band.kind)
+            .unwrap_or(0) as f32;
+        let n = index + 1;
+        let fields: [(String, f32); 5] = [
+            (format!("b{n}_on"), if band.enabled { 1.0 } else { 0.0 }),
+            (format!("b{n}_type"), kind_index),
+            (format!("b{n}_freq"), band.freq),
+            (format!("b{n}_gain"), band.gain_db),
+            (format!("b{n}_q"), band.q),
+        ];
+        // The band's current mirror values, to skip no-ops.
+        let current: Vec<f32> = self
+            .slots
             .iter()
             .find(|s| s.key == slot_key)
-            .and_then(|s| s.params.iter().find(|p| p.key == "subdivision"))
-            .and_then(|p| p.stepped.map(|(_, index)| index))
-            .map(lh_dsp::time::delay::subdivision_ratio)
-            .unwrap_or(1.0)
+            .map(|s| {
+                let desc = s.pedals[s.active_pedal];
+                s.params
+                    .iter()
+                    .zip(desc.params)
+                    .skip(index * BAND_PARAMS)
+                    .take(BAND_PARAMS)
+                    .map(|(p, d)| d.range.to_real(p.norm))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (i, (key, real)) in fields.iter().enumerate() {
+            let unchanged = current
+                .get(i)
+                .is_some_and(|c| (c - real).abs() <= 1e-3 * real.abs().max(1.0));
+            if unchanged {
+                continue;
+            }
+            match self.session.chain.set_param(slot_key, key, *real) {
+                Ok(applied) => {
+                    self.session.midi_desync_param(slot_key, key);
+                    self.update_param_ui(slot_key, key, applied.real);
+                }
+                Err(e) => {
+                    self.status = e.to_string();
+                    return;
+                }
+            }
+        }
+        self.status = format!(
+            "{} band {}: {} {:.0} Hz {:+.1} dB Q {:.2}{}",
+            slot_key,
+            n,
+            band.kind,
+            band.freq,
+            band.gain_db,
+            band.q,
+            if band.enabled { "" } else { " (off)" },
+        );
+        self.pedal_eq_cache.clear();
+    }
+
+    /// Whether the board's selected slot currently shows the parametric
+    /// pedal — its faceplate is the EQ canvas (PRD 011).
+    fn selected_is_parametric(&self) -> bool {
+        self.slots
+            .iter()
+            .find(|s| s.key == self.selected)
+            .and_then(|s| s.pedals.get(s.active_pedal))
+            .is_some_and(|p| p.key == "parametric")
+    }
+
+    /// Apply the session's global tempo (PRD 012) to a slot and, if it
+    /// changed anything, resync the UI mirror and status line. Shared by
+    /// every call site that moves the tempo or a delay's sync/subdivision.
+    fn report_tempo(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        self.status = lines.last().cloned().unwrap_or_default();
+        self.refresh_slots();
     }
 
     /// Select the slot at a chain position and show its faceplate: whatever
@@ -1040,6 +1083,7 @@ impl Running {
             for cache in &self.knob_caches {
                 cache.clear();
             }
+            self.pedal_eq_cache.clear();
         }
     }
 
@@ -1161,10 +1205,11 @@ impl Running {
                     Ok(_) => {
                         self.session.midi_desync_param(&slot, &param);
                         self.refresh_slots();
-                        // Flipping a delay's subdivision re-locks its echo to
-                        // the last tapped tempo (PRD 004).
-                        if param == "subdivision" {
-                            self.apply_tap_time(&slot);
+                        // Flipping a delay's subdivision, or turning sync on,
+                        // re-derives its time from the global tempo (PRD 012).
+                        if param == "subdivision" || param == "sync" {
+                            let lines = self.session.apply_tempo_to(&slot);
+                            self.report_tempo(lines);
                         }
                     }
                     Err(e) => self.status = e.to_string(),
@@ -1225,7 +1270,20 @@ impl Running {
                 Ok(msg) => self.status = msg,
                 Err(e) => self.status = e,
             },
-            Message::TapTempo(slot) => self.tap(&slot, Instant::now()),
+            Message::Tap => {
+                let lines = self.session.tap_tempo(None);
+                self.report_tempo(lines);
+            }
+            Message::TapTempo(slot) => {
+                let lines = self.session.tap_tempo(Some(&slot));
+                self.report_tempo(lines);
+            }
+            Message::LooperPress { slot, action } => {
+                if let Err(e) = self.session.looper_press(&slot, action) {
+                    self.status = e;
+                }
+                self.refresh_slots();
+            }
             Message::OpenBrowser(kind) => {
                 let remembered = match kind {
                     AssetKind::Nam => self.session.config.nam_dir.clone(),
@@ -1320,6 +1378,27 @@ impl Running {
                         format!("global eq {}", if enabled { "enabled" } else { "bypassed" });
                 }
                 self.eq_cache.clear();
+            }
+            Message::PedalEqBand { slot, index, band } => {
+                self.apply_pedal_eq_band(&slot, index, band);
+            }
+            Message::PedalEqSelect(index) => {
+                self.pedal_eq_selected = index;
+                self.pedal_eq_cache.clear();
+            }
+            Message::PedalEqFlat(slot) => {
+                for p in lh_dsp::eq::parametric::DESC.params {
+                    if self
+                        .session
+                        .chain
+                        .set_param(&slot, p.key, p.default)
+                        .is_ok()
+                    {
+                        self.session.midi_desync_param(&slot, p.key);
+                    }
+                }
+                self.refresh_slots();
+                self.status = format!("{slot}: parametric reset to flat");
             }
             Message::EqFlat => {
                 match self.session.reset_global_eq() {
@@ -1678,9 +1757,15 @@ impl Running {
                 chunk.commit_all();
             }
         }
-        if matches!(self.view, View::Eq) && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
+        // The EQ canvases (the global view, or a parametric faceplate on
+        // the board) want live spectrum frames; skip the FFT when neither
+        // is showing.
+        let eq_canvas_open = matches!(self.view, View::Eq)
+            || (matches!(self.view, View::Board) && self.selected_is_parametric());
+        if eq_canvas_open && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
             self.analyzer.update();
             self.eq_cache.clear();
+            self.pedal_eq_cache.clear();
         }
 
         self.drain_tap();
@@ -2358,13 +2443,16 @@ impl Running {
     /// Global output EQ (PRD 003): the spectrum-backed band editor plus a
     /// detail strip for the selected band.
     fn eq_view(&self) -> Element<'_, Message> {
-        let state = self.session.eq_state();
+        let state = self.session.eq_state().clone();
         let band = state.bands[self.eq_selected];
+        let master_on = state.enabled;
 
         let panel = Canvas::new(EqPanel {
             state,
+            target: EqTarget::Global,
             selected: self.eq_selected,
             spectrum: &self.analyzer.bins,
+            spectrum_tag: None,
             sample_rate: self.analyzer.sample_rate(),
             cache: &self.eq_cache,
         })
@@ -2407,16 +2495,9 @@ impl Running {
             button(text("flat").size(12))
                 .on_press(Message::EqFlat)
                 .style(theme::action),
-            button(
-                text(if state.enabled {
-                    "EQ ON"
-                } else {
-                    "EQ BYPASSED"
-                })
-                .size(12)
-            )
-            .on_press(Message::EqMaster)
-            .style(theme::chip(state.enabled)),
+            button(text(if master_on { "EQ ON" } else { "EQ BYPASSED" }).size(12))
+                .on_press(Message::EqMaster)
+                .style(theme::chip(master_on)),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
@@ -2427,6 +2508,93 @@ impl Running {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    /// The parametric pedal's faceplate (PRD 011): the shared EQ canvas
+    /// bound to this slot's band params, plus the band detail strip. The
+    /// spectrum overlay is the output-stage tap (tagged "OUT" — it is not a
+    /// per-slot probe).
+    fn pedal_eq_editor(&self, slot: &SlotUi) -> Element<'_, Message> {
+        let desc = slot.pedals[slot.active_pedal];
+        let reals: Vec<f32> = slot
+            .params
+            .iter()
+            .zip(desc.params)
+            .map(|(p, d)| d.range.to_real(p.norm))
+            .collect();
+        let bands = lh_dsp::eq::parametric::bands_from_reals(&reals);
+        // `enabled` only tints the curve — actual bypass is the slot's LED
+        // and engine crossfade, and a bypassed slot's faceplate still shows
+        // its settings at full strength (knob rule).
+        let state = lh_core::global_eq::GlobalEqState {
+            enabled: true,
+            bands,
+        };
+        let selected = self.pedal_eq_selected.min(bands.len() - 1);
+        let band = state.bands[selected];
+
+        let panel = Canvas::new(EqPanel {
+            state,
+            target: EqTarget::Slot(slot.key.clone()),
+            selected,
+            spectrum: &self.analyzer.bins,
+            spectrum_tag: Some("OUT"),
+            sample_rate: self.analyzer.sample_rate(),
+            cache: &self.pedal_eq_cache,
+        })
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let mut toggled = band;
+        toggled.enabled = !band.enabled;
+        let readout = if band.kind.has_gain() {
+            format!(
+                "{:.0} Hz  {:+.1} dB  Q {:.2}",
+                band.freq, band.gain_db, band.q
+            )
+        } else {
+            format!("{:.0} Hz  Q {:.2}", band.freq, band.q)
+        };
+        let kind_slot = slot.key.clone();
+        let controls = row![
+            text(format!("band {}", selected + 1))
+                .size(13)
+                .color(theme::TEXT_BRIGHT),
+            pick_list(BandKind::ALL, Some(band.kind), move |kind| {
+                let mut b = band;
+                b.kind = kind;
+                if !kind.has_gain() {
+                    b.gain_db = 0.0;
+                }
+                Message::PedalEqBand {
+                    slot: kind_slot.clone(),
+                    index: selected,
+                    band: b,
+                }
+            })
+            .style(theme::pick)
+            .menu_style(theme::menu)
+            .text_size(13),
+            button(text(if band.enabled { "ON" } else { "OFF" }).size(12))
+                .on_press(Message::PedalEqBand {
+                    slot: slot.key.clone(),
+                    index: selected,
+                    band: toggled,
+                })
+                .style(theme::chip(band.enabled)),
+            text(readout)
+                .size(13)
+                .color(theme::TEXT_DIM)
+                .font(iced::Font::MONOSPACE),
+            space().width(Length::Fill),
+            button(text("flat").size(12))
+                .on_press(Message::PedalEqFlat(slot.key.clone()))
+                .style(theme::action),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+
+        column![panel, controls].spacing(10).into()
     }
 
     /// Audio I/O settings: pick devices/channel/buffer, apply restarts the
@@ -2611,6 +2779,15 @@ impl Running {
             let Some((labels, index)) = param.stepped else {
                 continue;
             };
+            // `sync` renders as a chip in the tap row below, not a dropdown
+            // (PRD 012).
+            if param.key == "sync" {
+                continue;
+            }
+            // Looper reverse/half are chips in the transport row (PRD 013).
+            if slot.family_key == "looper" && matches!(param.key, "reverse" | "half") {
+                continue;
+            }
             has_selector = true;
             let slot_key = slot.key.clone();
             let param_key = param.key;
@@ -2646,7 +2823,12 @@ impl Running {
         for (i, param) in slot
             .params
             .iter()
-            .filter(|p| p.stepped.is_none())
+            // Looper rec/undo/clear are momentary buttons in the transport row
+            // below, not knobs (PRD 013).
+            .filter(|p| {
+                p.stepped.is_none()
+                    && !(slot.family_key == "looper" && matches!(p.key, "rec" | "undo" | "clear"))
+            })
             .enumerate()
             .take(MAX_KNOBS)
         {
@@ -2682,11 +2864,18 @@ impl Running {
         let rule = container(space().width(Length::Fill).height(Length::Fixed(2.0)))
             .style(theme::identity_rule(slot.color));
 
+        let parametric = slot.pedals[slot.active_pedal].key == "parametric";
         let mut body = column![title, rule].spacing(12);
-        if has_selector {
-            body = body.push(selectors);
+        if parametric {
+            // The parametric pedal's faceplate is the EQ editor, not a knob
+            // row (PRD 011) — same canvas as the global EQ view.
+            body = body.push(self.pedal_eq_editor(slot));
+        } else {
+            if has_selector {
+                body = body.push(selectors);
+            }
+            body = body.push(knobs);
         }
-        body = body.push(knobs);
         // MIDI learn banner (PRD 008): armed target, cancel, clear-binding.
         if let Some((ls, lp)) = &learn_target {
             let mut banner = row![
@@ -2714,20 +2903,115 @@ impl Running {
             body = body.push(banner);
         }
         body = body.push(
-            text("drag: set · wheel: nudge · double-click: default · right-click: midi learn")
-                .size(11)
-                .color(theme::dim(theme::TEXT_DIM, 0.8)),
+            text(if parametric {
+                "drag: freq/gain · wheel: Q · double-click: band on/off"
+            } else {
+                "drag: set · wheel: nudge · double-click: default · right-click: midi learn"
+            })
+            .size(11)
+            .color(theme::dim(theme::TEXT_DIM, 0.8)),
         );
-        // Tap tempo (PRD 004): a momentary button, not a knob — timed on the
-        // control side, it only sets the `time` param (scaled by the
-        // subdivision selector above).
+        // Looper transport (PRD 013): rec/undo/clear are momentary buttons
+        // (fired as a 1.0→0.0 pulse by the session), reverse/half are chips,
+        // and a state LED (red = recording, green = playing, amber =
+        // overdubbing) mirrors the effect's one-button state machine.
+        if slot.family_key == "looper" {
+            use crate::session::LooperLed;
+            let (led_color, led_label) = match self.session.looper_led(&slot.key) {
+                LooperLed::Empty => (theme::dim(theme::TEXT_DIM, 0.7), "empty"),
+                LooperLed::Recording => (theme::METER_HOT, "recording"),
+                LooperLed::Playing => (theme::METER_OK, "playing"),
+                LooperLed::Overdubbing => (theme::ACCENT, "overdubbing"),
+            };
+            let stepped_on = |key: &str| -> bool {
+                slot.params
+                    .iter()
+                    .find(|p| p.key == key)
+                    .and_then(|p| p.stepped)
+                    .is_some_and(|(_, i)| i == 1)
+            };
+            let reverse_on = stepped_on("reverse");
+            let half_on = stepped_on("half");
+            body = body.push(
+                row![
+                    row![
+                        text("●").size(14).color(led_color),
+                        text(led_label)
+                            .size(13)
+                            .color(theme::TEXT_DIM)
+                            .font(iced::Font::MONOSPACE),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    space().width(Length::Fill),
+                    button(text("⏺ REC").size(13))
+                        .padding([8, 18])
+                        .on_press(Message::LooperPress {
+                            slot: slot.key.clone(),
+                            action: "rec",
+                        })
+                        .style(theme::action),
+                    button(text("↶ UNDO").size(13))
+                        .padding([8, 16])
+                        .on_press(Message::LooperPress {
+                            slot: slot.key.clone(),
+                            action: "undo",
+                        })
+                        .style(theme::action),
+                    button(text("✕ CLEAR").size(13))
+                        .padding([8, 16])
+                        .on_press(Message::LooperPress {
+                            slot: slot.key.clone(),
+                            action: "clear",
+                        })
+                        .style(theme::danger),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            );
+            body = body.push(
+                row![
+                    button(text("reverse").size(12))
+                        .padding([6, 14])
+                        .on_press(Message::Knob {
+                            slot: slot.key.clone(),
+                            param: "reverse".to_string(),
+                            norm: if reverse_on { 0.0 } else { 1.0 },
+                        })
+                        .style(theme::chip(reverse_on)),
+                    button(text("half").size(12))
+                        .padding([6, 14])
+                        .on_press(Message::Knob {
+                            slot: slot.key.clone(),
+                            param: "half".to_string(),
+                            norm: if half_on { 0.0 } else { 1.0 },
+                        })
+                        .style(theme::chip(half_on)),
+                    text("½-speed = octave down · reverse = play backward")
+                        .size(11)
+                        .color(theme::dim(theme::TEXT_DIM, 0.8)),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+        // Tap tempo (PRD 004/012): a momentary button, not a knob — timed on
+        // the control side, it drives the session's global tempo and (via
+        // the subdivision selector above) this slot's `time`. `sync` is a
+        // chip here rather than a dropdown: on, this slot follows every
+        // future tap/clock update instead of just this button's own taps.
         if slot.family_key == "delay" {
             let bpm = self
-                .taps
-                .get(&slot.key)
-                .and_then(|t| t.period)
-                .map(|p| format!("♩ = {:.0} bpm", 60.0 / p))
-                .unwrap_or_else(|| "tap ×2 in rhythm to set the time".to_string());
+                .session
+                .tempo_bpm()
+                .map(|b| format!("♩ = {b:.0} bpm"))
+                .unwrap_or_else(|| "tap ×2 in rhythm to set the tempo".to_string());
+            let synced = slot
+                .params
+                .iter()
+                .find(|p| p.key == "sync")
+                .and_then(|p| p.stepped)
+                .is_some_and(|(_, index)| index == 1);
             body = body.push(
                 row![
                     button(text("TAP").size(15))
@@ -2738,6 +3022,15 @@ impl Running {
                         .size(13)
                         .color(theme::TEXT_DIM)
                         .font(iced::Font::MONOSPACE),
+                    space().width(Length::Fill),
+                    button(text(if synced { "SYNC" } else { "sync" }).size(12))
+                        .padding([6, 14])
+                        .on_press(Message::Knob {
+                            slot: slot.key.clone(),
+                            param: "sync".to_string(),
+                            norm: if synced { 0.0 } else { 1.0 },
+                        })
+                        .style(theme::chip(synced)),
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center),
@@ -2797,7 +3090,18 @@ impl Running {
         let stats = self.session.stats();
         let fps = 1.0 / self.frame_secs.max(1e-4);
         let xruns = stats.underrun_events + stats.overrun_events;
+        let bpm = self
+            .session
+            .tempo_bpm()
+            .map(|b| format!("♩ {b:.0}"))
+            .unwrap_or_else(|| "♩ —".to_string());
         row![
+            // The global tempo (PRD 012): click to tap. Delay faceplates
+            // have their own TAP button; this is the one always in view.
+            button(text(bpm).size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 10])
+                .on_press(Message::Tap)
+                .style(theme::action),
             text(self.status.clone()).size(12).color(theme::TEXT_DIM),
             space().width(Length::Fill),
             // xruns only demand attention when they exist.

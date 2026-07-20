@@ -20,6 +20,7 @@ use lh_dsp::dynamics::Limiter;
 use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
 use lh_dsp::filter::Filter;
+use lh_dsp::looper::Looper;
 use lh_dsp::modulation::Modulation;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
@@ -161,6 +162,21 @@ impl PickupState {
 }
 
 /// A running pedalboard: audio streams live, handles on this side.
+/// GUI-facing mirror of a looper slot's transport state (PRD 013). The DSP
+/// effect owns the authoritative state on the audio thread; the session
+/// mirrors it from the same rec/clear presses it forwards, so the GUI can
+/// color the LED without a status tap out of the engine. Best-effort: a
+/// pathological instant double-tap (recording < 2 samples) can drift the
+/// mirror by one step, which only mistints an LED — never the audio.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum LooperLed {
+    #[default]
+    Empty,
+    Recording,
+    Playing,
+    Overdubbing,
+}
+
 pub struct Session {
     pub chain: ChainHandle,
     pub nam: AssetHandle<NamAsset>,
@@ -180,6 +196,11 @@ pub struct Session {
     snapshots: BTreeMap<String, lh_core::preset::Snapshot>,
     active_snapshot: Option<String>,
     morph: Option<Morph>,
+    /// Global tempo (PRD 012) — session-transient, never persisted.
+    tempo: TempoState,
+    /// Looper transport LED mirror (PRD 013), keyed by slot handle —
+    /// session-transient (a restart re-prepares empty loops).
+    looper_leds: std::collections::HashMap<String, LooperLed>,
 }
 
 /// An in-progress snapshot morph (PRD 009): the value trajectory from the
@@ -203,6 +224,68 @@ struct MorphStep {
 /// A param whose norm moves by less than this over a morph is dropped (a
 /// switch only touches what actually differs).
 const MORPH_EPS: f32 = 1e-4;
+
+// --- global tempo (PRD 012) ---
+
+/// Taps further apart than this start a fresh tempo (the pre-012 GUI
+/// behavior, moved here).
+const TAP_TIMEOUT_SECS: f32 = 2.0;
+/// Inter-tap intervals averaged for the reading.
+const TAP_HISTORY: usize = 4;
+/// 24-ppqn tick intervals kept for the median (~2 beats at the middle).
+const CLOCK_HISTORY: usize = 48;
+/// Ticks needed before the clock claims a tempo (half a beat).
+const CLOCK_MIN_TICKS: usize = 12;
+/// Plausible tick intervals: 24 ppqn over ~20–300 bpm. Outside the window
+/// means a stream gap or garbage — accumulation restarts.
+const CLOCK_TICK_MIN_US: u64 = 4_000;
+const CLOCK_TICK_MAX_US: u64 = 120_000;
+/// Clock wobble below this (relative) does not rewrite synced times.
+const TEMPO_HYSTERESIS: f32 = 0.005;
+pub const TEMPO_MIN_BPM: f32 = 30.0;
+pub const TEMPO_MAX_BPM: f32 = 300.0;
+
+/// Global tempo state (PRD 012): one BPM per session, written by taps
+/// (GUI / REPL / MIDI `tempo.tap`) and MIDI clock, read by delay slots
+/// whose `sync` is on. Session-transient by design — a synced slot's
+/// `time` param is the durable result, so presets stay portable.
+#[derive(Default)]
+struct TempoState {
+    bpm: Option<f32>,
+    /// Last BPM written onto synced slots (the hysteresis anchor).
+    applied_bpm: Option<f32>,
+    tap_last: Option<Instant>,
+    /// Recent inter-tap intervals (seconds), newest last.
+    tap_intervals: Vec<f32>,
+    clock_last_us: Option<u64>,
+    /// Recent inter-tick intervals (seconds), newest last.
+    clock_intervals: Vec<f32>,
+}
+
+/// Mean of the recent taps → BPM; `None` until two taps land.
+fn tap_bpm(intervals: &[f32]) -> Option<f32> {
+    if intervals.is_empty() {
+        return None;
+    }
+    let period = intervals.iter().sum::<f32>() / intervals.len() as f32;
+    Some((60.0 / period).clamp(TEMPO_MIN_BPM, TEMPO_MAX_BPM))
+}
+
+/// Median of the recent 24-ppqn tick intervals → BPM; `None` until
+/// [`CLOCK_MIN_TICKS`] land. Median over mean: one late tick (a USB
+/// scheduling hiccup) cannot bend the tempo.
+fn clock_bpm(intervals: &[f32]) -> Option<f32> {
+    if intervals.len() < CLOCK_MIN_TICKS {
+        return None;
+    }
+    let mut sorted = intervals.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let tick = sorted[sorted.len() / 2];
+    if tick <= 0.0 {
+        return None;
+    }
+    Some((60.0 / (24.0 * tick)).clamp(TEMPO_MIN_BPM, TEMPO_MAX_BPM))
+}
 
 /// One snapshot chip's state for the GUI (PRD 009).
 pub struct SnapshotChip {
@@ -300,11 +383,14 @@ pub struct FamilyEntry {
     ) -> Box<dyn Effect>,
 }
 
-/// Every chain family the session can build, in the default-chain (and add
-/// menu) order — the one place that knows the full rig. Pinned to
-/// [`lh_core::DEFAULT_CHAIN`] by a test, which also pins the plugin's fixed
-/// chain to the same constant.
-pub static FAMILY_REGISTRY: [FamilyEntry; 11] = [
+/// Every chain family the session can build — the one place that knows the
+/// full rig. The first [`lh_core::DEFAULT_CHAIN`]`.len()` entries are the
+/// default board, in order (pinned by a test, which also pins the plugin's
+/// fixed chain to the same constant); any entries past it are **add-only**
+/// families — buildable and offered in the "＋" menu, but not on the default
+/// board and not in the (host-driven) plugin. `looper` is the first of these
+/// (PRD 013: standalone-only, `add looper`).
+pub static FAMILY_REGISTRY: [FamilyEntry; 12] = [
     FamilyEntry {
         desc: &lh_dsp::dynamics::gate::FAMILY,
         asset: None,
@@ -336,7 +422,7 @@ pub static FAMILY_REGISTRY: [FamilyEntry; 11] = [
         },
     },
     FamilyEntry {
-        desc: &lh_dsp::eq::chain::FAMILY,
+        desc: &lh_dsp::eq::FAMILY,
         asset: None,
         build: |_, _, _| Box::new(Eq::new()),
     },
@@ -369,6 +455,12 @@ pub static FAMILY_REGISTRY: [FamilyEntry; 11] = [
         desc: &lh_dsp::dynamics::limiter::FAMILY,
         asset: None,
         build: |_, _, _| Box::new(Limiter::new()),
+    },
+    // --- add-only families (past DEFAULT_CHAIN) ---
+    FamilyEntry {
+        desc: &lh_dsp::looper::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Looper::new()),
     },
 ];
 
@@ -472,6 +564,8 @@ impl Session {
             snapshots: BTreeMap::new(),
             active_snapshot: None,
             morph: None,
+            tempo: TempoState::default(),
+            looper_leds: std::collections::HashMap::new(),
         })
     }
 
@@ -645,6 +739,10 @@ impl Session {
             .chain
             .install_slot(effect, position.unwrap_or(usize::MAX))
             .map_err(|e| e.to_string())?;
+        // A freshly added looper starts empty (PRD 013 LED mirror).
+        if family_key == "looper" {
+            self.looper_leds.insert(handle.clone(), LooperLed::Empty);
+        }
         let mut lines = vec![format!(
             "added {handle} — chain: {}",
             self.chain.order_handles().join(" → ")
@@ -676,10 +774,56 @@ impl Session {
         };
         // A spilled slot desyncs pickup like any structure change (PRD 008).
         self.midi_desync_slot(handle);
+        self.looper_leds.remove(handle);
         Ok(format!(
             "{verb} {handle} — chain: {}",
             self.chain.order_handles().join(" → ")
         ))
+    }
+
+    /// The looper transport LED for a slot handle (PRD 013) — `Empty` for a
+    /// non-looper or unknown handle.
+    pub fn looper_led(&self, handle: &str) -> LooperLed {
+        self.looper_leds.get(handle).copied().unwrap_or_default()
+    }
+
+    /// Whether a slot handle is a looper (single-pedal family: pedal key ==
+    /// family key == "looper").
+    fn is_looper(&self, handle: &str) -> bool {
+        self.chain.active_pedal(handle).is_ok_and(|k| k == "looper")
+    }
+
+    /// Fire a looper transport momentary (`rec`/`undo`/`clear`) as a 1.0→0.0
+    /// pulse — the rising edge triggers the effect, the falling edge re-arms
+    /// it, and the shadow settles at 0 so a preset never stores a held button
+    /// (PRD 013). The LED mirror advances on the press.
+    pub fn looper_press(&mut self, handle: &str, action: &str) -> Result<(), String> {
+        self.chain
+            .set_param(handle, action, 1.0)
+            .map_err(|e| e.to_string())?;
+        self.chain
+            .set_param(handle, action, 0.0)
+            .map_err(|e| e.to_string())?;
+        self.note_looper_transport(handle, action);
+        Ok(())
+    }
+
+    /// Advance the LED mirror for a genuine transport press (once per GUI /
+    /// REPL press; on the rising edge of a MIDI-driven one).
+    fn note_looper_transport(&mut self, handle: &str, action: &str) {
+        let led = self.looper_leds.entry(handle.to_string()).or_default();
+        *led = match action {
+            // The one-button state machine (mirrors the effect's on_rec).
+            "rec" => match *led {
+                LooperLed::Empty => LooperLed::Recording,
+                LooperLed::Recording => LooperLed::Playing,
+                LooperLed::Playing => LooperLed::Overdubbing,
+                LooperLed::Overdubbing => LooperLed::Playing,
+            },
+            "clear" => LooperLed::Empty,
+            // undo/reverse/half don't move the play/record state.
+            _ => *led,
+        };
     }
 
     /// Whether spillover is on (PRD 010).
@@ -692,6 +836,144 @@ impl Session {
         self.config.spillover = on;
         save_config(&self.config);
         format!("spillover {}", if on { "on" } else { "off" })
+    }
+
+    // --- global tempo (PRD 012) ---
+
+    /// The session tempo, if one has been tapped / clocked / set.
+    pub fn tempo_bpm(&self) -> Option<f32> {
+        self.tempo.bpm
+    }
+
+    /// One tap (footer chip, faceplate button, REPL `tap`, MIDI
+    /// `tempo.tap`). `slot` is the faceplate whose TAP was hit: that slot
+    /// gets the derived time even with `sync` off — the pre-PRD 012
+    /// behavior of the per-slot button, preserved.
+    pub fn tap_tempo(&mut self, slot: Option<&str>) -> Vec<String> {
+        let now = Instant::now();
+        let t = &mut self.tempo;
+        if let Some(last) = t.tap_last {
+            let gap = now.duration_since(last).as_secs_f32();
+            if gap < TAP_TIMEOUT_SECS {
+                t.tap_intervals.push(gap);
+                if t.tap_intervals.len() > TAP_HISTORY {
+                    t.tap_intervals.remove(0);
+                }
+            } else {
+                t.tap_intervals.clear(); // stale — start a fresh tempo
+            }
+        }
+        t.tap_last = Some(now);
+        let Some(bpm) = tap_bpm(&t.tap_intervals) else {
+            return Vec::new(); // first tap of a run — nothing to say yet
+        };
+        t.bpm = Some(bpm);
+        let mut lines = vec![format!("tap: ♩ = {bpm:.0} bpm")];
+        lines.extend(self.apply_tempo(slot, false));
+        lines
+    }
+
+    /// Set the tempo directly (REPL `tempo <bpm>`).
+    pub fn set_tempo_bpm(&mut self, bpm: f32) -> Vec<String> {
+        let bpm = bpm.clamp(TEMPO_MIN_BPM, TEMPO_MAX_BPM);
+        self.tempo.bpm = Some(bpm);
+        let mut lines = vec![format!("tempo: ♩ = {bpm:.0} bpm")];
+        lines.extend(self.apply_tempo(None, false));
+        lines
+    }
+
+    /// Re-derive one slot's `time` from the current tempo — its
+    /// subdivision/sync selector just moved. No tempo yet = no-op.
+    pub fn apply_tempo_to(&mut self, slot: &str) -> Vec<String> {
+        let Some(bpm) = self.tempo.bpm else {
+            return Vec::new();
+        };
+        self.retime_delay(slot, 60_000.0 / bpm)
+    }
+
+    /// Push the tempo onto every synced delay instance (plus `one_shot`,
+    /// synced or not). `hysteresis` skips sub-[`TEMPO_HYSTERESIS`] wobble —
+    /// the clock path calls this on every tick.
+    fn apply_tempo(&mut self, one_shot: Option<&str>, hysteresis: bool) -> Vec<String> {
+        let Some(bpm) = self.tempo.bpm else {
+            return Vec::new();
+        };
+        if hysteresis
+            && one_shot.is_none()
+            && self
+                .tempo
+                .applied_bpm
+                .is_some_and(|a| (bpm - a).abs() / a < TEMPO_HYSTERESIS)
+        {
+            return Vec::new();
+        }
+        self.tempo.applied_bpm = Some(bpm);
+        let period_ms = 60_000.0 / bpm;
+        let handles = self.chain.order_handles();
+        let families = self.chain.families();
+        let mut lines = Vec::new();
+        for (handle, family) in handles.iter().zip(families) {
+            if family.key != "delay" {
+                continue;
+            }
+            let synced = self
+                .chain
+                .param_norm(handle, "sync")
+                .is_some_and(|n| n >= 0.5);
+            if synced || one_shot == Some(handle.as_str()) {
+                lines.extend(self.retime_delay(handle, period_ms));
+            }
+        }
+        lines
+    }
+
+    /// `time = quarter-note period × the slot's subdivision`, clamped into
+    /// the voice's range.
+    fn retime_delay(&mut self, slot: &str, period_ms: f32) -> Vec<String> {
+        let ratio = self
+            .chain
+            .param_desc(slot, "subdivision")
+            .zip(self.chain.param_norm(slot, "subdivision"))
+            .map(|(d, n)| lh_dsp::time::delay::subdivision_ratio(d.range.to_real(n) as usize))
+            .unwrap_or(1.0);
+        let Some(desc) = self.chain.param_desc(slot, "time") else {
+            return Vec::new(); // not a delay — nothing to retime
+        };
+        let time = desc.range.clamp(period_ms * ratio);
+        match self.chain.set_param(slot, "time", time) {
+            Ok(applied) => vec![format!("{slot}: time = {:.0} ms", applied.real)],
+            Err(e) => vec![e.to_string()],
+        }
+    }
+
+    /// One 0xF8 tick: interval → ring → median BPM. Absurd or gapped
+    /// intervals restart the accumulation (PRD 012).
+    fn on_clock_tick(&mut self, stamp_us: u64, lines: &mut Vec<String>) {
+        let bpm = {
+            let t = &mut self.tempo;
+            if let Some(last) = t.clock_last_us {
+                let dt = stamp_us.saturating_sub(last);
+                if (CLOCK_TICK_MIN_US..=CLOCK_TICK_MAX_US).contains(&dt) {
+                    t.clock_intervals.push(dt as f32 / 1e6);
+                    if t.clock_intervals.len() > CLOCK_HISTORY {
+                        t.clock_intervals.remove(0);
+                    }
+                } else {
+                    t.clock_intervals.clear();
+                }
+            }
+            t.clock_last_us = Some(stamp_us);
+            clock_bpm(&t.clock_intervals)
+        };
+        let Some(bpm) = bpm else { return };
+        // Status only when the reading meaningfully moves — a steady clock
+        // must not repaint the status bar 120 times a second.
+        let announce = self.tempo.bpm.is_none_or(|old| (old - bpm).abs() >= 1.0);
+        self.tempo.bpm = Some(bpm);
+        if announce {
+            lines.push(format!("midi: clock ♩ = {bpm:.0} bpm"));
+        }
+        lines.extend(self.apply_tempo(None, true));
     }
 
     /// Apply everything the foot controller sent since the last call.
@@ -709,6 +991,20 @@ impl Session {
     }
 
     fn apply_midi_event(&mut self, event: lh_midi::MidiEvent, lines: &mut Vec<String>) {
+        // System realtime is tempo, not mapping (PRD 012).
+        match event {
+            lh_midi::MidiEvent::Clock { stamp_us } => {
+                self.on_clock_tick(stamp_us, lines);
+                return;
+            }
+            lh_midi::MidiEvent::Start | lh_midi::MidiEvent::Stop => {
+                // Fresh phase on start; a stop freezes the tempo where it is.
+                self.tempo.clock_last_us = None;
+                self.tempo.clock_intervals.clear();
+                return;
+            }
+            _ => {}
+        }
         let controller = match event {
             lh_midi::MidiEvent::ControlChange { controller, .. } => Some(controller),
             _ => None,
@@ -771,6 +1067,22 @@ impl Session {
                     }
                     return;
                 }
+                // Virtual `tempo.tap` target (PRD 012): a press (value ≥ 64)
+                // is one tap; the release half of a momentary switch is not.
+                if slot == "tempo" {
+                    if param == "tap" {
+                        if norm >= 0.5 {
+                            for line in self.tap_tempo(None) {
+                                lines.push(format!("midi: {line}"));
+                            }
+                        }
+                    } else {
+                        lines.push(format!(
+                            "midi: unknown tempo target tempo.{param} — use \"tempo.tap\""
+                        ));
+                    }
+                    return;
+                }
                 // `slot.pedal` (and the pre-v3 aliases) selects a pedal;
                 // everything else lands on the active pedal's knobs.
                 if lh_engine::is_pedal_selector(&param) {
@@ -792,13 +1104,23 @@ impl Session {
                     Some(p) => {
                         let real = p.range.to_real(norm);
                         match self.chain.set_param(&slot, &param, real) {
-                            Ok(applied) => lines.push(match p.range.label(applied.real) {
-                                Some(label) => format!("midi: {slot}.{param} = {label}"),
-                                None => format!(
-                                    "midi: {slot}.{param} = {:.2} {}",
-                                    applied.real, applied.unit
-                                ),
-                            }),
+                            Ok(applied) => {
+                                // A momentary footswitch press (norm ≥ 0.5) on
+                                // a looper advances the LED mirror (PRD 013).
+                                if norm >= 0.5
+                                    && matches!(param.as_str(), "rec" | "clear")
+                                    && self.is_looper(&slot)
+                                {
+                                    self.note_looper_transport(&slot, &param);
+                                }
+                                lines.push(match p.range.label(applied.real) {
+                                    Some(label) => format!("midi: {slot}.{param} = {label}"),
+                                    None => format!(
+                                        "midi: {slot}.{param} = {:.2} {}",
+                                        applied.real, applied.unit
+                                    ),
+                                })
+                            }
                             Err(e) => lines.push(format!("midi: {e}")),
                         }
                     }
@@ -806,6 +1128,14 @@ impl Session {
                 }
             }
             lh_midi::Action::SetActive { slot, active } => {
+                if slot == "tempo" {
+                    lines.push(
+                        "midi: map a controller to \"tempo.tap\" (each press taps), \
+                         not bare \"tempo\""
+                            .into(),
+                    );
+                    return;
+                }
                 if slot == "snapshot" {
                     lines.push(
                         "midi: map a controller to \"snapshot.select\" (a value \
@@ -1240,6 +1570,8 @@ impl Session {
         // Every param may have moved out from under a pedal: pickup-gated
         // controllers must re-engage before they speak again (PRD 008).
         self.midi_desync_all();
+        // A fresh board rebuilds any looper slots empty (PRD 013 LED mirror).
+        self.looper_leds.clear();
         Ok(lines)
     }
 
@@ -1609,11 +1941,22 @@ mod tests {
     #[test]
     fn registry_matches_the_default_chain_and_its_invariants() {
         let keys: Vec<&str> = FAMILY_REGISTRY.iter().map(|e| e.desc.key).collect();
+        // The default board is the registry's prefix, in order; anything past
+        // it is an add-only family (PRD 013's looper — not on the default
+        // board, not in the plugin).
         assert_eq!(
-            keys,
-            lh_core::DEFAULT_CHAIN,
-            "registry order is the default chain"
+            &keys[..lh_core::DEFAULT_CHAIN.len()],
+            &lh_core::DEFAULT_CHAIN[..],
+            "the default chain is the registry prefix"
         );
+        let add_only: Vec<&str> = keys[lh_core::DEFAULT_CHAIN.len()..].to_vec();
+        assert_eq!(add_only, ["looper"], "add-only families past the board");
+        for key in &add_only {
+            assert!(
+                !lh_core::DEFAULT_CHAIN.contains(key),
+                "add-only family {key:?} must not be in the default chain"
+            );
+        }
         for (i, a) in keys.iter().enumerate() {
             // Trailing digits are reserved for instance handles ("drive2");
             // the engine's handle parser depends on it.
@@ -1884,5 +2227,55 @@ mod tests {
         assert_eq!(chain_summary(&preset), "gate → (evva)");
         preset.chain.clear();
         assert_eq!(chain_summary(&preset), "passthrough");
+    }
+
+    // --- global tempo (PRD 012) ---
+
+    #[test]
+    fn tap_bpm_needs_two_taps_and_averages_the_rest() {
+        assert_eq!(tap_bpm(&[]), None, "one tap: no interval yet");
+        // Exactly 0.5 s apart = 120 bpm.
+        let bpm = tap_bpm(&[0.5]).unwrap();
+        assert!((bpm - 120.0).abs() < 0.1);
+        // A steadier run of taps averages out a slightly early one: mean
+        // period 0.4875 s ⇒ 123.08 bpm.
+        let bpm = tap_bpm(&[0.5, 0.5, 0.45, 0.5]).unwrap();
+        assert!((bpm - 123.08).abs() < 0.1, "got {bpm}");
+    }
+
+    #[test]
+    fn tap_bpm_clamps_to_the_supported_range() {
+        // A wild single tap (2 s later ⇒ 30 bpm floor is fine, but a
+        // near-instant double tap must not report an absurd bpm).
+        let bpm = tap_bpm(&[0.02]).unwrap(); // 3000 bpm, uncapped
+        assert_eq!(bpm, TEMPO_MAX_BPM);
+        let bpm = tap_bpm(&[5.0]).unwrap(); // 12 bpm, uncapped
+        assert_eq!(bpm, TEMPO_MIN_BPM);
+    }
+
+    #[test]
+    fn clock_bpm_needs_min_ticks_and_uses_the_median() {
+        // 24 ppqn @ 120 bpm ⇒ 20.833... ms/tick.
+        let tick = 60.0 / 120.0 / 24.0;
+        let steady = vec![tick; CLOCK_MIN_TICKS - 1];
+        assert_eq!(clock_bpm(&steady), None, "one short of the minimum");
+
+        let mut ticks = vec![tick; CLOCK_MIN_TICKS];
+        assert!(clock_bpm(&ticks).is_some());
+        let bpm = clock_bpm(&ticks).unwrap();
+        assert!((bpm - 120.0).abs() < 0.1, "got {bpm}");
+
+        // One wild outlier (a scheduling hiccup) must not move the median.
+        ticks.push(tick * 20.0);
+        let bpm = clock_bpm(&ticks).unwrap();
+        assert!((bpm - 120.0).abs() < 0.1, "outlier moved the median: {bpm}");
+    }
+
+    #[test]
+    fn clock_bpm_clamps_to_the_supported_range() {
+        let fast = vec![0.001f32; CLOCK_MIN_TICKS]; // absurdly fast ticks
+        assert_eq!(clock_bpm(&fast), Some(TEMPO_MAX_BPM));
+        let slow = vec![1.0f32; CLOCK_MIN_TICKS]; // absurdly slow ticks
+        assert_eq!(clock_bpm(&slow), Some(TEMPO_MIN_BPM));
     }
 }
