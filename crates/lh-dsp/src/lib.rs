@@ -15,6 +15,7 @@
 //! - [`filter`] — envelope-driven filters (auto-wah)
 //! - [`looper`] — record / overdub / undo loop pedal (a chain slot)
 //! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
+//! - [`pitch`] — octave / interval shifters (granular, one shared engine)
 //! - [`time`] — delay, reverb
 //! - [`cab`] — cabinet IR convolution
 //! - [`tuner`] — pitch analysis (not an effect; feeds the GUI)
@@ -28,6 +29,8 @@ pub mod eq;
 pub mod filter;
 pub mod looper;
 pub mod modulation;
+pub mod pitch;
+pub mod practice;
 pub mod testutil;
 pub mod time;
 pub mod tuner;

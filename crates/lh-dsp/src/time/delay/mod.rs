@@ -21,12 +21,20 @@
 //! (unity small-signal, bounded loud — repeats compress instead of running
 //! away); `digital` stays linear.
 //!
-//! **Tap tempo and sync** (PRD 004/012) are control-side features: the
-//! `subdivision` and `sync` stepped params are stored here and shown in the
-//! UI, but the tempo itself — tapped, MIDI-clocked, or (plugin) read from
-//! the host transport — lives one layer up (the session, or the plugin's
-//! forwarding code). The engine treats both params as no-ops — they modify
-//! control-side tap/clock→time math, never the audio path.
+//! **Tap tempo** (PRD 004) is a control-side feature: the `subdivision`
+//! stepped param is stored here and shown in the UI, but the tap button
+//! itself lives in the GUI and only ever sets the `time` param. The engine
+//! treats `subdivision` as a no-op — it is a modifier for the control-side
+//! tap→time math, not an audio parameter.
+//!
+//! **Tempo sync** (ADR 014) is the other control-side selector: the `sync`
+//! stepped param locks `time` to the rig's global BPM (a note division) when
+//! it is anything but *Free*. The BPM itself is tapped, MIDI-clocked, or
+//! (plugin) read from the host transport one layer up (the session, or the
+//! plugin's forwarding code). The DSP treats `sync` as a no-op too — the
+//! control side reads it, derives the time via [`lh_core::tempo`], and sends
+//! it down the normal `time` smoother. Both selectors sit at the tail of every
+//! voice's faceplate.
 
 mod digital;
 mod tape;
@@ -135,17 +143,18 @@ const SUBDIVISION: ParamDesc = ParamDesc {
     smoothing_ms: 0.0,
 };
 
-/// Follow the global tempo (PRD 012) — another control-side modifier: when
-/// on, the session (or the plugin's forwarding layer) rewrites `time` from
-/// the current tempo × `subdivision`; the audio path never reads it.
+/// Global-tempo lock (ADR 014): **Free** = the Time knob rules; any note
+/// division locks `time` to the rig's BPM (the standalone session derives it
+/// each control tick; the plugin from the host transport). Like `subdivision`,
+/// it is control-side only and does nothing in the audio path.
 const SYNC: ParamDesc = ParamDesc {
     key: "sync",
     name: "Sync",
     unit: "",
     range: Range::Stepped {
-        labels: &["off", "on"],
+        labels: lh_core::tempo::SYNC_DIVISIONS,
     },
-    default: 0.0,
+    default: 0.0, // Free
     smoothing_ms: 0.0,
 };
 
@@ -173,7 +182,7 @@ enum Ctl {
     /// Fast LFO depth — tape Flutter.
     ModB,
     Subdivision,
-    /// Tempo-follow toggle (PRD 012) — control-side, like `Subdivision`.
+    /// Global-tempo lock selector (control-side only, like `Subdivision`).
     Sync,
 }
 
@@ -408,7 +417,7 @@ impl Effect for Delay {
             Ctl::Tone => self.tone.set_target(real),
             Ctl::ModA => self.mod_a.set_target(real),
             Ctl::ModB => self.mod_b.set_target(real),
-            Ctl::Subdivision | Ctl::Sync => {} // control-side only (module docs)
+            Ctl::Subdivision | Ctl::Sync => {} // control-side only (see module docs)
         }
     }
 
@@ -524,16 +533,18 @@ mod tests {
             captions(2),
             ["Time", "Feedback", "Mix", "Tone", "Mod", "Div", "Sync"]
         );
-        // Every voice shares the tap subdivision selector and the tempo
-        // sync toggle (PRD 012), both stepped, sync shipping off.
+        // Every voice shares the tap subdivision selector and the tempo-sync
+        // division selector, both stepped and control-side only; sync ships on
+        // Free (index 0) so a fresh delay follows its own Time knob.
         for pedal in FAMILY.pedals {
-            assert!(matches!(
-                pedal.params[pedal.param_index("subdivision").unwrap()].range,
-                Range::Stepped { .. }
-            ));
+            for key in ["subdivision", "sync"] {
+                assert!(matches!(
+                    pedal.params[pedal.param_index(key).unwrap()].range,
+                    Range::Stepped { .. }
+                ));
+            }
             let sync = &pedal.params[pedal.param_index("sync").unwrap()];
-            assert!(matches!(sync.range, Range::Stepped { .. }));
-            assert_eq!(sync.default, 0.0, "{}: sync ships off", pedal.key);
+            assert_eq!(sync.default, 0.0, "{}: sync ships on Free", pedal.key);
         }
         assert_eq!(subdivision_ratio(0), 1.0);
         assert!((subdivision_ratio(1) - 0.75).abs() < 1e-6);

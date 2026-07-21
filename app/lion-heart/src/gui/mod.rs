@@ -117,6 +117,10 @@ pub enum Message {
     /// per-slot behavior, preserved).
     Tap,
     TapTempo(String),
+    /// Toggle the practice metronome (PRD 019): the footer click chip.
+    ToggleMetronome,
+    /// Step the metronome's beats-per-bar through the common meters.
+    CycleTimeSig,
     /// A looper transport momentary press (PRD 013): `action` is
     /// `"rec"`/`"undo"`/`"clear"`, fired as a 1.0→0.0 pulse by the session.
     LooperPress {
@@ -1062,17 +1066,6 @@ impl Running {
             .is_some_and(|p| p.key == "parametric")
     }
 
-    /// Apply the session's global tempo (PRD 012) to a slot and, if it
-    /// changed anything, resync the UI mirror and status line. Shared by
-    /// every call site that moves the tempo or a delay's sync/subdivision.
-    fn report_tempo(&mut self, lines: Vec<String>) {
-        if lines.is_empty() {
-            return;
-        }
-        self.status = lines.last().cloned().unwrap_or_default();
-        self.refresh_slots();
-    }
-
     /// Select the slot at a chain position and show its faceplate: whatever
     /// view is up, clicking the chain always lands on the board (the fix for
     /// "chain clicks do nothing while tuner/eq/live/settings is open").
@@ -1205,11 +1198,13 @@ impl Running {
                     Ok(_) => {
                         self.session.midi_desync_param(&slot, &param);
                         self.refresh_slots();
-                        // Flipping a delay's subdivision, or turning sync on,
-                        // re-derives its time from the global tempo (PRD 012).
-                        if param == "subdivision" || param == "sync" {
-                            let lines = self.session.apply_tempo_to(&slot);
-                            self.report_tempo(lines);
+                        // Moving a delay's subdivision, or its sync division,
+                        // re-derives its time from the global tempo (ADR 014);
+                        // refresh again if that moved the Time knob.
+                        if (param == "subdivision" || param == "sync")
+                            && self.session.apply_tempo_to(&slot)
+                        {
+                            self.refresh_slots();
                         }
                     }
                     Err(e) => self.status = e.to_string(),
@@ -1271,12 +1266,29 @@ impl Running {
                 Err(e) => self.status = e,
             },
             Message::Tap => {
-                let lines = self.session.tap_tempo(None);
-                self.report_tempo(lines);
+                let msg = self.session.tap_tempo(None);
+                if !msg.is_empty() {
+                    self.status = msg;
+                }
             }
             Message::TapTempo(slot) => {
-                let lines = self.session.tap_tempo(Some(&slot));
-                self.report_tempo(lines);
+                let msg = self.session.tap_tempo(Some(&slot));
+                if !msg.is_empty() {
+                    self.status = msg;
+                }
+            }
+            Message::ToggleMetronome => {
+                self.status = self.session.toggle_metronome();
+            }
+            Message::CycleTimeSig => {
+                // Step through the common meters: 4 → 3 → 6 → 2 → 4…
+                let next = match self.session.beats_per_bar() {
+                    4 => 3,
+                    3 => 6,
+                    6 => 2,
+                    _ => 4,
+                };
+                self.status = self.session.set_beats_per_bar(next);
             }
             Message::LooperPress { slot, action } => {
                 if let Err(e) = self.session.looper_press(&slot, action) {
@@ -1287,7 +1299,7 @@ impl Running {
             Message::OpenBrowser(kind) => {
                 let remembered = match kind {
                     AssetKind::Nam => self.session.config.nam_dir.clone(),
-                    AssetKind::Ir => self.session.config.ir_dir.clone(),
+                    AssetKind::Ir | AssetKind::IrB => self.session.config.ir_dir.clone(),
                 };
                 let start = remembered
                     .map(PathBuf::from)
@@ -1305,6 +1317,7 @@ impl Running {
                     let result = match browser.kind {
                         AssetKind::Nam => self.session.load_nam(&path),
                         AssetKind::Ir => self.session.load_ir(&path),
+                        AssetKind::IrB => self.session.load_ir_b(&path),
                     };
                     match result {
                         Ok(msg) => {
@@ -1320,6 +1333,7 @@ impl Running {
                 let (had, label) = match kind {
                     AssetKind::Nam => (self.session.unload_nam(), "nam"),
                     AssetKind::Ir => (self.session.unload_ir(), "ir"),
+                    AssetKind::IrB => (self.session.unload_ir_b(), "ir blend"),
                 };
                 if had {
                     self.status = format!("{label}: unloaded");
@@ -1722,6 +1736,12 @@ impl Running {
         let morphing = self.session.is_morphing();
         self.session.tick_morph(now);
         if morphing {
+            self.refresh_slots();
+        }
+
+        // Re-derive tempo-locked controls (ADR 014); refresh the faceplate
+        // only when a locked time/rate actually moved.
+        if self.session.tick_tempo() {
             self.refresh_slots();
         }
 
@@ -2779,11 +2799,6 @@ impl Running {
             let Some((labels, index)) = param.stepped else {
                 continue;
             };
-            // `sync` renders as a chip in the tap row below, not a dropdown
-            // (PRD 012).
-            if param.key == "sync" {
-                continue;
-            }
             // Looper reverse/half are chips in the transport row (PRD 013).
             if slot.family_key == "looper" && matches!(param.key, "reverse" | "half") {
                 continue;
@@ -2995,23 +3010,13 @@ impl Running {
                 .align_y(iced::Alignment::Center),
             );
         }
-        // Tap tempo (PRD 004/012): a momentary button, not a knob — timed on
-        // the control side, it drives the session's global tempo and (via
-        // the subdivision selector above) this slot's `time`. `sync` is a
-        // chip here rather than a dropdown: on, this slot follows every
-        // future tap/clock update instead of just this button's own taps.
+        // Tap tempo (PRD 004 / ADR 014): a momentary button, not a knob —
+        // timed on the control side, it sets the rig's global tempo and (via
+        // this slot's subdivision) a *Free* delay's own `time`. The `sync`
+        // division dropdown sits in the selector row above; on anything but
+        // Free, this slot's time locks to the global tempo instead.
         if slot.family_key == "delay" {
-            let bpm = self
-                .session
-                .tempo_bpm()
-                .map(|b| format!("♩ = {b:.0} bpm"))
-                .unwrap_or_else(|| "tap ×2 in rhythm to set the tempo".to_string());
-            let synced = slot
-                .params
-                .iter()
-                .find(|p| p.key == "sync")
-                .and_then(|p| p.stepped)
-                .is_some_and(|(_, index)| index == 1);
+            let bpm = format!("♩ = {:.0} bpm", self.session.tempo_bpm());
             body = body.push(
                 row![
                     button(text("TAP").size(15))
@@ -3022,15 +3027,6 @@ impl Running {
                         .size(13)
                         .color(theme::TEXT_DIM)
                         .font(iced::Font::MONOSPACE),
-                    space().width(Length::Fill),
-                    button(text(if synced { "SYNC" } else { "sync" }).size(12))
-                        .padding([6, 14])
-                        .on_press(Message::Knob {
-                            slot: slot.key.clone(),
-                            param: "sync".to_string(),
-                            norm: if synced { 0.0 } else { 1.0 },
-                        })
-                        .style(theme::chip(synced)),
                 ]
                 .spacing(12)
                 .align_y(iced::Alignment::Center),
@@ -3038,44 +3034,20 @@ impl Running {
         }
         if let Some(kind) = crate::session::asset_kind(&slot.key) {
             let (nam_name, ir_name) = self.session.asset_names();
-            let (label, file) = match kind {
-                AssetKind::Nam => ("CAPTURE", nam_name),
-                AssetKind::Ir => ("IMPULSE", ir_name),
-            };
-            let loaded = file != "-";
-            body = body.push(
-                container(
-                    row![
-                        text(label).size(10).color(theme::TEXT_DIM),
-                        text(if loaded {
-                            file
-                        } else {
-                            "— nothing loaded —".to_string()
-                        })
-                        .size(13)
-                        .color(if loaded {
-                            theme::TEXT_BRIGHT
-                        } else {
-                            theme::TEXT_DIM
-                        })
-                        .font(iced::Font::MONOSPACE),
-                        space().width(Length::Fill),
-                        button(text("load…").size(12))
-                            .padding([3, 10])
-                            .on_press(Message::OpenBrowser(kind))
-                            .style(theme::action),
-                        button(text("unload").size(12))
-                            .padding([3, 10])
-                            .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
-                            .style(theme::danger),
-                    ]
-                    .spacing(12)
-                    .align_y(iced::Alignment::Center),
-                )
-                .padding([8, 12])
-                .width(Length::Fill)
-                .style(theme::inset),
-            );
+            match kind {
+                AssetKind::Nam => body = body.push(self.asset_row("CAPTURE", nam_name, kind)),
+                AssetKind::Ir => {
+                    // The cab shows both mics; its `blend` knob crosses A⇄B
+                    // (ADR 015). Mic B is optional — load it to blend.
+                    body = body.push(self.asset_row("MIC A", ir_name, AssetKind::Ir));
+                    body = body.push(self.asset_row(
+                        "MIC B",
+                        self.session.ir_b_name(),
+                        AssetKind::IrB,
+                    ));
+                }
+                AssetKind::IrB => {} // never a family mount
+            }
         }
 
         container(body)
@@ -3086,22 +3058,72 @@ impl Running {
             .into()
     }
 
+    /// One loaded-asset "LCD" row: label, file name, and load/unload buttons.
+    fn asset_row(
+        &self,
+        label: &'static str,
+        file: String,
+        kind: AssetKind,
+    ) -> Element<'_, Message> {
+        let loaded = file != "-";
+        container(
+            row![
+                text(label).size(10).color(theme::TEXT_DIM),
+                text(if loaded {
+                    file
+                } else {
+                    "— nothing loaded —".to_string()
+                })
+                .size(13)
+                .color(if loaded {
+                    theme::TEXT_BRIGHT
+                } else {
+                    theme::TEXT_DIM
+                })
+                .font(iced::Font::MONOSPACE),
+                space().width(Length::Fill),
+                button(text("load…").size(12))
+                    .padding([3, 10])
+                    .on_press(Message::OpenBrowser(kind))
+                    .style(theme::action),
+                button(text("unload").size(12))
+                    .padding([3, 10])
+                    .on_press_maybe(loaded.then_some(Message::UnloadAsset(kind)))
+                    .style(theme::danger),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([8, 12])
+        .width(Length::Fill)
+        .style(theme::inset)
+        .into()
+    }
+
     fn footer(&self) -> Element<'_, Message> {
         let stats = self.session.stats();
         let fps = 1.0 / self.frame_secs.max(1e-4);
         let xruns = stats.underrun_events + stats.overrun_events;
-        let bpm = self
-            .session
-            .tempo_bpm()
-            .map(|b| format!("♩ {b:.0}"))
-            .unwrap_or_else(|| "♩ —".to_string());
+        let bpm = format!("♩ {:.0}", self.session.tempo_bpm());
+        let metro_on = self.session.metronome_on();
+        let sig = format!("{}/4", self.session.beats_per_bar());
         row![
-            // The global tempo (PRD 012): click to tap. Delay faceplates
+            // The global tempo (ADR 014): click to tap. Delay faceplates
             // have their own TAP button; this is the one always in view.
             button(text(bpm).size(12).font(iced::Font::MONOSPACE))
                 .padding([2, 10])
                 .on_press(Message::Tap)
                 .style(theme::action),
+            // Practice metronome (PRD 019): lit amber when running; the
+            // time-sig chip steps the accent's bar length.
+            button(text("click").size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 10])
+                .on_press(Message::ToggleMetronome)
+                .style(theme::chip(metro_on)),
+            button(text(sig).size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 8])
+                .on_press(Message::CycleTimeSig)
+                .style(theme::chip(false)),
             text(self.status.clone()).size(12).color(theme::TEXT_DIM),
             space().width(Length::Fill),
             // xruns only demand attention when they exist.

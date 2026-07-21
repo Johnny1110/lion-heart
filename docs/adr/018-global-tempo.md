@@ -1,10 +1,24 @@
-# ADR 015: Global tempo — session-owned, control-side only
+# ADR 018: Global tempo — session-owned, control-side only
 
 Status: **accepted — implemented**
 Date: 2026-07-20
 Relates to: PRD 012 (`docs/PRD/012-global-tempo.md`), PRD 004 / ADR 007
 (delay family: the `subdivision` control-side-modifier precedent), PRD 008
-(virtual MIDI targets: `snapshot.select` is the pattern `tempo.tap` follows)
+(virtual MIDI targets: `snapshot.select` is the pattern `tempo.tap` follows),
+ADR 014 (tempo sync: the note-division target this feeds)
+
+> **Merge reconciliation (2026-07-21).** This ADR and ADR 014 were authored in
+> parallel on two machines for the same feature area, and reconciled at merge
+> time into one combined design. This ADR's lasting contribution is the **BPM
+> source**: the session-owned `TempoState` (tap history + MIDI-clock median),
+> the persisted `AppConfig.tempo_bpm`, and the plugin reading the host
+> transport. The **sync mechanism** below — a boolean `sync` that re-derived a
+> delay's `time` from `tempo × subdivision` — was **superseded** by ADR 014's
+> stepped note-division `sync` selector and its engine-side
+> `apply_tempo_sync` (which also locks a tremolo's `rate`). So where this ADR
+> says "boolean sync" / "`retime_delay` on every synced delay", read: the
+> source here feeds `ChainHandle::apply_tempo_sync` (ADR 014). The per-slot tap
+> still sets a *Free* delay's time via its `subdivision`, as described.
 
 ## Context
 

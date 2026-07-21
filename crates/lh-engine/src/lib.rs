@@ -338,6 +338,12 @@ pub struct Chain {
     telemetry: Arc<Telemetry>,
     /// Optional raw-input copy for control-thread analyzers (tuner).
     tap: Option<rtrb::Producer<f32>>,
+    /// Optional aux monitor input (PRD 019): metronome/backing audio a player
+    /// thread renders and pushes as interleaved stereo (L,R,L,R…). Summed onto
+    /// the bus *after* the output stage — a click is a clean monitor mix, not
+    /// something the amp tone or the safety limiter should touch. Drop-on-empty:
+    /// an underrun is a brief gap, never a stall.
+    aux: Option<rtrb::Consumer<f32>>,
 }
 
 impl Chain {
@@ -376,6 +382,14 @@ impl Chain {
     /// Call before the chain moves to the audio thread.
     pub fn set_output_tap(&mut self, tap: rtrb::Producer<f32>) {
         self.output.tap = Some(tap);
+    }
+
+    /// Install the aux monitor input (PRD 019): a player thread pushes
+    /// interleaved stereo into the consumer's producer; the chain drains it
+    /// onto the output after the amp/limiter. Call before the chain moves to
+    /// the audio thread.
+    pub fn set_aux_input(&mut self, aux: rtrb::Consumer<f32>) {
+        self.aux = Some(aux);
     }
 
     /// Send an effect down the chute; park it if the chute is full (retried
@@ -468,6 +482,34 @@ impl Chain {
             {
                 self.retire(effect);
             }
+        }
+    }
+
+    /// Sum the aux monitor input onto the bus (PRD 019). The player thread
+    /// pushes interleaved stereo; we add up to `left.len()` frames of whatever
+    /// is available — an underrun leaves the rest untouched (a brief gap in the
+    /// click, never a stall). Runs after the output stage so the monitor mix
+    /// bypasses the amp tone and the safety limiter; idle (early return) when
+    /// no aux is wired or the ring is empty, so the path is bit-transparent
+    /// with the metronome off.
+    fn mix_aux(&mut self, left: &mut [f32], right: &mut [f32]) {
+        let Some(aux) = &mut self.aux else {
+            return;
+        };
+        let frames = left.len().min(aux.slots() / 2);
+        if frames == 0 {
+            return;
+        }
+        // Read whole L/R pairs. The ring only ever holds pairs (the producer
+        // writes them), so `2 * frames` never splits a frame.
+        if let Ok(chunk) = aux.read_chunk(2 * frames) {
+            let (a, b) = chunk.as_slices();
+            let at = |i: usize| if i < a.len() { a[i] } else { b[i - a.len()] };
+            for f in 0..frames {
+                left[f] += at(2 * f);
+                right[f] += at(2 * f + 1);
+            }
+            chunk.commit_all();
         }
     }
 
@@ -635,6 +677,12 @@ impl Chain {
 
         // Output stage (PRD 003): global EQ → safety limiter → spectrum tap.
         self.output.process(left, right);
+
+        // Aux monitor mix (PRD 019): metronome/backing summed *after* the amp
+        // chain and the safety limiter — a clean click, not amp-processed. The
+        // spectrum tap above stays guitar-only; peak_out below reflects the true
+        // device-bound sum.
+        self.mix_aux(left, right);
 
         self.telemetry
             .peak_out_bits
@@ -872,6 +920,46 @@ impl ChainHandle {
         let desc = shadow.family.pedals[shadow.pedal];
         let param = desc.param_index(param_key)?;
         Some(shadow.norms[shadow.pedal][param])
+    }
+
+    /// Re-derive every tempo-locked control from `bpm` (ADR 014). A slot whose
+    /// `sync` selector is *Free* is left alone; a delay locks its `time` to the
+    /// note length, an LFO effect (tremolo) locks its `rate` so one cycle spans
+    /// the note. Control-side and idempotent — a locked control is re-sent only
+    /// when its target actually changes (tempo, division, or a pedal switch),
+    /// so a settled rig produces no queue traffic. Returns whether any control
+    /// moved, so a UI can refresh just the faceplate that changed.
+    pub fn apply_tempo_sync(&mut self, bpm: f32) -> bool {
+        let mut changed = false;
+        for handle in self.order_handles() {
+            // Only pedals exposing a `sync` selector participate.
+            let (Some(desc), Some(norm)) = (
+                self.param_desc(&handle, "sync"),
+                self.param_norm(&handle, "sync"),
+            ) else {
+                continue;
+            };
+            let div = desc.range.to_real(norm) as usize;
+            let (key, target) = if self.param_desc(&handle, "time").is_some() {
+                ("time", lh_core::tempo::synced_time_ms(bpm, div))
+            } else if self.param_desc(&handle, "rate").is_some() {
+                ("rate", lh_core::tempo::synced_rate_hz(bpm, div))
+            } else {
+                continue;
+            };
+            // Free (or an effect with no lockable control) leaves the knob in
+            // charge.
+            let (Some(target), Some(desc)) = (target, self.param_desc(&handle, key)) else {
+                continue;
+            };
+            let target_norm = desc.range.to_norm(target);
+            let current = self.param_norm(&handle, key).unwrap_or(target_norm);
+            if (current - target_norm).abs() > 1e-4 {
+                let _ = self.set_param(&handle, key, target);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// The active pedal's key for a slot.
@@ -1479,6 +1567,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             output: OutputStage::new(),
             telemetry: Arc::clone(&telemetry),
             tap: None,
+            aux: None,
         },
         ChainHandle {
             tx,

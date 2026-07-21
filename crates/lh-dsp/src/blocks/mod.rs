@@ -3,6 +3,7 @@
 //! on (RT rule 6), and the lock-free asset hot-swap seam.
 
 pub mod biquad;
+pub mod grain;
 pub mod oversample;
 pub mod smooth;
 pub mod swap;

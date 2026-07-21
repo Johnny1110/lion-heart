@@ -1,7 +1,7 @@
 # PRD 019: 練習工具組 — 節拍器 → 鼓 Groove → Song Player
 
-狀態：**草案（待開發）**
-日期：2026-07-20
+狀態：**Phase 1（節拍器）已實作（ADR 020）；Phase 2/3 待開發**
+日期：2026-07-20（Phase 1 落地 2026-07-21）
 里程碑：M22（2026-07-20 路線圖第 9 項，**分三期**）
 關聯：PRD 012（全域 tempo——節拍器/鼓的時鐘源）、PRD 018（pitch shifter
 ——song player 移調共用）、PRD 003（輸出級——monitor mix 落點）、白皮書
@@ -22,11 +22,18 @@ AmpliTube standalone、Spark/Katana 類產品的殺手鐧是練習工具。Lion-
 
 ## 2. 規格（三期）
 
-**Phase 1 — 節拍器（M22a）**：
-- click 合成（短 enveloped 正弦/雜訊 burst），掛全域 tempo（PRD 012）。
+**Phase 1 — 節拍器（M22a）✅ 已實作（ADR 020）**：
+- click 合成（短 enveloped 正弦 burst），掛全域 tempo（PRD 012）。實作為
+  `lh_dsp::practice::Metronome`（非 Effect，是 monitor 產生器）。
 - 拍號（4/4 等）、beat 1 重音、count-in、音量。
-- GUI：header/live 一顆節拍器開關 + BPM（共用 tempo chip）+ 拍號；REPL
-  `metronome on|off`、`click <vol>`。
+- 共用基礎已建：**aux monitor lane**（引擎 `Chain::set_aux_input`，安全
+  limiter 之後相加）+ **player 執行緒**（`lh-aux-player`，off audio thread
+  合成，drop-on-empty）。
+- GUI：footer 一顆 `click` 開關（亮琥珀=運行）+ 拍號 chip（步進）+ 共用
+  BPM chip；REPL `metronome on|off`、`click <0-100>`、`timesig <n>`、
+  `countin`。
+- 落地備註：click 合成用純正弦（非雜訊 burst，保持確定性/可測）；節拍器
+  設定為 app-global 環境（不進 preset），僅跨裝置重啟由 CarryOver 保留。
 
 **Phase 2 — 鼓 Groove（M22b）**：
 - 內建鼓 loop 樣本播放（bundled WAV，或使用者 `~/.lion-heart/grooves/`）。

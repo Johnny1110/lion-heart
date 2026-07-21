@@ -114,8 +114,11 @@ fn bench_effects(c: &mut Criterion) {
     };
     cab_handle
         .install(Box::new(lh_dsp::cab::IrAsset {
-            left: build(),
-            right: build(),
+            a: lh_dsp::cab::IrPair {
+                left: build(),
+                right: build(),
+            },
+            b: None,
         }))
         .unwrap();
     bench_stereo!(group, "cab_ir_100ms", cab, buf, buf_r);
@@ -159,6 +162,17 @@ fn bench_effects(c: &mut Criterion) {
         bench_stereo!(group, format!("mod_{}", pedal.key), modulation, buf, buf_r);
     }
 
+    // Pitch: both granular shifters run every sample regardless of knob levels.
+    for (index, pedal) in lh_dsp::pitch::FAMILY.pedals.iter().enumerate() {
+        let mut pitch = lh_dsp::pitch::Pitch::new();
+        pitch.prepare(SR);
+        pitch.select_pedal(index);
+        for (i, p) in pedal.params.iter().enumerate() {
+            pitch.set_param(i, p.default_norm());
+        }
+        bench_stereo!(group, format!("pitch_{}", pedal.key), pitch, buf, buf_r);
+    }
+
     for (index, pedal) in lh_dsp::time::reverb::FAMILY.pedals.iter().enumerate() {
         let mut reverb = Reverb::new();
         reverb.prepare(SR);
@@ -180,6 +194,23 @@ fn bench_effects(c: &mut Criterion) {
         global_eq.set_band(i, state.bands[i]);
     }
     bench_stereo!(group, "global_eq_4band", global_eq, buf, buf_r);
+
+    // Practice metronome (PRD 019): worst-case block cost — a click sounding
+    // through the whole block (restart before each iter fires the downbeat).
+    // Runs on the player thread, not the audio callback; the engine's aux sum
+    // is only a per-sample stereo add on top of this.
+    {
+        let mut metro = lh_dsp::practice::Metronome::new();
+        metro.prepare(SR);
+        metro.set_bpm(120.0);
+        let mut mono = vec![0.0f32; BLOCK];
+        group.bench_function("metronome_click", |b| {
+            b.iter(|| {
+                metro.restart();
+                metro.render(black_box(&mut mono));
+            })
+        });
+    }
 
     group.finish();
 }

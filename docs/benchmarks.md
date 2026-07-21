@@ -7,9 +7,24 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-21 (practice tools: metronome) — Linux dev container (relative)
+
+The metronome (PRD 019, Phase 1 / ADR 020) is an aux **monitor** source: it
+renders on the app's player thread — not the audio callback — and the engine
+only sums its ring into the output after the safety limiter. So its render cost
+is off the RT budget entirely; the number below is the worst case (a click
+sounding through the whole 64-frame block). The audio-thread cost the aux lane
+*adds* is a per-sample stereo add plus one lock-free ring read — below the noise
+floor of a criterion bench, and `assert_no_alloc`-clean (validated by a
+null-device jam with the click on).
+
+| Bench                              | Median      | Note                        |
+| ---------------------------------- | ----------- | --------------------------- |
+| metronome_click (worst-case block) | ~218 ns     | player thread, off RT budget |
+
 ## 2026-07-20 (M16 looper) — Linux dev container (relative)
 
-The looper (PRD 013 / ADR 016) is a chain slot with a preallocated 60-second
+The looper (PRD 013 / ADR 019) is a chain slot with a preallocated 60-second
 double buffer. Its three steady states cost, in order: recording (a write per
 sample), playing (one interpolated read + a smoothstep seam gain), and
 overdubbing (read + soft-clipped in-place write, plus the undo-snapshot copy
@@ -25,7 +40,7 @@ native on the Mac for the absolute table):
 
 ## 2026-07-20 (M14 parametric EQ pedal) — Linux dev container (relative)
 
-The eq family's second pedal (PRD 011 / ADR 014) is the output-stage
+The eq family's second pedal (PRD 011 / ADR 017) is the output-stage
 `GlobalEq` reused whole behind a 40-param façade, so its settled cost must
 match the global stage — and it does. Numbers below are from the Linux dev
 sandbox (same box, same run — read them **relative to each other**;
@@ -36,6 +51,19 @@ re-measure native on the Mac for the absolute table):
 | eq_3band (tone pedal)              | ~684 ns     | unchanged path          |
 | eq_parametric_4band                | ~1.45 µs    | 4 bands live, settled   |
 | global_eq_4band (same box)         | ~1.46 µs    | parity: same engine     |
+
+## 2026-07-19 (pitch family: octaver) — macOS, Apple Silicon (native)
+
+The new `pitch` slot's first pedal (ADR 016): a granular octaver. Per-sample
+cost is two `blocks::grain::GrainShift` reads (each a phasor advance + two
+interpolated taps + two sine windows) plus one block-rate Tone coefficient.
+Both shifters run every sample regardless of knob levels, so this is the true
+per-block cost. Opt-in family (off the default board), so it only costs when
+the player adds it.
+
+| Bench                              | Median      | % of 64-frame deadline |
+| ---------------------------------- | ----------- | ---------------------- |
+| pitch — octaver (2 grain shifters) | ~1.05 µs    | 0.08 %                 |
 
 ## 2026-07-19 (M13 expression: manual wah) — macOS, Apple Silicon (native)
 

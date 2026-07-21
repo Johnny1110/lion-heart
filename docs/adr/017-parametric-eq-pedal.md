@@ -1,4 +1,4 @@
-# ADR 014: The eq slot becomes a two-pedal family (parametric)
+# ADR 017: The eq slot becomes a two-pedal family (parametric)
 
 Status: **accepted — implemented**
 Date: 2026-07-20

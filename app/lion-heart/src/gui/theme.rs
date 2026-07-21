@@ -56,6 +56,9 @@ const REVERB: Color = Color::from_rgb(0.58, 0.63, 0.93);
 const CAB: Color = Color::from_rgb(0.79, 0.57, 0.37);
 const LIMITER: Color = Color::from_rgb(0.94, 0.46, 0.31);
 const LOOPER: Color = Color::from_rgb(0.80, 0.40, 0.92);
+/// Orchid magenta — the pitch family (ADR 016): an otherworldly octave color,
+/// distinct from the modulation/reverb violets.
+const PITCH: Color = Color::from_rgb(0.85, 0.42, 0.78);
 
 const TS9: Color = Color::from_rgb(0.35, 0.77, 0.45);
 const BD2: Color = Color::from_rgb(0.42, 0.58, 0.94);
@@ -123,6 +126,7 @@ pub fn family_color(key: &str) -> Color {
         "cab" => CAB,
         "limiter" => LIMITER,
         "looper" => LOOPER,
+        "pitch" => PITCH,
         _ => ACCENT, // drive family: the pedal picks the color
     }
 }
@@ -510,11 +514,12 @@ mod tests {
     /// cards.
     #[test]
     fn every_selectable_pedal_wears_its_own_livery() {
-        let families: [&lh_core::FamilyDesc; 6] = [
+        let families: [&lh_core::FamilyDesc; 7] = [
             &lh_dsp::drive::FAMILY,
             &lh_dsp::filter::FAMILY,
             &lh_dsp::eq::FAMILY,
             &lh_dsp::modulation::FAMILY,
+            &lh_dsp::pitch::FAMILY,
             &lh_dsp::time::delay::FAMILY,
             &lh_dsp::time::reverb::FAMILY,
         ];

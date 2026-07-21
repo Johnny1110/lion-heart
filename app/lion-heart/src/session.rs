@@ -8,7 +8,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use lh_core::preset::{AssetRef, PRESET_SCHEMA_VERSION, Preset, PresetAssets, SNAPSHOT_SLOTS};
 use lh_dsp::Effect;
@@ -22,6 +25,8 @@ use lh_dsp::eq::Eq;
 use lh_dsp::filter::Filter;
 use lh_dsp::looper::Looper;
 use lh_dsp::modulation::Modulation;
+use lh_dsp::pitch::Pitch;
+use lh_dsp::practice::Metronome;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{ChainHandle, build_chain};
@@ -68,10 +73,20 @@ pub struct AppConfig {
     /// switch or slot removal instead of being cut. On by default.
     #[serde(default = "spillover_default")]
     pub spillover: bool,
+    /// Global tempo in BPM (ADR 014): drives every effect whose `sync`
+    /// selector is locked to a note division. App-global — one tempo for the
+    /// rig, like `morph_ms`. Persisted so the tapped/typed tempo survives a
+    /// restart.
+    #[serde(default = "tempo_default")]
+    pub tempo_bpm: f32,
 }
 
 fn spillover_default() -> bool {
     true
+}
+
+fn tempo_default() -> f32 {
+    lh_core::tempo::DEFAULT_BPM
 }
 
 impl Default for AppConfig {
@@ -88,6 +103,7 @@ impl Default for AppConfig {
             in_channel: None,
             morph_ms: 0,
             spillover: spillover_default(),
+            tempo_bpm: tempo_default(),
         }
     }
 }
@@ -116,8 +132,11 @@ pub struct CarryOver {
     chain: Vec<lh_core::preset::SlotState>,
     nam: Option<AssetRef>,
     ir: Option<AssetRef>,
+    ir_b: Option<AssetRef>,
     snapshots: BTreeMap<String, lh_core::preset::Snapshot>,
     active_snapshot: Option<String>,
+    /// Metronome runtime state (PRD 019), so a device restart keeps the click.
+    metronome: MetroSnapshot,
 }
 
 /// A live MIDI input: the connection, its event stream, and the mapping.
@@ -183,6 +202,8 @@ pub struct Session {
     pub cab: AssetHandle<IrAsset>,
     pub nam_ref: Option<AssetRef>,
     pub ir_ref: Option<AssetRef>,
+    /// The cab's optional blend IR (a second mic/cabinet, ADR 015).
+    pub ir_b_ref: Option<AssetRef>,
     pub sample_rate: u32,
     pub config: AppConfig,
     runner: DuplexRunner,
@@ -201,6 +222,24 @@ pub struct Session {
     /// Looper transport LED mirror (PRD 013), keyed by slot handle —
     /// session-transient (a restart re-prepares empty loops).
     looper_leds: std::collections::HashMap<String, LooperLed>,
+    /// Metronome control shared with the aux player thread (PRD 019). The BPM
+    /// tracks the global tempo; other settings are session-transient (carried
+    /// across a device restart, not persisted).
+    metronome: Arc<MetronomeShared>,
+    /// The aux player thread's handle, joined on drop.
+    player_join: Option<JoinHandle<()>>,
+}
+
+impl Drop for Session {
+    /// Stop the aux player thread cleanly (PRD 019): clear its run flag and join
+    /// it before the stream tears down, so its aux producer is released while
+    /// the chain (holding the consumer) is still alive on the audio thread.
+    fn drop(&mut self) {
+        self.metronome.running.store(false, Ordering::Relaxed);
+        if let Some(join) = self.player_join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 /// An in-progress snapshot morph (PRD 009): the value trajectory from the
@@ -245,13 +284,13 @@ const TEMPO_HYSTERESIS: f32 = 0.005;
 pub const TEMPO_MIN_BPM: f32 = 30.0;
 pub const TEMPO_MAX_BPM: f32 = 300.0;
 
-/// Global tempo state (PRD 012): one BPM per session, written by taps
-/// (GUI / REPL / MIDI `tempo.tap`) and MIDI clock, read by delay slots
-/// whose `sync` is on. Session-transient by design — a synced slot's
-/// `time` param is the durable result, so presets stay portable.
+/// Global tempo **source** state (PRD 012): the tap-history and MIDI-clock
+/// accumulators that resolve to the rig BPM. The BPM itself lives in
+/// `config.tempo_bpm` (persisted, ADR 014); this is the transient plumbing
+/// that feeds it. A synced slot's `time`/`rate` param is the durable result,
+/// so presets stay portable.
 #[derive(Default)]
 struct TempoState {
-    bpm: Option<f32>,
     /// Last BPM written onto synced slots (the hysteresis anchor).
     applied_bpm: Option<f32>,
     tap_last: Option<Instant>,
@@ -285,6 +324,165 @@ fn clock_bpm(intervals: &[f32]) -> Option<f32> {
         return None;
     }
     Some((60.0 / (24.0 * tick)).clamp(TEMPO_MIN_BPM, TEMPO_MAX_BPM))
+}
+
+// --- practice tools: metronome (PRD 019, Phase 1) ---
+
+/// Stereo frames the aux monitor ring holds (~170 ms @ 48k) — deep enough that
+/// the player thread's periodic fill never underruns the audio callback.
+const AUX_RING_FRAMES: usize = 8_192;
+/// Frames the player renders at most per wake.
+const PLAYER_CHUNK: usize = 2_048;
+/// The player keeps roughly this much audio buffered ahead — enough to ride
+/// scheduling jitter, short enough that a tempo/enable change is heard promptly
+/// (a whole-ring pre-fill would lag control by the ring depth).
+const PLAYER_TARGET_MS: f32 = 50.0;
+/// The player thread sleeps this long between fills.
+const PLAYER_TICK: Duration = Duration::from_millis(3);
+
+/// Cross-thread metronome control (PRD 019): the session writes these atomics,
+/// the aux player thread reads them each fill. All scalars are independent (no
+/// multi-field invariant), so `Relaxed` is sufficient; the audio content itself
+/// travels the lock-free aux ring. The BPM mirrors the rig's global tempo
+/// (ADR 014), pushed here whenever the tempo moves.
+struct MetronomeShared {
+    /// The player thread runs while this is set (cleared on session drop).
+    running: AtomicBool,
+    enabled: AtomicBool,
+    /// Bumped to force a downbeat restart (enable / count-in).
+    restart_gen: AtomicU32,
+    bpm_bits: AtomicU32,
+    volume_bits: AtomicU32,
+    beats_per_bar: AtomicU32,
+    accent: AtomicBool,
+}
+
+impl MetronomeShared {
+    fn new(bpm: f32) -> Self {
+        Self {
+            running: AtomicBool::new(true),
+            enabled: AtomicBool::new(false),
+            restart_gen: AtomicU32::new(0),
+            bpm_bits: AtomicU32::new(lh_core::tempo::clamp_bpm(bpm).to_bits()),
+            volume_bits: AtomicU32::new(0.6f32.to_bits()),
+            beats_per_bar: AtomicU32::new(4),
+            accent: AtomicBool::new(true),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+    fn bpm(&self) -> f32 {
+        f32::from_bits(self.bpm_bits.load(Ordering::Relaxed))
+    }
+    fn set_bpm(&self, bpm: f32) {
+        self.bpm_bits
+            .store(lh_core::tempo::clamp_bpm(bpm).to_bits(), Ordering::Relaxed);
+    }
+    fn volume(&self) -> f32 {
+        f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
+    }
+    fn set_volume(&self, v: f32) {
+        self.volume_bits
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    fn beats_per_bar(&self) -> u32 {
+        self.beats_per_bar.load(Ordering::Relaxed).clamp(1, 16)
+    }
+    fn set_beats_per_bar(&self, n: u32) {
+        self.beats_per_bar.store(n.clamp(1, 16), Ordering::Relaxed);
+    }
+    fn accent(&self) -> bool {
+        self.accent.load(Ordering::Relaxed)
+    }
+    fn set_accent(&self, on: bool) {
+        self.accent.store(on, Ordering::Relaxed);
+    }
+    fn request_restart(&self) {
+        self.restart_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    fn restart_gen(&self) -> u32 {
+        self.restart_gen.load(Ordering::Relaxed)
+    }
+}
+
+/// The runtime metronome state that must survive an audio-engine restart
+/// (device/buffer change) — carried across [`Session::carry_over`]. BPM is not
+/// here: it rides `config.tempo_bpm`, re-read on the fresh session.
+#[derive(Clone, Copy)]
+struct MetroSnapshot {
+    enabled: bool,
+    volume: f32,
+    beats_per_bar: u32,
+    accent: bool,
+}
+
+/// Spawn the aux player thread (PRD 019): it renders the metronome into the aux
+/// ring, keeping ~[`PLAYER_TARGET_MS`] buffered ahead. Off the audio thread, so
+/// heap use here is fine — the audio thread only ever sums the ring. When the
+/// metronome is disabled it stops writing and the ring drains, so the engine's
+/// aux sum early-returns (bit-transparent output).
+fn spawn_player(
+    mut prod: rtrb::Producer<f32>,
+    shared: Arc<MetronomeShared>,
+    sample_rate: u32,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("lh-aux-player".into())
+        .spawn(move || {
+            let target_frames =
+                ((PLAYER_TARGET_MS * 1e-3 * sample_rate as f32) as usize).min(AUX_RING_FRAMES);
+            let mut metro = Metronome::new();
+            metro.prepare(sample_rate);
+            let mut mono = vec![0.0f32; PLAYER_CHUNK];
+            let mut last_gen = shared.restart_gen();
+            let mut was_enabled = false;
+
+            while shared.running.load(Ordering::Relaxed) {
+                metro.set_bpm(shared.bpm());
+                metro.set_volume(shared.volume());
+                metro.set_beats_per_bar(shared.beats_per_bar());
+                metro.set_accent(shared.accent());
+                let enabled = shared.enabled();
+                let cur_gen = shared.restart_gen();
+                // Restart on enable or an explicit count-in so the click begins
+                // cleanly on beat 1.
+                if (enabled && !was_enabled) || cur_gen != last_gen {
+                    metro.restart();
+                }
+                last_gen = cur_gen;
+                was_enabled = enabled;
+
+                if enabled {
+                    let free_frames = prod.slots() / 2;
+                    let buffered = AUX_RING_FRAMES - free_frames;
+                    let want = target_frames.saturating_sub(buffered);
+                    let n = want.min(free_frames).min(PLAYER_CHUNK);
+                    if n > 0 {
+                        metro.render(&mut mono[..n]);
+                        if let Ok(mut chunk) = prod.write_chunk(2 * n) {
+                            let (a, b) = chunk.as_mut_slices();
+                            let mut dst = a.iter_mut().chain(b.iter_mut());
+                            for &s in &mono[..n] {
+                                // Mono click duplicated onto both aux channels.
+                                if let (Some(dl), Some(dr)) = (dst.next(), dst.next()) {
+                                    *dl = s;
+                                    *dr = s;
+                                }
+                            }
+                            drop(dst);
+                            chunk.commit_all();
+                        }
+                    }
+                }
+                std::thread::sleep(PLAYER_TICK);
+            }
+        })
+        .expect("spawn aux player thread")
 }
 
 /// One snapshot chip's state for the GUI (PRD 009).
@@ -360,11 +558,14 @@ impl Morph {
     }
 }
 
-/// The session asset a chain family mounts (hot-swapped off-thread).
+/// The session asset a chain family mounts (hot-swapped off-thread). `IrB` is
+/// not a family mount — it is the cab's optional blend IR (ADR 015), used by
+/// the browser/unload routing only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssetKind {
     Nam,
     Ir,
+    IrB,
 }
 
 /// One buildable chain family: its descriptor (the key, display name, and
@@ -383,18 +584,26 @@ pub struct FamilyEntry {
     ) -> Box<dyn Effect>,
 }
 
-/// Every chain family the session can build — the one place that knows the
-/// full rig. The first [`lh_core::DEFAULT_CHAIN`]`.len()` entries are the
-/// default board, in order (pinned by a test, which also pins the plugin's
-/// fixed chain to the same constant); any entries past it are **add-only**
-/// families — buildable and offered in the "＋" menu, but not on the default
-/// board and not in the (host-driven) plugin. `looper` is the first of these
-/// (PRD 013: standalone-only, `add looper`).
-pub static FAMILY_REGISTRY: [FamilyEntry; 12] = [
+/// Every chain family the session can build, in add-menu order — the one
+/// place that knows the full rig. [`lh_core::DEFAULT_CHAIN`] (the board that
+/// ships) is an in-order **subsequence** of this: the registry may carry
+/// extra opt-in families that ship *off* the board and are added from the ＋
+/// menu — `pitch` (ADR 016) and the standalone-only `looper` (PRD 013, also
+/// absent from the host-driven plugin). A test pins the subsequence relation
+/// and the invariants; the plugin's fixed chain is pinned to `DEFAULT_CHAIN`
+/// directly.
+pub static FAMILY_REGISTRY: [FamilyEntry; 13] = [
     FamilyEntry {
         desc: &lh_dsp::dynamics::gate::FAMILY,
         asset: None,
         build: |_, _, _| Box::new(NoiseGate::new()),
+    },
+    // `pitch` is opt-in: registered (so the ＋ menu and REPL can add it) but
+    // absent from DEFAULT_CHAIN, so it does not eat a default-board slot.
+    FamilyEntry {
+        desc: &lh_dsp::pitch::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Pitch::new()),
     },
     FamilyEntry {
         desc: &lh_dsp::filter::FAMILY,
@@ -525,6 +734,13 @@ impl Session {
         } else {
             None
         };
+        // Aux monitor lane (PRD 019): the player thread pushes the metronome
+        // (and later drums/backing) into the chain, summed after the amp/limiter.
+        let (aux_prod, aux_cons) = rtrb::RingBuffer::new(AUX_RING_FRAMES * 2);
+        chain.set_aux_input(aux_cons);
+
+        // Config is needed before the stream for the metronome's initial tempo.
+        let config = load_config();
 
         let runner_opts = RunnerOpts {
             input: opts.input.clone(),
@@ -548,14 +764,20 @@ impl Session {
 
         let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());
 
+        // Start the aux player thread now that the stream rate is known; the
+        // click follows the persisted global tempo.
+        let metronome = Arc::new(MetronomeShared::new(config.tempo_bpm));
+        let player_join = spawn_player(aux_prod, Arc::clone(&metronome), runner.sample_rate);
+
         Ok(Self {
             chain: chain_handle,
             nam: nam_handle,
             cab: cab_handle,
             nam_ref: None,
             ir_ref: None,
+            ir_b_ref: None,
             sample_rate: runner.sample_rate,
-            config: load_config(),
+            config,
             runner,
             tuner_tap,
             spectrum_tap,
@@ -566,6 +788,8 @@ impl Session {
             morph: None,
             tempo: TempoState::default(),
             looper_leds: std::collections::HashMap::new(),
+            metronome,
+            player_join: Some(player_join),
         })
     }
 
@@ -576,8 +800,15 @@ impl Session {
             chain: self.chain.snapshot_chain(),
             nam: self.nam_ref.clone(),
             ir: self.ir_ref.clone(),
+            ir_b: self.ir_b_ref.clone(),
             snapshots: self.snapshots.clone(),
             active_snapshot: self.active_snapshot.clone(),
+            metronome: MetroSnapshot {
+                enabled: self.metronome.enabled(),
+                volume: self.metronome.volume(),
+                beats_per_bar: self.metronome.beats_per_bar(),
+                accent: self.metronome.accent(),
+            },
         }
     }
 
@@ -599,10 +830,26 @@ impl Session {
         // NAM validation and IR resampling against the new stream.
         let fallback = presets_dir().unwrap_or_default();
         session.apply_asset(carry.nam.as_ref(), &fallback, AssetKind::Nam, &mut lines);
-        session.apply_asset(carry.ir.as_ref(), &fallback, AssetKind::Ir, &mut lines);
+        session.apply_cab(
+            carry.ir.as_ref(),
+            carry.ir_b.as_ref(),
+            &fallback,
+            &mut lines,
+        );
         // Scenes ride across the restart (a device change must not wipe them).
         session.snapshots = carry.snapshots.clone();
         session.active_snapshot = carry.active_snapshot.clone();
+        // The metronome rides across too (PRD 019) — the fresh player thread
+        // already tracks the persisted tempo; restore the rest of its state.
+        session.metronome.set_volume(carry.metronome.volume);
+        session
+            .metronome
+            .set_beats_per_bar(carry.metronome.beats_per_bar);
+        session.metronome.set_accent(carry.metronome.accent);
+        if carry.metronome.enabled {
+            session.metronome.set_enabled(true);
+            session.metronome.request_restart();
+        }
         Ok((session, lines))
     }
 
@@ -838,98 +1085,74 @@ impl Session {
         format!("spillover {}", if on { "on" } else { "off" })
     }
 
-    // --- global tempo (PRD 012) ---
+    // --- global tempo: source (taps + MIDI clock) ---
+    //
+    // One rig BPM lives in `config.tempo_bpm` (persisted; see `tempo_bpm` /
+    // `set_tempo_bpm` further below). This section is the *source* side —
+    // turning tap gestures and MIDI-clock ticks into that BPM. Applying it to
+    // the sync-locked delays/tremolo is `apply_tempo_now` / `tick_tempo`,
+    // which delegate to `ChainHandle::apply_tempo_sync` (the note-division
+    // math in `lh_core::tempo`, ADR 014).
 
-    /// The session tempo, if one has been tapped / clocked / set.
-    pub fn tempo_bpm(&self) -> Option<f32> {
-        self.tempo.bpm
-    }
-
-    /// One tap (footer chip, faceplate button, REPL `tap`, MIDI
-    /// `tempo.tap`). `slot` is the faceplate whose TAP was hit: that slot
-    /// gets the derived time even with `sync` off — the pre-PRD 012
-    /// behavior of the per-slot button, preserved.
-    pub fn tap_tempo(&mut self, slot: Option<&str>) -> Vec<String> {
+    /// One tap (footer chip, faceplate TAP, REPL `tap`, MIDI `tempo.tap`).
+    /// Two-plus taps in rhythm set the rig tempo. `slot` is the faceplate whose
+    /// TAP was hit: a *Free* (unsynced) delay there also takes its `time` from
+    /// this tap × its subdivision — the pre-sync per-slot tap workflow
+    /// (PRD 004), preserved. A synced slot ignores it (its division owns time).
+    pub fn tap_tempo(&mut self, slot: Option<&str>) -> String {
         let now = Instant::now();
-        let t = &mut self.tempo;
-        if let Some(last) = t.tap_last {
-            let gap = now.duration_since(last).as_secs_f32();
-            if gap < TAP_TIMEOUT_SECS {
-                t.tap_intervals.push(gap);
-                if t.tap_intervals.len() > TAP_HISTORY {
-                    t.tap_intervals.remove(0);
-                }
-            } else {
-                t.tap_intervals.clear(); // stale — start a fresh tempo
-            }
-        }
-        t.tap_last = Some(now);
-        let Some(bpm) = tap_bpm(&t.tap_intervals) else {
-            return Vec::new(); // first tap of a run — nothing to say yet
-        };
-        t.bpm = Some(bpm);
-        let mut lines = vec![format!("tap: ♩ = {bpm:.0} bpm")];
-        lines.extend(self.apply_tempo(slot, false));
-        lines
-    }
-
-    /// Set the tempo directly (REPL `tempo <bpm>`).
-    pub fn set_tempo_bpm(&mut self, bpm: f32) -> Vec<String> {
-        let bpm = bpm.clamp(TEMPO_MIN_BPM, TEMPO_MAX_BPM);
-        self.tempo.bpm = Some(bpm);
-        let mut lines = vec![format!("tempo: ♩ = {bpm:.0} bpm")];
-        lines.extend(self.apply_tempo(None, false));
-        lines
-    }
-
-    /// Re-derive one slot's `time` from the current tempo — its
-    /// subdivision/sync selector just moved. No tempo yet = no-op.
-    pub fn apply_tempo_to(&mut self, slot: &str) -> Vec<String> {
-        let Some(bpm) = self.tempo.bpm else {
-            return Vec::new();
-        };
-        self.retime_delay(slot, 60_000.0 / bpm)
-    }
-
-    /// Push the tempo onto every synced delay instance (plus `one_shot`,
-    /// synced or not). `hysteresis` skips sub-[`TEMPO_HYSTERESIS`] wobble —
-    /// the clock path calls this on every tick.
-    fn apply_tempo(&mut self, one_shot: Option<&str>, hysteresis: bool) -> Vec<String> {
-        let Some(bpm) = self.tempo.bpm else {
-            return Vec::new();
-        };
-        if hysteresis
-            && one_shot.is_none()
-            && self
-                .tempo
-                .applied_bpm
-                .is_some_and(|a| (bpm - a).abs() / a < TEMPO_HYSTERESIS)
         {
-            return Vec::new();
-        }
-        self.tempo.applied_bpm = Some(bpm);
-        let period_ms = 60_000.0 / bpm;
-        let handles = self.chain.order_handles();
-        let families = self.chain.families();
-        let mut lines = Vec::new();
-        for (handle, family) in handles.iter().zip(families) {
-            if family.key != "delay" {
-                continue;
+            let t = &mut self.tempo;
+            if let Some(last) = t.tap_last {
+                let gap = now.duration_since(last).as_secs_f32();
+                if gap < TAP_TIMEOUT_SECS {
+                    t.tap_intervals.push(gap);
+                    if t.tap_intervals.len() > TAP_HISTORY {
+                        t.tap_intervals.remove(0);
+                    }
+                } else {
+                    t.tap_intervals.clear(); // stale — start a fresh tempo
+                }
             }
-            let synced = self
+            t.tap_last = Some(now);
+        }
+        let Some(bpm) = tap_bpm(&self.tempo.tap_intervals) else {
+            return String::new(); // first tap of a run — nothing to say yet
+        };
+        self.set_tempo_bpm(bpm); // persist + re-derive the synced slots
+        // Legacy per-slot tap: a Free delay under the tapped faceplate follows
+        // the tap directly (via its own subdivision), since its Time knob still
+        // rules while sync = Free.
+        if let Some(slot) = slot
+            && self.slot_is_free_delay(slot)
+        {
+            self.retime_delay(slot, 60_000.0 / self.config.tempo_bpm);
+        }
+        format!("tap: ♩ = {:.0} bpm", self.config.tempo_bpm)
+    }
+
+    /// A slot's `subdivision`/`sync` selector just moved — re-derive its locked
+    /// control from the current tempo. Returns whether anything moved (so the
+    /// GUI can refresh that faceplate). No-op for a *Free* slot.
+    pub fn apply_tempo_to(&mut self, _slot: &str) -> bool {
+        self.chain.apply_tempo_sync(self.config.tempo_bpm)
+    }
+
+    /// Whether `slot` is a delay currently on *Free* sync (its Time knob rules,
+    /// so a per-slot tap may set its time directly).
+    fn slot_is_free_delay(&self, slot: &str) -> bool {
+        self.chain.param_desc(slot, "time").is_some()
+            && self
                 .chain
-                .param_norm(handle, "sync")
-                .is_some_and(|n| n >= 0.5);
-            if synced || one_shot == Some(handle.as_str()) {
-                lines.extend(self.retime_delay(handle, period_ms));
-            }
-        }
-        lines
+                .param_desc(slot, "sync")
+                .zip(self.chain.param_norm(slot, "sync"))
+                .map(|(d, n)| !lh_core::tempo::is_synced(d.range.to_real(n) as usize))
+                .unwrap_or(true)
     }
 
     /// `time = quarter-note period × the slot's subdivision`, clamped into
-    /// the voice's range.
-    fn retime_delay(&mut self, slot: &str, period_ms: f32) -> Vec<String> {
+    /// the voice's range — the per-slot tap path (PRD 004).
+    fn retime_delay(&mut self, slot: &str, period_ms: f32) {
         let ratio = self
             .chain
             .param_desc(slot, "subdivision")
@@ -937,17 +1160,16 @@ impl Session {
             .map(|(d, n)| lh_dsp::time::delay::subdivision_ratio(d.range.to_real(n) as usize))
             .unwrap_or(1.0);
         let Some(desc) = self.chain.param_desc(slot, "time") else {
-            return Vec::new(); // not a delay — nothing to retime
+            return; // not a delay — nothing to retime
         };
         let time = desc.range.clamp(period_ms * ratio);
-        match self.chain.set_param(slot, "time", time) {
-            Ok(applied) => vec![format!("{slot}: time = {:.0} ms", applied.real)],
-            Err(e) => vec![e.to_string()],
-        }
+        let _ = self.chain.set_param(slot, "time", time);
     }
 
-    /// One 0xF8 tick: interval → ring → median BPM. Absurd or gapped
-    /// intervals restart the accumulation (PRD 012).
+    /// One 0xF8 tick: interval → ring → median BPM, applied **live** (not
+    /// persisted — a MIDI clock is transient). Absurd or gapped intervals
+    /// restart the accumulation; sub-[`TEMPO_HYSTERESIS`] wobble on a steady
+    /// clock does not requeue chain messages (PRD 012).
     fn on_clock_tick(&mut self, stamp_us: u64, lines: &mut Vec<String>) {
         let bpm = {
             let t = &mut self.tempo;
@@ -966,14 +1188,21 @@ impl Session {
             clock_bpm(&t.clock_intervals)
         };
         let Some(bpm) = bpm else { return };
-        // Status only when the reading meaningfully moves — a steady clock
-        // must not repaint the status bar 120 times a second.
-        let announce = self.tempo.bpm.is_none_or(|old| (old - bpm).abs() >= 1.0);
-        self.tempo.bpm = Some(bpm);
+        let bpm = lh_core::tempo::clamp_bpm(bpm);
+        // A steady clock's sub-0.5% wobble must not repaint the status bar or
+        // requeue chain messages 120 times a second.
+        if self
+            .tempo
+            .applied_bpm
+            .is_some_and(|a| (bpm - a).abs() / a < TEMPO_HYSTERESIS)
+        {
+            return;
+        }
+        let announce = (self.config.tempo_bpm - bpm).abs() >= 1.0;
+        self.apply_tempo_now(bpm);
         if announce {
             lines.push(format!("midi: clock ♩ = {bpm:.0} bpm"));
         }
-        lines.extend(self.apply_tempo(None, true));
     }
 
     /// Apply everything the foot controller sent since the last call.
@@ -1072,7 +1301,8 @@ impl Session {
                 if slot == "tempo" {
                     if param == "tap" {
                         if norm >= 0.5 {
-                            for line in self.tap_tempo(None) {
+                            let line = self.tap_tempo(None);
+                            if !line.is_empty() {
                                 lines.push(format!("midi: {line}"));
                             }
                         }
@@ -1379,6 +1609,89 @@ impl Session {
         format!("morph time {} ms", self.config.morph_ms)
     }
 
+    /// The rig's global tempo (ADR 014).
+    pub fn tempo_bpm(&self) -> f32 {
+        self.config.tempo_bpm
+    }
+
+    /// Set the global tempo (clamped to the musical range), re-derive the
+    /// sync-locked controls, and **persist** it (a typed/tapped tempo survives
+    /// a restart). The MIDI-clock path uses [`Session::apply_tempo_now`]
+    /// instead — a clock is transient, so it applies without persisting.
+    pub fn set_tempo_bpm(&mut self, bpm: f32) -> String {
+        self.apply_tempo_now(bpm);
+        save_config(&self.config);
+        format!("tempo ♩ = {:.0} bpm", self.config.tempo_bpm)
+    }
+
+    /// Set the live tempo and re-derive every sync-locked control, **without**
+    /// persisting — the shared core of `set_tempo_bpm` (which persists) and the
+    /// MIDI-clock path (which does not).
+    fn apply_tempo_now(&mut self, bpm: f32) {
+        self.config.tempo_bpm = lh_core::tempo::clamp_bpm(bpm);
+        self.tempo.applied_bpm = Some(self.config.tempo_bpm);
+        self.chain.apply_tempo_sync(self.config.tempo_bpm);
+        // The metronome click follows the rig tempo (PRD 019).
+        self.metronome.set_bpm(self.config.tempo_bpm);
+    }
+
+    // --- practice tools: metronome (PRD 019, Phase 1) ---
+
+    /// Whether the metronome click is currently on.
+    pub fn metronome_on(&self) -> bool {
+        self.metronome.enabled()
+    }
+
+    /// Enable or disable the click; enabling restarts the bar on beat 1.
+    pub fn set_metronome(&mut self, on: bool) -> String {
+        self.metronome.set_enabled(on);
+        if on {
+            self.metronome.request_restart();
+        }
+        format!("metronome {}", if on { "on" } else { "off" })
+    }
+
+    /// Toggle the click (GUI button / footswitch).
+    pub fn toggle_metronome(&mut self) -> String {
+        self.set_metronome(!self.metronome.enabled())
+    }
+
+    /// Click level, `0.0..=1.0`.
+    pub fn click_volume(&self) -> f32 {
+        self.metronome.volume()
+    }
+
+    pub fn set_click_volume(&mut self, volume: f32) -> String {
+        self.metronome.set_volume(volume);
+        format!("click volume {:.0}%", self.metronome.volume() * 100.0)
+    }
+
+    /// Beats per bar (the accent recurs every `n`).
+    pub fn beats_per_bar(&self) -> u32 {
+        self.metronome.beats_per_bar()
+    }
+
+    pub fn set_beats_per_bar(&mut self, n: u32) -> String {
+        self.metronome.set_beats_per_bar(n);
+        format!("time signature {}/4", self.metronome.beats_per_bar())
+    }
+
+    /// Turn the click on and restart the bar — a count-in lead from beat 1.
+    pub fn count_in(&mut self) -> String {
+        self.metronome.set_enabled(true);
+        self.metronome.request_restart();
+        "count-in — click from beat 1".to_string()
+    }
+
+    /// Re-derive every tempo-locked control from the global BPM. Called on the
+    /// control loop (GUI frame tick / REPL poll) after [`Session::tick_morph`].
+    /// Delegates to [`lh_engine::ChainHandle::apply_tempo_sync`]; returns
+    /// whether any control moved, so the GUI can refresh just the faceplate
+    /// that changed.
+    pub fn tick_tempo(&mut self) -> bool {
+        self.chain.apply_tempo_sync(self.config.tempo_bpm)
+    }
+
     /// Per-letter chip state for the GUI (PRD 009): populated, active, and
     /// (for the active one) whether the live scene has drifted from stored.
     pub fn snapshot_chips(&self) -> Vec<SnapshotChip> {
@@ -1420,13 +1733,12 @@ impl Session {
 
     /// Loaded asset file names for display, `"-"` when empty.
     pub fn asset_names(&self) -> (String, String) {
-        let name = |r: &Option<AssetRef>| {
-            r.as_ref()
-                .and_then(|a| Path::new(&a.path).file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "-".into())
-        };
-        (name(&self.nam_ref), name(&self.ir_ref))
+        (asset_name(&self.nam_ref), asset_name(&self.ir_ref))
+    }
+
+    /// The cab's blend-IR file name, or `"-"` when none is loaded (ADR 015).
+    pub fn ir_b_name(&self) -> String {
+        asset_name(&self.ir_b_ref)
     }
 
     // --- assets ---
@@ -1452,15 +1764,33 @@ impl Session {
         ))
     }
 
-    pub fn load_ir(&mut self, path: &Path) -> Result<String, String> {
-        let (asset, info) =
-            lh_assets::load_ir(path, self.sample_rate).map_err(|e| e.to_string())?;
-        if self.cab.install(asset).is_err() {
+    /// (Re)decode the cab from its current primary + blend IR refs and install
+    /// the combined asset in one hot-swap (ADR 015). Both files are re-read
+    /// (control-thread, cheap) so whichever IRs are set ride the single swap;
+    /// no primary IR clears the cab. Returns the primary IR's info for status.
+    fn rebuild_cab(&mut self) -> Result<Option<lh_assets::IrInfo>, String> {
+        let Some(a_ref) = self.ir_ref.clone() else {
+            self.cab.clear();
+            return Ok(None);
+        };
+        let (a, info) = lh_assets::load_ir_pair(Path::new(&a_ref.path), self.sample_rate)
+            .map_err(|e| e.to_string())?;
+        let b = match &self.ir_b_ref {
+            Some(b_ref) => Some(
+                lh_assets::load_ir_pair(Path::new(&b_ref.path), self.sample_rate)
+                    .map_err(|e| e.to_string())?
+                    .0,
+            ),
+            None => None,
+        };
+        if self.cab.install(Box::new(IrAsset { a, b })).is_err() {
             return Err("install queue full, try again".into());
         }
-        self.ir_ref = asset_ref_for(path);
-        self.config.ir_dir = parent_dir(path);
-        save_config(&self.config);
+        Ok(Some(info))
+    }
+
+    /// Human-readable load note for an IR (resample/trim caveats).
+    fn ir_note(path: &Path, info: &lh_assets::IrInfo) -> String {
         let mut notes = Vec::new();
         if info.resampled {
             notes.push(format!(
@@ -1476,13 +1806,95 @@ impl Session {
         } else {
             format!(" ({})", notes.join(", "))
         };
-        Ok(format!(
-            "ir: {} loaded, {} samples = {:.0} ms{}",
+        format!(
+            "{}, {} samples = {:.0} ms{}",
             file_name(path),
             info.used_samples,
             info.seconds() * 1e3,
             notes,
-        ))
+        )
+    }
+
+    /// Load the cab's **primary** IR. Any loaded blend IR is preserved and
+    /// re-installed alongside it.
+    pub fn load_ir(&mut self, path: &Path) -> Result<String, String> {
+        let prev = self.ir_ref.clone();
+        self.ir_ref = asset_ref_for(path);
+        match self.rebuild_cab() {
+            Ok(Some(info)) => {
+                self.config.ir_dir = parent_dir(path);
+                save_config(&self.config);
+                Ok(format!("ir: {} loaded", Self::ir_note(path, &info)))
+            }
+            Ok(None) => Ok("ir cleared".into()),
+            Err(e) => {
+                self.ir_ref = prev; // roll back on failure — keep the old cab
+                Err(e)
+            }
+        }
+    }
+
+    /// Load the cab's **blend** IR (a second mic/cabinet, ADR 015). Requires a
+    /// primary IR already loaded; the `blend` knob crossfades between them.
+    pub fn load_ir_b(&mut self, path: &Path) -> Result<String, String> {
+        if self.ir_ref.is_none() {
+            return Err("load a primary cab IR first, then add a blend IR".into());
+        }
+        let prev = self.ir_b_ref.clone();
+        self.ir_b_ref = asset_ref_for(path);
+        match self.rebuild_cab() {
+            Ok(_) => {
+                self.config.ir_dir = parent_dir(path);
+                save_config(&self.config);
+                Ok(format!(
+                    "ir blend: {} loaded — dial the cab `blend` knob",
+                    file_name(path)
+                ))
+            }
+            Err(e) => {
+                self.ir_b_ref = prev; // roll back on failure
+                Err(e)
+            }
+        }
+    }
+
+    /// Restore the cab from a preset / carry-over: set both IR refs (resolving
+    /// each against `fallback_dir`) and install them together. No primary IR
+    /// clears the cab; a blend IR without a primary is dropped.
+    fn apply_cab(
+        &mut self,
+        ir: Option<&AssetRef>,
+        ir_b: Option<&AssetRef>,
+        fallback_dir: &Path,
+        lines: &mut Vec<String>,
+    ) {
+        let Some(a_ref) = ir else {
+            self.unload_ir(); // clears both refs + the cab
+            return;
+        };
+        match lh_assets::resolve_asset(a_ref, Some(fallback_dir)) {
+            Ok((a_path, warnings)) => {
+                lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
+                // Set the blend ref first so the primary's load installs both
+                // in one swap.
+                self.ir_b_ref =
+                    ir_b.and_then(|r| match lh_assets::resolve_asset(r, Some(fallback_dir)) {
+                        Ok((p, w)) => {
+                            lines.extend(w.into_iter().map(|w| format!("warning: {w}")));
+                            asset_ref_for(&p)
+                        }
+                        Err(e) => {
+                            lines.push(format!("error: blend ir: {e}"));
+                            None
+                        }
+                    });
+                match self.load_ir(&a_path) {
+                    Ok(msg) => lines.push(msg),
+                    Err(e) => lines.push(format!("error: {e}")),
+                }
+            }
+            Err(e) => lines.push(format!("error: {e}")),
+        }
     }
 
     /// Returns true when there was something to unload.
@@ -1494,12 +1906,22 @@ impl Session {
         had
     }
 
+    /// Unload the whole cab (both the primary and any blend IR).
     pub fn unload_ir(&mut self) -> bool {
         let had = self.cab.clear();
-        if had {
-            self.ir_ref = None;
-        }
+        self.ir_ref = None;
+        self.ir_b_ref = None;
         had
+    }
+
+    /// Unload only the blend IR, leaving the primary cab in place.
+    pub fn unload_ir_b(&mut self) -> bool {
+        if self.ir_b_ref.is_none() {
+            return false;
+        }
+        self.ir_b_ref = None;
+        let _ = self.rebuild_cab(); // reinstall the primary alone
+        true
     }
 
     // --- presets ---
@@ -1517,6 +1939,7 @@ impl Session {
             assets: PresetAssets {
                 nam: self.nam_ref.clone(),
                 ir: self.ir_ref.clone(),
+                ir_b: self.ir_b_ref.clone(),
             },
             snapshots: self.snapshots.clone(),
             active_snapshot: self.active_snapshot.clone(),
@@ -1544,7 +1967,12 @@ impl Session {
         lines.extend(warnings.into_iter().map(|w| format!("warning: {w}")));
 
         self.apply_asset(preset.assets.nam.as_ref(), &dir, AssetKind::Nam, &mut lines);
-        self.apply_asset(preset.assets.ir.as_ref(), &dir, AssetKind::Ir, &mut lines);
+        self.apply_cab(
+            preset.assets.ir.as_ref(),
+            preset.assets.ir_b.as_ref(),
+            &dir,
+            &mut lines,
+        );
 
         // Scenes come with the preset (PRD 009); apply the saved active one
         // instantly (no morph on load — it re-asserts values the baseline
@@ -1589,6 +2017,7 @@ impl Session {
                     let loaded = match kind {
                         AssetKind::Nam => self.load_nam(&path),
                         AssetKind::Ir => self.load_ir(&path),
+                        AssetKind::IrB => self.load_ir_b(&path),
                     };
                     match loaded {
                         Ok(msg) => lines.push(msg),
@@ -1601,6 +2030,7 @@ impl Session {
                 match kind {
                     AssetKind::Nam => self.unload_nam(),
                     AssetKind::Ir => self.unload_ir(),
+                    AssetKind::IrB => self.unload_ir_b(),
                 };
             }
         }
@@ -1906,6 +2336,15 @@ fn save_config(config: &AppConfig) {
     }
 }
 
+/// An asset ref's file name for display, or `"-"` when unset.
+fn asset_name(reference: &Option<AssetRef>) -> String {
+    reference
+        .as_ref()
+        .and_then(|a| Path::new(&a.path).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "-".into())
+}
+
 fn asset_ref_for(path: &Path) -> Option<AssetRef> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     match lh_assets::hash_file(&canonical) {
@@ -1939,24 +2378,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_matches_the_default_chain_and_its_invariants() {
+    fn registry_covers_the_default_chain_and_its_invariants() {
         let keys: Vec<&str> = FAMILY_REGISTRY.iter().map(|e| e.desc.key).collect();
-        // The default board is the registry's prefix, in order; anything past
-        // it is an add-only family (PRD 013's looper — not on the default
-        // board, not in the plugin).
-        assert_eq!(
-            &keys[..lh_core::DEFAULT_CHAIN.len()],
-            &lh_core::DEFAULT_CHAIN[..],
-            "the default chain is the registry prefix"
-        );
-        let add_only: Vec<&str> = keys[lh_core::DEFAULT_CHAIN.len()..].to_vec();
-        assert_eq!(add_only, ["looper"], "add-only families past the board");
-        for key in &add_only {
+        // The default board is an in-order subsequence of the registry: every
+        // shipped family is registered, in the same relative order, but the
+        // registry may carry extra opt-in families that ship *off* the board —
+        // `pitch` (ADR 016) and the standalone-only `looper` (PRD 013).
+        let mut cursor = keys.iter();
+        for want in lh_core::DEFAULT_CHAIN {
             assert!(
-                !lh_core::DEFAULT_CHAIN.contains(key),
-                "add-only family {key:?} must not be in the default chain"
+                cursor.any(|k| *k == want),
+                "default-chain family {want:?} missing from the registry (or out of order)"
             );
         }
+        // Everything the registry carries beyond the default board is off-board
+        // by construction, so none of it may also appear in DEFAULT_CHAIN.
+        let off_board: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|k| !lh_core::DEFAULT_CHAIN.contains(k))
+            .collect();
+        assert_eq!(
+            off_board,
+            ["pitch", "looper"],
+            "off-board opt-in families, in registry order"
+        );
         for (i, a) in keys.iter().enumerate() {
             // Trailing digits are reserved for instance handles ("drive2");
             // the engine's handle parser depends on it.

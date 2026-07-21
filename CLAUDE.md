@@ -387,8 +387,102 @@ criterion harness. Engine tail suite (rings-then-evicts, hard-cut contrast,
 forced-decay cap, lane exhaustion) uses a deterministic feedback-resonator
 test effect. **Plugin unchanged** — hosts own their tail handling.
 
-**M14 (parametric EQ pedal) — code landed (uncommitted).** Specced in
-PRD 011, recorded as ADR 014. First item of the 2026-07-20 nine-feature
+**Global tempo & note-division sync — code landed (uncommitted).** Recorded as
+**ADR 014 (sync target) + ADR 018 (BPM source)**, specced in PRD 012. Two
+parallel designs (one per machine) were reconciled at merge time (2026-07-21)
+into one combined feature; the two ADRs carry matching merge-reconciliation
+notes. **BPM source (ADR 018):** one app-global BPM (`AppConfig.tempo_bpm`,
+default 120, clamp 30–300, config.json — environment, not preset), fed by three
+sources into a session-owned **`TempoState`** (tap history + MIDI-clock
+accumulators): tap (footer **♩ BPM chip**, REPL `tap`/`tempo`), MIDI clock, and
+(plugin) host transport. `lh-midi` parses realtime bytes (`Ignore::None` — midir
+filters them by default): `MidiEvent::Clock { stamp_us }` / `Start` / `Stop`,
+`stamp_us` the driver's own timestamp (tick *intervals* carry the tempo). The
+session takes the **median** of the last 48 tick intervals (mean would let one
+USB hiccup bend it) with a plausibility gate (4–120 ms/tick, restarts on a gap)
+and a <0.5% hysteresis so a steady clock does not repaint the bar or requeue
+chain messages; tap/typed tempo persists, a MIDI-clock tempo is applied live but
+not persisted. **Sync target (ADR 014):** a per-pedal stepped **`sync`** param
+(`Free · 1/1 · 1/2 · 1/4. · 1/4 · 1/8. · 1/8T · 1/8 · 1/16` from
+`lh_core::tempo::SYNC_DIVISIONS`, default Free) on the 3 delay voices + tremolo —
+append-only, **no preset schema bump** (old files lack it → Free → identical),
+rides presets/MIDI/plugin for free, a **control-side no-op** in the DSP like
+delay's `subdivision` (`Ctl::Sync`). Pure math in `lh_core::tempo`
+(`synced_time_ms`/`synced_rate_hz`). **`ChainHandle::apply_tempo_sync(bpm) ->
+bool`** (lh-engine) locks a slot's `time` (delay) or `rate` (tremolo) when its
+`sync` ≠ Free via the normal `set_param` smoother; idempotent, returns whether
+anything moved. `Session::tick_tempo` delegates each control tick after
+`tick_morph`; `apply_tempo_now` is the non-persisting apply the MIDI-clock path
+shares. Per-slot **tap + `subdivision` stay** — a *Free* delay's TAP still sets
+its own `time` from tap × subdivision. GUI: the `sync` division renders as a
+stepped dropdown in the selector row (not a boolean chip); the footer BPM chip
+is the always-in-view tap. MIDI: virtual `tempo.tap` target (`SetParam` gated on
+`norm >= 0.5` — the press, PRD 008's `snapshot.select` pattern). **Plugin:**
+`apply_tempo_sync` runs once per block; while the active delay pedal's `sync` ≠
+Free, `context.transport().tempo` (via `lh_core::tempo::synced_time_ms`, split
+out and unit-tested) overrides `time` and the host's own `time` automation is
+ignored until `sync` returns to Free (the host param is never touched, so no
+restore logic). Plugin ids gain `delay_{digital,tape,vintage}_sync` +
+`mod_tremolo_sync` (**pre-v0.1 additive break** — no renames; re-run
+clap-validator); the plugin drives delay `time` only (tremolo `rate` sync is
+standalone-only for now). **Zero DSP/RT cost** (no audio-thread change). Engine
+test `apply_tempo_sync` locks delay time + tremolo rate; lh-core math tests;
+session tap/clock median tests.
+
+**Dual-IR cab / mic blend — code landed (uncommitted).** Recorded as
+ADR 015; deepens the NAM+IR tone core. The cab convolves a **primary IR `a`
+plus an optional blend IR `b`** (a second mic) with a new **`blend` knob**
+(0 = all A, 1 = all B) — a **linear** crossfade (the two mics are correlated,
+so level stays put while the top-end/comb difference sweeps; identical mics
+sum to unity). `IrAsset` grew `{ a: IrPair, b: Option<IrPair> }`; the blend +
+level trajectories are snapshotted once per block and shared L/R. **One asset
+handle** kept (`CabIr::new()` unchanged — the family-builder signature is
+shared by all 11 families): the control side owns both files and composes the
+combined asset — `lh_assets::load_ir_pair` decodes one IR; the session's
+`rebuild_cab` reloads whichever of `ir_ref`/`ir_b_ref` are set and installs
+them together (changing one re-decodes both — cheap/rare). Preset **schema v7**
+(`assets.ir_b`, `#[serde(default)]`; a v6 file is a single-mic v7, sounds
+identical; bumped so an old build rejects a dual-IR preset); `ir_b` rides
+`CarryOver`. Surfaces: REPL `load ir_b`/`unload ir_b`; GUI cab faceplate shows
+**MIC A**/**MIC B** rows (new `AssetKind::IrB` routes browser/unload) around
+the auto-rendered `blend` knob; blend IR needs a primary; unloading the
+primary clears both. Plugin loads both from a preset + exposes `cab_blend`
+(**pre-v0.1 additive break, re-run clap-validator**); it can't load a blend IR
+interactively (assets come from presets there). ~2× cab CPU only when a blend
+IR is loaded (~7 µs, 0.5 %); single-mic cabs pay nothing. RT-safe (all scratch
+in `prepare`). Tests: `blend_crossfades_between_the_two_irs`,
+`blend_is_inert_without_a_second_ir`, preset `ir_b` round-trip.
+
+**Pitch family (octaver) — code landed (uncommitted).** Recorded as ADR 016;
+fills the one missing effect category (octave/pitch). New chain family
+**`pitch`** (key broad for a future harmonizer/whammy/detuner), first pedal
+**`octaver`**: a POG-style granular doubler — a stereo **Dry** path mixed with a
+**Sub** (−1 oct) and **Oct** (+1 oct) voice taken off the *mono sum* (fat,
+centered octaves), a shared **Tone** lowpass (600 Hz–9 kHz) taming the granular
+fizz. Built on a new shared primitive **`blocks::grain::GrainShift`** (the
+no-FFT two-tap "doppler" shifter promoted from the shimmer reverb's math;
+reverb keeps its private copy — dedup deferred to a health pass to avoid
+pre-v0.1 churn). Feed-forward, so **no tail** (`tail_seconds()` 0, no spill) and
+bounded by construction. **Opt-in, not on the default board**: `pitch` is
+registered in `FAMILY_REGISTRY` (so ＋ menu / REPL `add pitch` reach it) but
+**absent from `DEFAULT_CHAIN`**, so the board stays 11/12 with a free slot. This
+decoupled the registry from `DEFAULT_CHAIN` for the first time — the default
+board is now an in-order **subsequence** of the registry (pinning test relaxed
+accordingly; the standalone-only `looper` is the other off-board family).
+**No preset schema bump** (new family =
+vocabulary; old presets reconcile the absent slot away). Livery: orchid magenta,
+joined the distinct-livery test. Faceplate auto-renders (generic knobs); GUI/
+session/engine needed no per-family code beyond the registry entry + theme
+color. ~1.05 µs/block (0.08 %; `pitch_octaver` bench). Granular ⇒ polyphonic
+but warbly — *not* an OC-2 mono divider (accepted, ADR 016). **Plugin
+unchanged**: its fixed chain is `DEFAULT_CHAIN`, which did not move, so no new
+param ids and clap-validator is unaffected — plugin pitch is a follow-up. 12
+new tests (octave up/down land on the Goertzel bin, dry-path transparent,
+Tone darkens the up-voice, bounded/finite fuzz, silence→silence, plus
+`GrainShift`'s own).
+
+**Parametric EQ pedal — code landed (uncommitted).** Specced in
+PRD 011, recorded as **ADR 017**. First item of the 2026-07-20 nine-feature
 roadmap (user-picked: recorder/re-amp, looper, global tempo sync, comp
 family, power-amp sim, practice tools, setlists+leveling, pitch family,
 this). The `eq` slot became a **two-pedal family** (3-band keeps key
@@ -405,53 +499,19 @@ diff-and-send through the slot param path (shadow-live, MIDI-learnable via
 REPL `learn eq.b3_freq`, scene-morphable), spectrum overlay = the output
 tap tagged "OUT" (no per-slot taps); the FFT also runs while a parametric
 faceplate is showing. Livery: analyzer ice; eq joined the distinct-livery
-pin (6 families). Plugin: **pre-v0.1 id break** — eq now qualifies ids
+pin. Plugin: **pre-v0.1 id break** — eq now qualifies ids
 with the pedal key (`eq_low` → `eq_eq_low`), `eq_parametric_*` +
 `eq_pedal` appear; re-run clap-validator. Bench `eq_parametric_4band` ≈
 `global_eq_4band` (same-box parity ~1.45 µs — settled-skip inherited).
 
-**M15 (global tempo) — code landed (uncommitted).** Specced in PRD 012,
-recorded as ADR 015. Second item of the 2026-07-20 roadmap. Tap tempo,
-MIDI clock, and (plugin) host transport BPM now feed **one session-owned
-`TempoState`** instead of the GUI's per-slot `TapState` (deleted outright
-— session's `tap_tempo`/`apply_tempo`/`apply_tempo_to` are a straight
-port of the same math). Delay voices gained a second control-side-only
-param **`sync`** (`Ctl::Sync => {}`, ADR 007's `subdivision` pattern) —
-on, a slot's `time` is re-derived from the tempo × its subdivision
-whenever either changes; **zero engine/DSP-audio-path changes**.
-`lh-midi` parses realtime bytes (`Ignore::None` — midir filters them by
-default): `MidiEvent::Clock { stamp_us }` / `Start` / `Stop`, `stamp_us`
-being the driver's own timestamp (tick *intervals* carry the tempo; a
-control-thread wall-clock read at drain time would quantize it away).
-Session takes the **median** of the last 48 tick intervals (mean would
-let one USB hiccup bend the reading) with a plausibility gate (4–120 ms/
-tick) that restarts accumulation on a gap; a changed-BPM line and the
-per-slot resync are hysteresis-gated (<0.5% wobble is silent) so a
-steady external clock doesn't repaint the status bar or requeue chain
-messages every tick. GUI: footer grew a global **♩ BPM chip** (click =
-tap); the delay faceplate's TAP row now reads the session tempo and
-grew a **SYNC chip** next to it (the boolean gets a toggle, not the
-generic stepped-param dropdown). MIDI: virtual `tempo.tap` target
-(`SetParam` gated on `norm >= 0.5` — the press, not a momentary switch's
-release; PRD 008's `snapshot.select` pattern). REPL: `tap` / `tempo` /
-`tempo <bpm>`. **Plugin**: `apply_tempo_sync` runs once per block after
-the existing float-forwarding loop — while the active delay pedal's
-`sync` is on, `context.transport().tempo` (pure math split into
-`synced_time_ms`, unit-tested without a `ProcessContext` mock) overrides
-`time` and the host's own `time` automation is ignored until `sync` goes
-off again (the host param itself is never touched, so no restore logic
-is needed on the way back). No host tempo (or `sync` off) leaves `time`
-exactly where the normal forwarding loop already put it. Plugin gains
-`delay_{digital,tape,vintage}_sync` (**pre-v0.1 id addition**, purely
-additive — no renames this time), re-run clap-validator.
-
-**M16 (looper) — code landed (uncommitted).** Specced in PRD 013, recorded as
-ADR 016. First item of the 2026-07-20 nine-feature roadmap after tempo. New
-single-pedal family `looper` — the **first add-only family**: buildable +
+**Looper — code landed (uncommitted).** Specced in PRD 013, recorded as
+**ADR 019**. First item of the 2026-07-20 nine-feature roadmap after tempo. New
+single-pedal family `looper` — an **add-only family**: buildable +
 offered in the "＋" menu but **not** in `DEFAULT_CHAIN` and **not** in the
 plugin (standalone-only, ADR 013's reasoning). The registry↔default-chain
-test relaxed from "equal" to "default chain is the registry prefix; the rest
-are add-only." **Engine and session message set untouched**: transport
+test was relaxed from "equal" to "default chain is an in-order **subsequence**
+of the registry; the rest are add-only" (`pitch` ships off-board too).
+**Engine and session message set untouched**: transport
 (`rec`/`undo`/`clear`) are momentary linear params, rising-edge-through-0.5 in
 `set_param` (the `tempo.tap` idiom); the GUI/REPL/MIDI fire a **1.0→0.0
 pulse** (the FIFO ring keeps both edges; the shadow settles at 0 so a preset
@@ -478,6 +538,49 @@ schema bump** (new vocabulary; transport stored as 0), **no plugin id change**.
 overdub soft-clip bound, seam delta bound, mix-0 bit-exact, 60 s @ 96 k cap,
 multi-rate). ~0.65–1.03 µs/block record/play/overdub (`looper_*` benches,
 ≤0.08 % deadline). v2: tempo-quantized length, multi-undo, loop→WAV export.
+
+**Practice tools — metronome (Phase 1) — code landed (uncommitted).** Specced
+in PRD 019 (three phases: metronome → drum groove → song player), recorded as
+**ADR 020**. Phase 1 = the metronome **plus the shared aux-monitor foundation**
+the later phases reuse. First **monitor/aux path** in the engine: the `Chain`
+grew an optional interleaved-stereo **aux input ring**
+(`Chain::set_aux_input`), drained and summed onto the bus **after** the output
+stage (global EQ → safety limiter → spectrum tap) and before `peak_out` — so
+the click bypasses the amp tone and is *not* limited by the guitar's safety
+limiter (a monitor mix, not tone), the **spectrum tap stays guitar-only**
+(read pre-aux), and `peak_out` reflects the true device sum. Drop-on-empty
+(underrun = a brief gap, never a stall); bit-transparent with the click off
+(the drain early-returns on an empty ring). **Synthesis is off the audio
+thread**: a dedicated `lh-aux-player` thread renders the metronome into the
+ring keeping ~50 ms buffered, so the audio callback only does a lock-free ring
+read + a per-sample stereo add — `assert_no_alloc`-clean (validated by a
+null-device jam with the click on, exit 0). The metronome is
+`lh_dsp::practice::Metronome` — a **generator, not an `Effect`** (new
+`practice/` module, the future home of the drum player + WSOLA): a mono
+enveloped-sine click (1500 Hz accent / 1000 Hz beat, ~50 ms), beat-1 accent,
+`beats_per_bar` (1–16), volume, `restart`/count-in, driven by an internal
+sample clock so it is pure/offline-testable and cannot drift vs the audio it
+mixes into. **BPM follows the global tempo** (ADR 014) — the session pushes
+`config.tempo_bpm` into the shared control state on every tempo move, so
+tapping the footer BPM chip re-times the click. Cross-thread control is an
+`Arc<MetronomeShared>` of atomics (enabled/bpm/vol/beats/accent/restart-gen/
+run flag, `Relaxed`); the player thread is **joined on `Session` drop**, and
+the metronome's runtime state rides a device restart via `CarryOver` (BPM
+re-reads from the persisted config). **App-global environment, not tone** — no
+preset schema bump, not in presets; **plugin unchanged** (hosts own their
+metronome, the spillover/ADR 013 precedent). Surfaces: footer `click` toggle
+(lit amber = running) + a stepped time-sig chip + the shared BPM chip; REPL
+`metronome on|off` / `click <0-100>` / `timesig <n>` / `countin`. Click level
+kept moderate (default accent ≈ −9 dBFS) since the aux sums post-limiter — a
+coincident full-scale guitar+click peak can clip (accepted for a practice
+monitor; a summed-output brickwall is the noted future mitigation). ~218 ns
+worst-case click block (`metronome_click` bench, **off the RT budget** — player
+thread); the aux sum is below a bench's noise floor. 7 metronome DSP tests
+(beat phase/accent/meter/volume/count-in restart/tempo tracking/multi-rate
+finite) + 4 engine aux tests (empty = bit-transparent, stereo sum, underrun
+gap, tap excludes aux). **Phases 2 (drum groove) & 3 (song player: `symphonia`
+decode, A-B loop, WSOLA varispeed, ±semitone) are deferred** — they render
+into the same aux ring from the same player thread.
 
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
@@ -545,15 +648,28 @@ post-cab and hear the position; `add eq` for a second instance with its
 own memory; save/reload a board with parametric values; an old preset
 still loads as the 3-band untouched; plugin ids re-checked — `eq_eq_*`
 rename plus `eq_parametric_*`),
-**global tempo** (tap the footer BPM chip a few times — it locks in and a
-sync-on delay's echo snaps to it; a sync-on slot also relocks the instant
-you flip its subdivision; feed MIDI clock from a DAW/drum machine — the
-chip tracks it, stop the clock and a manual tap immediately takes back
-over; `tempo.tap` bound to a momentary footswitch taps cleanly, not on
-release; plugin in a host — turn `sync` on a delay pedal, confirm it
-locks to the project tempo and the host's own `time` automation lane goes
-inert, then flip `sync` off and confirm `time` snaps back to whatever the
-host has stored; plugin ids re-checked — `delay_*_sync` appeared),
+**global tempo & sync** (tap the footer BPM chip a few times — it locks in;
+set a delay's `sync` division to dotted-1/8 and its echo snaps to the beat,
+a synced tremolo pulses in time; re-tap or `tempo <bpm>` re-locks, `sync`
+back to *Free* returns the Time/Rate knob with no click as the smoother
+glides; feed MIDI clock from a DAW/drum machine — the chip tracks it, stop
+the clock and a manual tap takes back over; `tempo.tap` bound to a momentary
+footswitch taps on the press, not the release; a synced delay saved/reloaded
+stays synced; plugin in a host — turn a delay pedal's `sync` off *Free*,
+confirm `time` locks to the project tempo and the host's own `time`
+automation goes inert, then back to *Free* and `time` snaps to whatever the
+host stored; plugin ids re-checked — `delay_*_sync` + `mod_tremolo_sync`
+appeared),
+**dual-IR cab by ear** (load MIC A, then MIC B — a different cab/mic; sweep the
+`blend` knob A⇄B and hear the mic mix / comb; the level shouldn't jump across
+the sweep; a dual-IR preset saved/reloaded keeps both mics + the blend; unload
+MIC B returns to A-only; the plugin loads both from that preset and `cab_blend`
+automates),
+**the octaver by ear** (`add pitch` from the ＋ menu — it starts off the default
+board; Sub for a fat synth-bass under a riff, Oct for the 12-string/organ
+shimmer, roll Tone back to tuck the up-octave fizz; check chord tracking and the
+granular warble on held notes vs the tighter dry; drag it *before* the drive for
+cleaner tracking; confirm Dry-only is transparent),
 **the looper by ear** (`add looper`; REC records a phrase, REC again plays
 it, REC again overdubs a layer, UNDO drops the layer and UNDO again brings it
 back, CLEAR empties it; drag the looper before the drive to loop a clean DI
@@ -562,6 +678,15 @@ it an octave; the seam doesn't click; a foot CC on `looper.rec` punches the
 loop and the faceplate LED tracks it — red recording / green playing / amber
 overdub; **confirm `assert_no_alloc` stays quiet** in a debug build while
 recording/overdubbing/undoing — a transport press mid-note must not SIGABRT),
+**the metronome by ear** (footer `click` toggle starts the tick on beat 1, lit
+amber; it locks to the global tempo — tap the BPM chip / `tempo 90` and the
+click follows; the time-sig chip moves the accent's bar length; `countin`
+restarts on 1; `click <0-100>` sets a comfortable monitor level that sits under
+the guitar without clipping on loud transients; **the click bypasses the amp**
+— it stays clean regardless of drive/EQ, and does not duck under a loud chord;
+the spectrum analyzer/EQ does *not* show the click; a device/buffer change in
+settings keeps the click running; **confirm `assert_no_alloc` stays quiet**
+with the click on while switching presets/pedals),
 plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
@@ -619,7 +744,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |
 | `lh-core`        | Param IDs & ranges, chain model, preset schema. No I/O, no threads | —             |
-| `lh-dsp`         | Effects, one module per category (dynamics, drive, eq, modulation, time, cab) over shared `blocks/`. Offline-testable, RT-safe | `lh-core`     |
+| `lh-dsp`         | Effects, one module per category (dynamics, drive, eq, modulation, pitch, time, cab) over shared `blocks/`. Offline-testable, RT-safe | `lh-core`     |
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |

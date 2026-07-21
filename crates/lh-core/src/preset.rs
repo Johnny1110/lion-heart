@@ -26,12 +26,18 @@
 //! no scenes: it loads and sounds identical. The version still bumps so an
 //! older build rejects a scene-bearing file outright instead of silently
 //! dropping the scenes it cannot represent.
+//!
+//! v7 (ADR 015): the cab may carry a second **blend IR** (`assets.ir_b`) — a
+//! second mic/cabinet. It defaults to absent, so a v6 file is a v7 file with a
+//! single-mic cab: loads and sounds identical. The version bumps for the same
+//! reason as v6 — an older build rejects a dual-IR preset rather than silently
+//! dropping the second mic.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 6;
+pub const PRESET_SCHEMA_VERSION: u32 = 7;
 
 /// Snapshot slot letters, in order (PRD 009). A preset stores at most this
 /// many scenes; the GUI shows one chip per letter.
@@ -177,8 +183,13 @@ impl SlotState {
 pub struct PresetAssets {
     #[serde(default)]
     pub nam: Option<AssetRef>,
+    /// The cab's primary IR.
     #[serde(default)]
     pub ir: Option<AssetRef>,
+    /// The cab's optional blend IR — a second mic/cabinet the `blend` knob
+    /// crossfades toward (ADR 015). Absent in v6 and earlier presets.
+    #[serde(default)]
+    pub ir_b: Option<AssetRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -403,6 +414,7 @@ mod tests {
                     sha256: "abc123".into(),
                 }),
                 ir: None,
+                ir_b: None,
             },
             snapshots: BTreeMap::new(),
             active_snapshot: None,
@@ -460,10 +472,34 @@ mod tests {
                        "pedals": {"hall": {"decay": 3.0}}}]
         }"#;
         let p = Preset::from_json(v5).unwrap();
-        assert_eq!(p.schema_version, 6);
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
         assert!(p.snapshots.is_empty());
         assert!(p.active_snapshot.is_none());
         assert_eq!(p.chain[0].pedals["hall"]["decay"], 3.0);
+    }
+
+    /// A v6 file (single-mic cab) upgrades to v7 with no blend IR — the cab
+    /// sounds identical. A v7 file round-trips its `ir_b`.
+    #[test]
+    fn dual_ir_field_defaults_absent_and_round_trips() {
+        let v6 = r#"{
+            "schema_version": 6,
+            "name": "one-mic",
+            "chain": [],
+            "assets": {"ir": {"path": "/a.wav", "sha256": "aa"}}
+        }"#;
+        let p = Preset::from_json(v6).unwrap();
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
+        assert!(p.assets.ir.is_some());
+        assert!(p.assets.ir_b.is_none(), "v6 cab has no blend IR");
+
+        let mut dual = p.clone();
+        dual.assets.ir_b = Some(AssetRef {
+            path: "/b.wav".into(),
+            sha256: "bb".into(),
+        });
+        let back = Preset::from_json(&dual.to_json_pretty()).unwrap();
+        assert_eq!(back.assets.ir_b.as_ref().unwrap().path, "/b.wav");
     }
 
     #[test]

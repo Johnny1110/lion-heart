@@ -62,7 +62,7 @@ pub struct LionHeartPlugin {
     last_pedal: Vec<i32>,
     last_active: Vec<bool>,
     last_preset: i32,
-    /// Host-BPM sync (PRD 012): `(pedal index, time_ms)` last pushed onto
+    /// Host-BPM sync (ADR 014): `(pedal index, time_ms)` last pushed onto
     /// the delay slot's `time` param via the sync override, so a repeat
     /// isn't resent every block and a pedal switch is detected even when
     /// the derived time happens to coincide. `None` while not overriding.
@@ -220,7 +220,7 @@ impl Plugin for LionHeartPlugin {
                 let _ = self.handle.set_active(sb.slot, active);
             }
         }
-        // Host-BPM sync (PRD 012): overrides the delay slot's `time` for
+        // Host-BPM sync (ADR 014): overrides the delay slot's `time` for
         // whichever pedal is active and has `sync` on, ignoring that
         // pedal's own `time` automation until sync goes off again.
         self.apply_tempo_sync(context);
@@ -243,20 +243,20 @@ impl Plugin for LionHeartPlugin {
 }
 
 impl LionHeartPlugin {
-    /// Host-BPM sync for the delay slot (PRD 012). The engine's `sync`
+    /// Host-BPM sync for the delay slot (ADR 014). The engine's `sync`
     /// param is a control-side no-op (like `subdivision`) — this is the
     /// "control side" for the plugin, the counterpart of the standalone
-    /// session's `apply_tempo`/`apply_tempo_to`.
+    /// session's `apply_tempo_sync`/`tick_tempo`.
     ///
-    /// Only the currently active delay pedal matters: its own `sync` and
-    /// `subdivision` host params, read directly (no smoothing needed, this
-    /// runs once per block, not per sample). When sync is on and the host
-    /// reports a tempo, `time = 60000/bpm × subdivision ratio`, clamped to
-    /// that pedal's own range, overrides whatever the host's `time`
-    /// automation says — the host param stays put, just ignored, so
-    /// turning sync back off snaps cleanly to it. No host tempo (e.g. a
-    /// standalone-hosted CLAP scanner) leaves `time` exactly where the
-    /// normal float-forwarding loop above already put it.
+    /// Only the currently active delay pedal matters: its own `sync` division
+    /// host param, read directly (no smoothing needed, this runs once per
+    /// block, not per sample). When sync is a note division (not *Free*) and
+    /// the host reports a tempo, `time = 60000/bpm × the division's beat
+    /// ratio` (`lh_core::tempo`), clamped to that pedal's own range, overrides
+    /// whatever the host's `time` automation says — the host param stays put,
+    /// just ignored, so returning to *Free* snaps cleanly back to it. No host
+    /// tempo (e.g. a standalone-hosted CLAP scanner) leaves `time` exactly
+    /// where the normal float-forwarding loop above already put it.
     fn apply_tempo_sync(&mut self, context: &mut impl ProcessContext<Self>) {
         let Some(sel) = self.params.selectors.iter().find(|s| s.slot == "delay") else {
             return; // defensive: the fixed chain always has one
@@ -268,12 +268,12 @@ impl LionHeartPlugin {
                 .iter()
                 .find(|sp| sp.slot == "delay" && sp.pedal == active && sp.key == key)
         };
-        let sync_on = find("sync").is_some_and(|sp| sp.param.value() >= 0.5);
+        let div = find("sync").map_or(0, |sp| sp.param.value().round() as usize);
 
-        if !sync_on {
-            // Falling edge: hand the slot back to the host's own `time`
-            // value for this pedal — the float loop won't, since (from its
-            // point of view) that value never changed while we overrode it.
+        if !lh_core::tempo::is_synced(div) {
+            // *Free*: hand the slot back to the host's own `time` value for
+            // this pedal — the float loop won't, since (from its point of
+            // view) that value never changed while we overrode it.
             if self.synced_delay.take().is_some()
                 && let Some(sp) = find("time")
             {
@@ -285,10 +285,7 @@ impl LionHeartPlugin {
         let Some(bpm) = context.transport().tempo else {
             return; // no host tempo to follow — leave time where it is
         };
-        let Some(sub) = find("subdivision") else {
-            return;
-        };
-        let Some(time_ms) = synced_time_ms(bpm, sub.param.value(), active) else {
+        let Some(time_ms) = synced_time_ms(bpm, div, active) else {
             return;
         };
 
@@ -303,18 +300,19 @@ impl LionHeartPlugin {
     }
 }
 
-/// Pure PRD-012 time math — `time = 60000/bpm × subdivision ratio`, clamped
+/// Pure ADR-014 time math — `lh_core::tempo::synced_time_ms(bpm, div)` clamped
 /// to `pedal`'s own range — split out of [`LionHeartPlugin::apply_tempo_sync`]
 /// so it is unit-testable without a full `ProcessContext` mock. `None` for a
-/// non-finite/non-positive bpm or an out-of-range pedal index.
-fn synced_time_ms(bpm: f64, subdivision: f32, pedal: usize) -> Option<f32> {
+/// non-finite/non-positive bpm, a *Free* (or out-of-range) division, or an
+/// out-of-range pedal index.
+fn synced_time_ms(bpm: f64, div: usize, pedal: usize) -> Option<f32> {
     if !(bpm.is_finite() && bpm > 0.0) {
         return None;
     }
-    let ratio = lh_dsp::time::delay::subdivision_ratio(subdivision as usize);
+    let base = lh_core::tempo::synced_time_ms(bpm as f32, div)?;
     let desc = lh_dsp::time::delay::FAMILY.pedals.get(pedal)?;
     let time = &desc.params[desc.param_index("time")?];
-    Some(time.range.clamp(60_000.0 / bpm as f32 * ratio))
+    Some(time.range.clamp(base))
 }
 
 // --- parameters -------------------------------------------------------------
@@ -579,14 +577,34 @@ fn load_preset_assets(assets: &mut AssetRuntime, index: usize, sample_rate: u32)
             assets.nam.clear();
         }
     }
-    match &preset.assets.ir {
-        Some(reference) => match lh_assets::resolve_asset(reference, Some(&dir))
+    // Cab: primary IR plus an optional blend IR (a second mic, ADR 015).
+    let load_pair = |reference: &lh_core::preset::AssetRef| {
+        lh_assets::resolve_asset(reference, Some(&dir))
             .map_err(|e| e.to_string())
-            .and_then(|(p, _)| lh_assets::load_ir(&p, sample_rate).map_err(|e| e.to_string()))
-        {
-            Ok((asset, info)) => {
-                if assets.cab.install(asset).is_ok() {
-                    nih_log!("lion-heart: ir loaded ({} samples)", info.used_samples);
+            .and_then(|(p, _)| lh_assets::load_ir_pair(&p, sample_rate).map_err(|e| e.to_string()))
+    };
+    match &preset.assets.ir {
+        Some(reference) => match load_pair(reference) {
+            Ok((a, info)) => {
+                // A blend IR that fails to load just leaves the cab single-mic.
+                let b = preset
+                    .assets
+                    .ir_b
+                    .as_ref()
+                    .and_then(|r| match load_pair(r) {
+                        Ok((pair, _)) => Some(pair),
+                        Err(e) => {
+                            nih_log!("lion-heart: ir blend: {e}");
+                            None
+                        }
+                    });
+                let blended = b.is_some();
+                if assets.cab.install(Box::new(IrAsset { a, b })).is_ok() {
+                    nih_log!(
+                        "lion-heart: ir loaded ({} samples{})",
+                        info.used_samples,
+                        if blended { " + blend" } else { "" }
+                    );
                 }
             }
             Err(e) => nih_log!("lion-heart: ir: {e}"),
@@ -643,15 +661,18 @@ mod tests {
         }
     }
 
-    // --- host-BPM sync (PRD 012) ---
+    // --- host-BPM sync (ADR 014) ---
 
     #[test]
-    fn synced_time_follows_bpm_and_subdivision() {
-        // Quarter note at 120 bpm = 500 ms; digital (pedal 0) spans well
-        // past that (20..2000), so no clamping kicks in.
-        assert_eq!(synced_time_ms(120.0, 0.0, 0).unwrap(), 500.0);
-        // Dotted 1/8 (index 1, ratio 0.75) at the same tempo = 375 ms.
-        assert_eq!(synced_time_ms(120.0, 1.0, 0).unwrap(), 375.0);
+    fn synced_time_follows_bpm_and_division() {
+        // `sync` divisions index into lh_core::tempo::SYNC_DIVISIONS: index 4
+        // is "1/4" (a quarter = 500 ms at 120 bpm); digital (pedal 0) spans
+        // well past that (20..2000), so no clamping kicks in.
+        assert_eq!(synced_time_ms(120.0, 4, 0).unwrap(), 500.0);
+        // Index 5 is "1/8." (dotted eighth, ratio 0.75) → 375 ms.
+        assert_eq!(synced_time_ms(120.0, 5, 0).unwrap(), 375.0);
+        // Index 0 is *Free* — the knob rules, so no synced time.
+        assert_eq!(synced_time_ms(120.0, 0, 0), None, "Free division");
     }
 
     #[test]
@@ -660,15 +681,15 @@ mod tests {
         // (1500 ms) must clamp down to the pedal's own ceiling, not
         // digital's 2000 ms.
         let vintage_index = lh_dsp::time::delay::FAMILY.pedal_index("vintage").unwrap();
-        let time = synced_time_ms(40.0, 0.0, vintage_index).unwrap();
+        let time = synced_time_ms(40.0, 4, vintage_index).unwrap();
         assert_eq!(time, 600.0);
     }
 
     #[test]
     fn synced_time_rejects_absent_or_invalid_tempo() {
-        assert_eq!(synced_time_ms(0.0, 0.0, 0), None, "zero bpm");
-        assert_eq!(synced_time_ms(-10.0, 0.0, 0), None, "negative bpm");
-        assert_eq!(synced_time_ms(f64::NAN, 0.0, 0), None, "NaN bpm");
-        assert_eq!(synced_time_ms(120.0, 0.0, 99), None, "out-of-range pedal");
+        assert_eq!(synced_time_ms(0.0, 4, 0), None, "zero bpm");
+        assert_eq!(synced_time_ms(-10.0, 4, 0), None, "negative bpm");
+        assert_eq!(synced_time_ms(f64::NAN, 4, 0), None, "NaN bpm");
+        assert_eq!(synced_time_ms(120.0, 4, 99), None, "out-of-range pedal");
     }
 }

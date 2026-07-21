@@ -18,9 +18,10 @@ use crate::session::{Session, SessionOpts, list_presets};
 const HELP: &str = "\
 commands:
   load nam <path.nam>          load an amp capture (rate must match engine)
-  load ir <path.wav>           load a cabinet impulse response
+  load ir <path.wav>           load a cabinet impulse response (primary mic)
+  load ir_b <path.wav>         load a blend IR (2nd mic; cab `blend` mixes A⇄B)
   load preset <name>           load a saved preset (chain + assets)
-  unload nam | unload ir       remove the capture / IR
+  unload nam|ir|ir_b           remove the capture / cab IR / blend IR
   save <name>                  save chain + assets as a preset
   presets                      list saved presets
   delete <name>                delete a saved preset
@@ -38,9 +39,13 @@ commands:
   snapshot save <A-D>          store the current scene into a slot
   morph <ms>                   scene morph time, 0–2000 ms
   tap                          tap the global tempo (two-plus in rhythm)
-  tempo                        show the global tempo
+  tempo                        show the global tempo for synced delay/tremolo
   tempo <bpm>                  set the global tempo directly (30-300)
   spillover on|off             let delay/reverb tails ring out on switch
+  metronome on|off             practice click locked to the global tempo
+  click <0-100>                metronome volume (percent)
+  timesig <n>                  beats per bar (accent on 1)
+  countin                      (re)start the click on beat 1
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -104,6 +109,7 @@ pub fn run(args: JamArgs) -> Result<()> {
         }
         session.collect_garbage();
         session.tick_morph(Instant::now());
+        session.tick_tempo();
         for line in session.drain_midi() {
             println!("  {line}");
         }
@@ -271,8 +277,14 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     Ok(msg) => println!("  {msg}"),
                     Err(e) => println!("  error: {e}"),
                 },
+                Some("ir_b") | Some("irb") => match session.load_ir_b(Path::new(&target)) {
+                    Ok(msg) => println!("  {msg}"),
+                    Err(e) => println!("  error: {e}"),
+                },
                 Some("preset") => load_preset(session, &target),
-                _ => println!("usage: load nam <path> | load ir <path> | load preset <name>"),
+                _ => println!(
+                    "usage: load nam <path> | load ir <path> | load ir_b <path> | load preset <name>"
+                ),
             }
         }
         Some("unload") => match parts.next() {
@@ -286,7 +298,12 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     println!("  ir: unloaded");
                 }
             }
-            _ => println!("usage: unload nam | unload ir"),
+            Some("ir_b") | Some("irb") => {
+                if session.unload_ir_b() {
+                    println!("  ir blend: unloaded");
+                }
+            }
+            _ => println!("usage: unload nam | unload ir | unload ir_b"),
         },
         Some(toggle @ ("on" | "off")) => match parts.next() {
             Some(slot) => match session.chain.set_active(slot, toggle == "on") {
@@ -423,23 +440,19 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             None => println!("  morph time is {} ms", session.morph_ms()),
         },
         Some("tap") => {
-            for line in session.tap_tempo(None) {
-                println!("  {line}");
+            let msg = session.tap_tempo(None);
+            if msg.is_empty() {
+                println!("  tap again in rhythm to set the tempo");
+            } else {
+                println!("  {msg}");
             }
         }
-        Some("tempo") => match parts.next() {
+        Some("tempo") | Some("bpm") => match parts.next() {
             Some(bpm) => match bpm.parse::<f32>() {
-                Ok(v) => {
-                    for line in session.set_tempo_bpm(v) {
-                        println!("  {line}");
-                    }
-                }
+                Ok(v) => println!("  {}", session.set_tempo_bpm(v)),
                 Err(_) => println!("  not a number: {bpm}"),
             },
-            None => match session.tempo_bpm() {
-                Some(bpm) => println!("  tempo: ♩ = {bpm:.0} bpm"),
-                None => println!("  tempo: not set yet — tap or `tempo <bpm>`"),
-            },
+            None => println!("  tempo is ♩ = {:.0} bpm", session.tempo_bpm()),
         },
         Some("spillover") => match parts.next() {
             Some("on") => println!("  {}", session.set_spillover(true)),
@@ -449,6 +462,29 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 if session.spillover() { "on" } else { "off" }
             ),
         },
+        Some("metronome") | Some("metro") => match parts.next() {
+            Some("on") => println!("  {}", session.set_metronome(true)),
+            Some("off") => println!("  {}", session.set_metronome(false)),
+            _ => println!(
+                "  metronome is {} — usage: metronome on|off",
+                if session.metronome_on() { "on" } else { "off" }
+            ),
+        },
+        Some("click") => match parts.next() {
+            Some(pct) => match pct.parse::<f32>() {
+                Ok(v) => println!("  {}", session.set_click_volume(v / 100.0)),
+                Err(_) => println!("  not a number: {pct}"),
+            },
+            None => println!("  click volume is {:.0}%", session.click_volume() * 100.0),
+        },
+        Some("timesig") | Some("sig") => match parts.next() {
+            Some(n) => match n.parse::<u32>() {
+                Ok(v) => println!("  {}", session.set_beats_per_bar(v)),
+                Err(_) => println!("  not a number: {n}"),
+            },
+            None => println!("  time signature is {}/4", session.beats_per_bar()),
+        },
+        Some("countin") | Some("count") => println!("  {}", session.count_in()),
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }
     true

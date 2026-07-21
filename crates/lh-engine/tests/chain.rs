@@ -76,6 +76,47 @@ fn params_travel_through_the_queue() {
     assert!((clamped.real - 0.9).abs() < 1e-6);
 }
 
+/// The active pedal's `key` param as a real-world value.
+fn real(handle: &lh_engine::ChainHandle, slot: &str, key: &str) -> f32 {
+    let desc = handle.param_desc(slot, key).unwrap();
+    desc.range.to_real(handle.param_norm(slot, key).unwrap())
+}
+
+/// Tempo sync (ADR 014): a delay's `sync` selector locks its `time` to the rig
+/// BPM (a note length); a tremolo's locks its `rate` (one cycle per note).
+/// *Free* leaves the knobs alone.
+#[test]
+fn tempo_sync_locks_delay_time_and_tremolo_rate() {
+    let (_chain, mut handle) = build_chain(vec![
+        Box::new(Delay::new()),
+        Box::new(lh_dsp::modulation::Modulation::new()),
+    ]);
+    // The mod slot's `sync` drives `rate` only on a rate pedal — pick tremolo.
+    handle.select_pedal("mod", "tremolo").unwrap();
+
+    // Sync defaults to Free: apply is a no-op and touches nothing.
+    let time_before = handle.param_norm("delay", "time").unwrap();
+    assert!(!handle.apply_tempo_sync(120.0), "Free rig moves nothing");
+    assert_eq!(handle.param_norm("delay", "time").unwrap(), time_before);
+
+    // Lock the delay to a quarter note ("1/4" = index 4) at 120 BPM → 500 ms.
+    handle.set_param("delay", "sync", 4.0).unwrap();
+    assert!(handle.apply_tempo_sync(120.0));
+    assert!((real(&handle, "delay", "time") - 500.0).abs() < 1.0);
+
+    // Idempotent at the same tempo — a settled rig makes no queue traffic.
+    assert!(!handle.apply_tempo_sync(120.0));
+
+    // A tempo change retunes it: a quarter at 90 BPM = 666.7 ms.
+    assert!(handle.apply_tempo_sync(90.0));
+    assert!((real(&handle, "delay", "time") - 60_000.0 / 90.0).abs() < 1.0);
+
+    // Tremolo locked to an eighth ("1/8" = index 7) at 120 BPM → 4 Hz.
+    handle.set_param("mod", "sync", 7.0).unwrap();
+    assert!(handle.apply_tempo_sync(120.0));
+    assert!((real(&handle, "mod", "rate") - 4.0).abs() < 0.05);
+}
+
 /// Snapshots (PRD 009): `capture_scene` reflects the *selected* pedal's
 /// live values and the bypass flag, so a scene stored now re-applies later.
 #[test]
@@ -298,6 +339,57 @@ fn structure_edits_fade_through_silence() {
     assert!(
         (out.last().unwrap() - 0.6).abs() < 1e-4,
         "lands on ((.1+.1)+.1)*2"
+    );
+}
+
+/// Projection magnitude onto `freq` over a slice (a Goertzel bin).
+fn tone_at(y: &[f32], freq: f32) -> f64 {
+    let n = y.len() as f64;
+    let (mut cs, mut cc) = (0.0f64, 0.0f64);
+    for (i, s) in y.iter().enumerate() {
+        let ph = 2.0 * std::f64::consts::PI * f64::from(freq) * i as f64 / f64::from(SR);
+        cs += f64::from(*s) * ph.sin();
+        cc += f64::from(*s) * ph.cos();
+    }
+    ((cs * 2.0 / n).powi(2) + (cc * 2.0 / n).powi(2)).sqrt()
+}
+
+/// The pitch family is opt-in (ADR 016): it reaches the chain through the
+/// dynamic install path (`add pitch`), not the default board. Prove the
+/// octaver composes with the real engine — installed mid-stream behind the
+/// gate, it rings a sub-octave into finite output.
+#[test]
+fn octaver_installs_and_rings_the_sub_octave() {
+    let (mut chain, mut handle) = build_chain(vec![Box::new(NoiseGate::new())]);
+    chain.prepare(SR);
+
+    let installed = handle
+        .install_slot(Box::new(lh_dsp::pitch::Pitch::new()), usize::MAX)
+        .unwrap();
+    assert_eq!(installed, "pitch");
+
+    // Sub-octave only, bright tone (real values; the level range is 0..1).
+    handle.set_param("pitch", "dry", 0.0).unwrap();
+    handle.set_param("pitch", "sub", 1.0).unwrap();
+    handle.set_param("pitch", "oct", 0.0).unwrap();
+    handle.set_param("pitch", "tone", 1.0).unwrap();
+
+    // A 220 Hz sine: the install fade, the smoothers, and the grain buffer all
+    // settle well inside the first third; measure the octave in the tail.
+    let mut x = sine(SR, 220.0, SR as usize);
+    let mut xr = x.clone();
+    for (l, r) in x.chunks_mut(256).zip(xr.chunks_mut(256)) {
+        chain.process(l, r);
+    }
+    assert_finite("octaver output", &x);
+
+    let tail = &x[SR as usize * 2 / 3..];
+    let sub = tone_at(tail, 110.0);
+    let fund = tone_at(tail, 220.0);
+    assert!(sub > 0.05, "sub-octave rings through the engine: {sub:.3}");
+    assert!(
+        sub > fund,
+        "sub-octave dominates the original pitch: {sub:.3} vs {fund:.3}"
     );
 }
 
@@ -795,5 +887,115 @@ fn lane_exhaustion_retires_the_oldest() {
         handle.collect_garbage(),
         1,
         "one of five spills was evicted to make room for the rest"
+    );
+}
+
+// --- aux monitor mix (PRD 019) ------------------------------------------
+
+#[test]
+fn aux_empty_is_a_no_op() {
+    // The metronome off (no aux data) must leave the output bit-identical to a
+    // chain with no aux wired at all.
+    let input = sine(SR, 220.0, 1024);
+    let mut ref_l = input.clone();
+    let mut ref_r = input.clone();
+    {
+        let (mut chain, _h) = build_chain(vec![]);
+        chain.prepare(SR);
+        chain.process(&mut ref_l, &mut ref_r);
+    }
+
+    let mut l = input.clone();
+    let mut r = input.clone();
+    let (mut chain, _h) = build_chain(vec![]);
+    chain.prepare(SR);
+    let (_prod, cons) = rtrb::RingBuffer::<f32>::new(4096);
+    chain.set_aux_input(cons);
+    chain.process(&mut l, &mut r);
+
+    assert_eq!(l, ref_l, "empty aux must not touch L");
+    assert_eq!(r, ref_r, "empty aux must not touch R");
+}
+
+#[test]
+fn aux_sums_stereo_onto_the_output() {
+    let (mut chain, _h) = build_chain(vec![]);
+    chain.prepare(SR);
+    let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(4096);
+    chain.set_aux_input(cons);
+
+    // Distinct L/R so a channel swap in the deinterleave would fail the test.
+    let frames = 256;
+    for _ in 0..frames {
+        prod.push(0.1).unwrap();
+        prod.push(-0.2).unwrap();
+    }
+    let mut l = vec![0.0f32; frames]; // silent guitar
+    let mut r = vec![0.0f32; frames];
+    chain.process(&mut l, &mut r);
+
+    for (lv, rv) in l.iter().zip(r.iter()) {
+        assert!((lv - 0.1).abs() < 1e-6, "L = {lv}");
+        assert!((rv + 0.2).abs() < 1e-6, "R = {rv}");
+    }
+}
+
+#[test]
+fn aux_underrun_is_a_gap_not_a_stall() {
+    let (mut chain, _h) = build_chain(vec![]);
+    chain.prepare(SR);
+    let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(4096);
+    chain.set_aux_input(cons);
+
+    // Only 100 frames for a 256-frame block: the rest is a clean gap.
+    let fed = 100;
+    for _ in 0..fed {
+        prod.push(0.3).unwrap();
+        prod.push(0.3).unwrap();
+    }
+    let mut l = vec![0.0f32; 256];
+    let mut r = vec![0.0f32; 256];
+    chain.process(&mut l, &mut r);
+
+    for (i, &lv) in l.iter().enumerate() {
+        if i < fed {
+            assert!((lv - 0.3).abs() < 1e-6, "fed L[{i}] = {lv}");
+        } else {
+            assert_eq!(lv, 0.0, "underrun leaves a gap at {i}");
+        }
+    }
+    assert!(l.iter().all(|s| s.is_finite()));
+}
+
+#[test]
+fn spectrum_tap_excludes_the_aux() {
+    // The output tap feeds the GUI analyzer — it must show the guitar tone,
+    // not the click, so it is read *before* the aux sum.
+    let (mut chain, _h) = build_chain(vec![]);
+    chain.prepare(SR);
+    let (tap_prod, mut tap_cons) = rtrb::RingBuffer::<f32>::new(4096);
+    chain.set_output_tap(tap_prod);
+    let (mut aux_prod, aux_cons) = rtrb::RingBuffer::<f32>::new(4096);
+    chain.set_aux_input(aux_cons);
+
+    let frames = 256;
+    for _ in 0..frames {
+        aux_prod.push(0.5).unwrap();
+        aux_prod.push(0.5).unwrap();
+    }
+    let mut l = vec![0.0f32; frames]; // silent guitar
+    let mut r = vec![0.0f32; frames];
+    chain.process(&mut l, &mut r);
+
+    // The output carries the aux...
+    assert!((l[0] - 0.5).abs() < 1e-6, "output carries aux");
+    // ...but the spectrum tap saw guitar-only silence.
+    let avail = tap_cons.slots();
+    assert!(avail > 0, "tap produced samples");
+    let chunk = tap_cons.read_chunk(avail).unwrap();
+    let (a, b) = chunk.as_slices();
+    assert!(
+        a.iter().chain(b.iter()).all(|s| s.abs() < 1e-9),
+        "spectrum tap must exclude the aux"
     );
 }

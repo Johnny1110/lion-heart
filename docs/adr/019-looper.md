@@ -1,9 +1,9 @@
-# ADR 016: Looper — an add-only chain-slot pedal with control-side transport
+# ADR 019: Looper — an add-only chain-slot pedal with control-side transport
 
 Status: **accepted — implemented**
 Date: 2026-07-20
 Relates to: PRD 013 (`docs/PRD/013-looper.md`), ADR 004 (per-pedal params),
-ADR 005 (dynamic chain: install/remove), ADR 015 / PRD 012 (the `tempo.tap`
+ADR 005 (dynamic chain: install/remove), ADR 018 / PRD 012 (the `tempo.tap`
 momentary idiom), white paper §3.1 (RT rules), §4.2 (click-freeness)
 
 ## Context
@@ -21,16 +21,18 @@ carries transport).
 
 - **The looper is a single-pedal family that is add-only** — buildable and
   offered in the "＋" menu, but *not* a member of `lh_core::DEFAULT_CHAIN`
-  and *not* in the (host-driven) plugin chain. This makes it the first family
-  where the app's `FAMILY_REGISTRY` is a proper superset of `DEFAULT_CHAIN`.
-  The registry↔default-chain test was relaxed from "equal" to "the default
-  chain is the registry's prefix; the remainder are add-only families." The
-  plugin builds `DEFAULT_CHAIN` only, so it never sees the looper (same
-  standalone-only reasoning as spillover, ADR 013).
+  and *not* in the (host-driven) plugin chain. It is one of the add-only
+  families that make the app's `FAMILY_REGISTRY` a proper superset of
+  `DEFAULT_CHAIN`. The registry↔default-chain test was relaxed from "equal"
+  to "the default chain is an in-order **subsequence** of the registry; the
+  remainder are add-only families" — the pitch family (ADR 016) ships off the
+  board too, ahead of the default slots rather than after them, so a strict
+  prefix relation does not hold. The plugin builds `DEFAULT_CHAIN` only, so it
+  never sees the looper (same standalone-only reasoning as spillover, ADR 013).
 
 - **Transport is momentary params, edge-detected in the effect.** `rec`,
   `undo`, and `clear` are linear 0..1 params; a press is a value crossing 0.5
-  upward, detected in `set_param` (the `tempo.tap` idiom, ADR 015). The state
+  upward, detected in `set_param` (the `tempo.tap` idiom, ADR 018). The state
   transition is O(1) bookkeeping, so it is RT-safe to run inline. The GUI /
   REPL / MIDI fire a press as a **1.0→0.0 pulse**: the SPSC ring is FIFO and
   never coalesces, so both edges survive in order, and the control shadow
