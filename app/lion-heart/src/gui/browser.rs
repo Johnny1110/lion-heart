@@ -45,6 +45,7 @@ impl Browser {
         match self.kind {
             AssetKind::Nam => ext.as_deref() == Some("nam"),
             AssetKind::Ir | AssetKind::IrB => ext.as_deref() == Some("wav"),
+            AssetKind::Song => matches!(ext.as_deref(), Some("wav") | Some("mp3")),
         }
     }
 
@@ -78,6 +79,7 @@ impl Browser {
             AssetKind::Nam => "load amp capture (.nam)",
             AssetKind::Ir => "load cabinet IR — mic A (.wav)",
             AssetKind::IrB => "load blend IR — mic B (.wav)",
+            AssetKind::Song => "load backing track (.wav / .mp3)",
         };
         let header = row![
             text(title).size(15).color(theme::TEXT_BRIGHT),

@@ -11,6 +11,12 @@
 //!
 //! [`Effect`]: crate::Effect
 
+mod groove;
 mod metronome;
+mod song;
+mod wsola;
 
+pub use groove::{DrumMachine, pattern_count, pattern_index, pattern_name};
 pub use metronome::Metronome;
+pub use song::{SongBuffer, SongPlayer};
+pub use wsola::Wsola;

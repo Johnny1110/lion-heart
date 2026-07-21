@@ -26,7 +26,7 @@ use lh_dsp::filter::Filter;
 use lh_dsp::looper::Looper;
 use lh_dsp::modulation::Modulation;
 use lh_dsp::pitch::Pitch;
-use lh_dsp::practice::Metronome;
+use lh_dsp::practice::{DrumMachine, Metronome};
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{ChainHandle, build_chain};
@@ -53,6 +53,9 @@ pub struct AppConfig {
     pub nam_dir: Option<String>,
     #[serde(default)]
     pub ir_dir: Option<String>,
+    /// Last directory a backing track was loaded from (PRD 019 Phase 3).
+    #[serde(default)]
+    pub song_dir: Option<String>,
     /// Audio I/O applied from the GUI settings panel; used when the matching
     /// CLI flag is absent. `buffer` stores the requested frames, 0 = device
     /// default; absent fields fall back to the app defaults.
@@ -97,6 +100,7 @@ impl Default for AppConfig {
             last_preset: None,
             nam_dir: None,
             ir_dir: None,
+            song_dir: None,
             input: None,
             output: None,
             buffer: None,
@@ -137,6 +141,8 @@ pub struct CarryOver {
     active_snapshot: Option<String>,
     /// Metronome runtime state (PRD 019), so a device restart keeps the click.
     metronome: MetroSnapshot,
+    /// Drum-groove runtime state (PRD 019 Phase 2), same reason.
+    groove: GrooveSnapshot,
 }
 
 /// A live MIDI input: the connection, its event stream, and the mapping.
@@ -226,6 +232,20 @@ pub struct Session {
     /// tracks the global tempo; other settings are session-transient (carried
     /// across a device restart, not persisted).
     metronome: Arc<MetronomeShared>,
+    /// Drum-groove control shared with the same player thread (PRD 019 Phase 2).
+    groove: Arc<GrooveShared>,
+    /// Song-player control shared with the player thread (PRD 019 Phase 3).
+    song: Arc<SongShared>,
+    /// Hands a decoded buffer to the player thread.
+    song_tx: std::sync::mpsc::Sender<Arc<lh_dsp::practice::SongBuffer>>,
+    /// Loader threads report completion here; the session drains it on tick.
+    song_load_tx: std::sync::mpsc::Sender<SongLoad>,
+    song_load_rx: std::sync::mpsc::Receiver<SongLoad>,
+    /// The loaded buffer, kept so it can be re-sent to a fresh player thread
+    /// after a device restart; and its GUI-side metadata.
+    song_current: Option<Arc<lh_dsp::practice::SongBuffer>>,
+    song_name: Option<String>,
+    song_peaks: Vec<f32>,
     /// The aux player thread's handle, joined on drop.
     player_join: Option<JoinHandle<()>>,
 }
@@ -421,14 +441,191 @@ struct MetroSnapshot {
     accent: bool,
 }
 
-/// Spawn the aux player thread (PRD 019): it renders the metronome into the aux
-/// ring, keeping ~[`PLAYER_TARGET_MS`] buffered ahead. Off the audio thread, so
-/// heap use here is fine — the audio thread only ever sums the ring. When the
-/// metronome is disabled it stops writing and the ring drains, so the engine's
-/// aux sum early-returns (bit-transparent output).
+/// Cross-thread drum-groove control (PRD 019, Phase 2), read by the aux player
+/// thread each fill. The groove tracks the same global tempo the metronome does
+/// (the player reads BPM from [`MetronomeShared`] and drives both).
+struct GrooveShared {
+    enabled: AtomicBool,
+    pattern: AtomicU32,
+    volume_bits: AtomicU32,
+    /// Bumped to arm a one-bar fill.
+    fill_gen: AtomicU32,
+    /// Bumped to restart the loop on the downbeat (enable).
+    restart_gen: AtomicU32,
+}
+
+impl GrooveShared {
+    fn new() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            pattern: AtomicU32::new(0),
+            volume_bits: AtomicU32::new(0.7f32.to_bits()),
+            fill_gen: AtomicU32::new(0),
+            restart_gen: AtomicU32::new(0),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+    fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+    fn pattern(&self) -> u32 {
+        self.pattern.load(Ordering::Relaxed)
+    }
+    fn set_pattern(&self, index: u32) {
+        self.pattern.store(index, Ordering::Relaxed);
+    }
+    fn volume(&self) -> f32 {
+        f32::from_bits(self.volume_bits.load(Ordering::Relaxed))
+    }
+    fn set_volume(&self, v: f32) {
+        self.volume_bits
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    fn request_fill(&self) {
+        self.fill_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    fn fill_gen(&self) -> u32 {
+        self.fill_gen.load(Ordering::Relaxed)
+    }
+    fn request_restart(&self) {
+        self.restart_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    fn restart_gen(&self) -> u32 {
+        self.restart_gen.load(Ordering::Relaxed)
+    }
+}
+
+/// Runtime groove state carried across an audio-engine restart.
+#[derive(Clone, Copy)]
+struct GrooveSnapshot {
+    enabled: bool,
+    pattern: u32,
+    volume: f32,
+}
+
+/// Cross-thread song-player control (PRD 019, Phase 3), read by the aux player
+/// thread each fill. The decoded buffer travels a separate channel (it is large;
+/// this is just the transport controls + the played-back position feedback).
+struct SongShared {
+    playing: AtomicBool,
+    speed_bits: AtomicU32,
+    semitones_bits: AtomicU32,
+    mix_bits: AtomicU32,
+    /// A-B loop in source frames; `b <= a` means no loop.
+    loop_a: AtomicU32,
+    loop_b: AtomicU32,
+    /// Bumped to request a seek to `seek_target` frames.
+    seek_gen: AtomicU32,
+    seek_target: AtomicU32,
+    /// Current play position (frames), published by the player for the GUI.
+    pos_frames: AtomicU32,
+    /// Total frames of the loaded song (0 = none), published by the player.
+    total_frames: AtomicU32,
+}
+
+impl SongShared {
+    fn new() -> Self {
+        Self {
+            playing: AtomicBool::new(false),
+            speed_bits: AtomicU32::new(1.0f32.to_bits()),
+            semitones_bits: AtomicU32::new(0.0f32.to_bits()),
+            mix_bits: AtomicU32::new(0.7f32.to_bits()),
+            loop_a: AtomicU32::new(0),
+            loop_b: AtomicU32::new(0),
+            seek_gen: AtomicU32::new(0),
+            seek_target: AtomicU32::new(0),
+            pos_frames: AtomicU32::new(0),
+            total_frames: AtomicU32::new(0),
+        }
+    }
+
+    fn playing(&self) -> bool {
+        self.playing.load(Ordering::Relaxed)
+    }
+    fn set_playing(&self, on: bool) {
+        self.playing.store(on, Ordering::Relaxed);
+    }
+    fn speed(&self) -> f32 {
+        f32::from_bits(self.speed_bits.load(Ordering::Relaxed))
+    }
+    fn set_speed(&self, v: f32) {
+        self.speed_bits
+            .store(v.clamp(0.25, 2.0).to_bits(), Ordering::Relaxed);
+    }
+    fn semitones(&self) -> f32 {
+        f32::from_bits(self.semitones_bits.load(Ordering::Relaxed))
+    }
+    fn set_semitones(&self, v: f32) {
+        self.semitones_bits
+            .store(v.clamp(-12.0, 12.0).to_bits(), Ordering::Relaxed);
+    }
+    fn mix(&self) -> f32 {
+        f32::from_bits(self.mix_bits.load(Ordering::Relaxed))
+    }
+    fn set_mix(&self, v: f32) {
+        self.mix_bits
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    fn loop_range(&self) -> (u32, u32) {
+        (
+            self.loop_a.load(Ordering::Relaxed),
+            self.loop_b.load(Ordering::Relaxed),
+        )
+    }
+    fn set_loop(&self, a: u32, b: u32) {
+        self.loop_a.store(a, Ordering::Relaxed);
+        self.loop_b.store(b, Ordering::Relaxed);
+    }
+    fn seek(&self, target: u32) {
+        self.seek_target.store(target, Ordering::Relaxed);
+        self.seek_gen.fetch_add(1, Ordering::Relaxed);
+    }
+    fn seek_gen(&self) -> u32 {
+        self.seek_gen.load(Ordering::Relaxed)
+    }
+    fn seek_target(&self) -> u32 {
+        self.seek_target.load(Ordering::Relaxed)
+    }
+    fn pos_frames(&self) -> u32 {
+        self.pos_frames.load(Ordering::Relaxed)
+    }
+    fn set_pos_frames(&self, p: u32) {
+        self.pos_frames.store(p, Ordering::Relaxed);
+    }
+    fn set_total_frames(&self, n: u32) {
+        self.total_frames.store(n, Ordering::Relaxed);
+    }
+}
+
+/// A completed background song decode (loader thread → session, PRD 019 Phase 3).
+enum SongLoad {
+    Loaded {
+        song: Arc<lh_dsp::practice::SongBuffer>,
+        name: String,
+        peaks: Vec<f32>,
+    },
+    Failed(String),
+}
+
+/// Buckets in the waveform peak envelope handed to the GUI.
+const SONG_WAVEFORM_BUCKETS: usize = 400;
+
+/// Spawn the aux player thread (PRD 019): it renders the metronome, the drum
+/// groove, **and** the song player, sums them, and keeps ~[`PLAYER_TARGET_MS`]
+/// of the mix buffered ahead in the aux ring. Off the audio thread, so heap use
+/// here is fine — the audio thread only sums the ring. When every source is off
+/// it stops writing and the ring drains, so the engine's aux sum early-returns
+/// (bit-transparent output). Metronome/drums track the one global tempo; the
+/// song runs on its own transport (varispeed/transpose/loop).
 fn spawn_player(
     mut prod: rtrb::Producer<f32>,
-    shared: Arc<MetronomeShared>,
+    metro_shared: Arc<MetronomeShared>,
+    groove_shared: Arc<GrooveShared>,
+    song_shared: Arc<SongShared>,
+    song_rx: std::sync::mpsc::Receiver<Arc<lh_dsp::practice::SongBuffer>>,
     sample_rate: u32,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -438,46 +635,126 @@ fn spawn_player(
                 ((PLAYER_TARGET_MS * 1e-3 * sample_rate as f32) as usize).min(AUX_RING_FRAMES);
             let mut metro = Metronome::new();
             metro.prepare(sample_rate);
-            let mut mono = vec![0.0f32; PLAYER_CHUNK];
-            let mut last_gen = shared.restart_gen();
-            let mut was_enabled = false;
+            let mut drums = DrumMachine::new();
+            drums.prepare(sample_rate);
+            let mut song = lh_dsp::practice::SongPlayer::new();
+            song.prepare(sample_rate);
+            let mut metro_buf = vec![0.0f32; PLAYER_CHUNK];
+            let mut drum_buf = vec![0.0f32; PLAYER_CHUNK];
+            let mut song_l = vec![0.0f32; PLAYER_CHUNK];
+            let mut song_r = vec![0.0f32; PLAYER_CHUNK];
 
-            while shared.running.load(Ordering::Relaxed) {
-                metro.set_bpm(shared.bpm());
-                metro.set_volume(shared.volume());
-                metro.set_beats_per_bar(shared.beats_per_bar());
-                metro.set_accent(shared.accent());
-                let enabled = shared.enabled();
-                let cur_gen = shared.restart_gen();
-                // Restart on enable or an explicit count-in so the click begins
-                // cleanly on beat 1.
-                if (enabled && !was_enabled) || cur_gen != last_gen {
+            let mut metro_last_gen = metro_shared.restart_gen();
+            let mut metro_was_on = false;
+            let mut groove_last_restart = groove_shared.restart_gen();
+            let mut groove_last_fill = groove_shared.fill_gen();
+            let mut groove_was_on = false;
+            let mut song_last_seek = song_shared.seek_gen();
+            let mut song_want_prev = false;
+
+            while metro_shared.running.load(Ordering::Relaxed) {
+                let bpm = metro_shared.bpm();
+
+                // --- metronome control ---
+                metro.set_bpm(bpm);
+                metro.set_volume(metro_shared.volume());
+                metro.set_beats_per_bar(metro_shared.beats_per_bar());
+                metro.set_accent(metro_shared.accent());
+                let metro_on = metro_shared.enabled();
+                let metro_gen = metro_shared.restart_gen();
+                if (metro_on && !metro_was_on) || metro_gen != metro_last_gen {
                     metro.restart();
                 }
-                last_gen = cur_gen;
-                was_enabled = enabled;
+                metro_last_gen = metro_gen;
+                metro_was_on = metro_on;
 
-                if enabled {
+                // --- groove control ---
+                drums.set_bpm(bpm);
+                drums.set_volume(groove_shared.volume());
+                drums.set_pattern(groove_shared.pattern() as usize);
+                let groove_on = groove_shared.enabled();
+                let groove_restart = groove_shared.restart_gen();
+                if (groove_on && !groove_was_on) || groove_restart != groove_last_restart {
+                    drums.restart();
+                }
+                groove_last_restart = groove_restart;
+                groove_was_on = groove_on;
+                let fill = groove_shared.fill_gen();
+                if fill != groove_last_fill {
+                    drums.fill();
+                    groove_last_fill = fill;
+                }
+
+                // --- song control ---
+                if let Ok(buf) = song_rx.try_recv() {
+                    song_shared.set_total_frames(buf.frames() as u32);
+                    song.set_song(buf);
+                }
+                song.set_speed(song_shared.speed());
+                song.set_semitones(song_shared.semitones());
+                song.set_mix(song_shared.mix());
+                let (la, lb) = song_shared.loop_range();
+                song.set_loop(la as usize, lb as usize);
+                let seek = song_shared.seek_gen();
+                if seek != song_last_seek {
+                    song.seek(song_shared.seek_target() as usize);
+                    song_last_seek = seek;
+                }
+                let song_want = song_shared.playing();
+                if song_want && !song_want_prev {
+                    // Rising edge (user pressed play): replay from the start if
+                    // parked at the end with no loop.
+                    if song.loop_range().is_none() && song.pos_frames() >= song.song_frames() {
+                        song.seek(0);
+                    }
+                    song.play();
+                } else if !song_want && song_want_prev {
+                    song.stop();
+                }
+                song_want_prev = song_want;
+                let song_on = song.is_playing();
+
+                if metro_on || groove_on || song_on {
                     let free_frames = prod.slots() / 2;
                     let buffered = AUX_RING_FRAMES - free_frames;
                     let want = target_frames.saturating_sub(buffered);
                     let n = want.min(free_frames).min(PLAYER_CHUNK);
                     if n > 0 {
-                        metro.render(&mut mono[..n]);
+                        // Render each active source; an off one is frozen so it
+                        // restarts cleanly when re-enabled.
+                        if metro_on {
+                            metro.render(&mut metro_buf[..n]);
+                        } else {
+                            metro_buf[..n].fill(0.0);
+                        }
+                        if groove_on {
+                            drums.render(&mut drum_buf[..n]);
+                        } else {
+                            drum_buf[..n].fill(0.0);
+                        }
+                        song.render(&mut song_l[..n], &mut song_r[..n]);
                         if let Ok(mut chunk) = prod.write_chunk(2 * n) {
                             let (a, b) = chunk.as_mut_slices();
                             let mut dst = a.iter_mut().chain(b.iter_mut());
-                            for &s in &mono[..n] {
-                                // Mono click duplicated onto both aux channels.
+                            for f in 0..n {
+                                // Mono click+drums onto both channels + stereo song.
+                                let m = metro_buf[f] + drum_buf[f];
                                 if let (Some(dl), Some(dr)) = (dst.next(), dst.next()) {
-                                    *dl = s;
-                                    *dr = s;
+                                    *dl = m + song_l[f];
+                                    *dr = m + song_r[f];
                                 }
                             }
                             drop(dst);
                             chunk.commit_all();
                         }
                     }
+                }
+
+                // Publish song position and reflect a self-stop at the end.
+                song_shared.set_pos_frames(song.pos_frames() as u32);
+                if song_want && !song.is_playing() {
+                    song_shared.set_playing(false);
+                    song_want_prev = false;
                 }
                 std::thread::sleep(PLAYER_TICK);
             }
@@ -566,6 +843,9 @@ pub enum AssetKind {
     Nam,
     Ir,
     IrB,
+    /// A practice backing track (PRD 019 Phase 3) — not a chain asset; the
+    /// browser routing loads it into the song player.
+    Song,
 }
 
 /// One buildable chain family: its descriptor (the key, display name, and
@@ -765,9 +1045,21 @@ impl Session {
         let (midi, midi_status) = connect_midi(opts.midi_port.as_deref());
 
         // Start the aux player thread now that the stream rate is known; the
-        // click follows the persisted global tempo.
+        // click + groove follow the persisted global tempo, the song has its
+        // own transport.
         let metronome = Arc::new(MetronomeShared::new(config.tempo_bpm));
-        let player_join = spawn_player(aux_prod, Arc::clone(&metronome), runner.sample_rate);
+        let groove = Arc::new(GrooveShared::new());
+        let song = Arc::new(SongShared::new());
+        let (song_tx, song_rx) = std::sync::mpsc::channel();
+        let (song_load_tx, song_load_rx) = std::sync::mpsc::channel();
+        let player_join = spawn_player(
+            aux_prod,
+            Arc::clone(&metronome),
+            Arc::clone(&groove),
+            Arc::clone(&song),
+            song_rx,
+            runner.sample_rate,
+        );
 
         Ok(Self {
             chain: chain_handle,
@@ -789,6 +1081,14 @@ impl Session {
             tempo: TempoState::default(),
             looper_leds: std::collections::HashMap::new(),
             metronome,
+            groove,
+            song,
+            song_tx,
+            song_load_tx,
+            song_load_rx,
+            song_current: None,
+            song_name: None,
+            song_peaks: Vec::new(),
             player_join: Some(player_join),
         })
     }
@@ -808,6 +1108,11 @@ impl Session {
                 volume: self.metronome.volume(),
                 beats_per_bar: self.metronome.beats_per_bar(),
                 accent: self.metronome.accent(),
+            },
+            groove: GrooveSnapshot {
+                enabled: self.groove.enabled(),
+                pattern: self.groove.pattern(),
+                volume: self.groove.volume(),
             },
         }
     }
@@ -849,6 +1154,12 @@ impl Session {
         if carry.metronome.enabled {
             session.metronome.set_enabled(true);
             session.metronome.request_restart();
+        }
+        session.groove.set_volume(carry.groove.volume);
+        session.groove.set_pattern(carry.groove.pattern);
+        if carry.groove.enabled {
+            session.groove.set_enabled(true);
+            session.groove.request_restart();
         }
         Ok((session, lines))
     }
@@ -1683,6 +1994,215 @@ impl Session {
         "count-in — click from beat 1".to_string()
     }
 
+    // --- practice tools: drum groove (PRD 019, Phase 2) ---
+
+    /// Whether the drum groove is currently playing.
+    pub fn groove_on(&self) -> bool {
+        self.groove.enabled()
+    }
+
+    /// Start/stop the groove; starting restarts the loop on the downbeat.
+    pub fn set_groove(&mut self, on: bool) -> String {
+        self.groove.set_enabled(on);
+        if on {
+            self.groove.request_restart();
+        }
+        format!(
+            "drums {} ({})",
+            if on { "on" } else { "off" },
+            lh_dsp::practice::pattern_name(self.groove.pattern() as usize),
+        )
+    }
+
+    pub fn toggle_groove(&mut self) -> String {
+        self.set_groove(!self.groove.enabled())
+    }
+
+    /// Current groove pattern's menu name.
+    pub fn groove_pattern_name(&self) -> &'static str {
+        lh_dsp::practice::pattern_name(self.groove.pattern() as usize)
+    }
+
+    /// Select a groove by name (e.g. `"funk"`) or numeric index.
+    pub fn set_groove_pattern(&mut self, selector: &str) -> Result<String, String> {
+        let count = lh_dsp::practice::pattern_count();
+        let index = lh_dsp::practice::pattern_index(selector)
+            .or_else(|| selector.parse::<usize>().ok().filter(|i| *i < count))
+            .ok_or_else(|| format!("unknown groove {selector:?}"))?;
+        self.groove.set_pattern(index as u32);
+        Ok(format!("groove {}", lh_dsp::practice::pattern_name(index)))
+    }
+
+    /// Step to the next groove pattern (GUI chip), wrapping.
+    pub fn cycle_groove_pattern(&mut self) -> String {
+        let count = lh_dsp::practice::pattern_count().max(1) as u32;
+        let next = (self.groove.pattern() + 1) % count;
+        self.groove.set_pattern(next);
+        format!("groove {}", lh_dsp::practice::pattern_name(next as usize))
+    }
+
+    pub fn groove_volume(&self) -> f32 {
+        self.groove.volume()
+    }
+
+    pub fn set_groove_volume(&mut self, volume: f32) -> String {
+        self.groove.set_volume(volume);
+        format!("drum volume {:.0}%", self.groove.volume() * 100.0)
+    }
+
+    /// Arm a one-bar drum fill (plays from the next downbeat).
+    pub fn groove_fill(&mut self) -> String {
+        self.groove.request_fill();
+        "drum fill armed".to_string()
+    }
+
+    // --- practice tools: song player (PRD 019, Phase 3) ---
+
+    /// Decode a backing track on a background loader thread (WAV/MP3). The
+    /// result arrives on [`Self::poll_song`]. Not carried across a device
+    /// restart — the buffer is large and the player thread is rebuilt.
+    pub fn load_song(&mut self, path: &Path) -> String {
+        let sr = self.sample_rate;
+        let tx = self.song_load_tx.clone();
+        self.config.song_dir = parent_dir(path);
+        save_config(&self.config);
+        let path = path.to_path_buf();
+        let name = file_name(&path);
+        let report = name.clone();
+        std::thread::spawn(move || {
+            let msg = match crate::song_loader::load_song(&path, sr) {
+                Ok(song) => SongLoad::Loaded {
+                    peaks: song.peaks(SONG_WAVEFORM_BUCKETS),
+                    song: Arc::new(song),
+                    name,
+                },
+                Err(e) => SongLoad::Failed(format!("song load failed: {e}")),
+            };
+            let _ = tx.send(msg);
+        });
+        format!("loading song {report:?}…")
+    }
+
+    /// Drain a completed decode (call on the control tick). Hands the buffer to
+    /// the player and returns a status line, or `None` if nothing finished.
+    pub fn poll_song(&mut self) -> Option<String> {
+        match self.song_load_rx.try_recv().ok()? {
+            SongLoad::Loaded { song, name, peaks } => {
+                let secs = song.seconds();
+                self.song.set_total_frames(song.frames() as u32);
+                self.song.seek(0);
+                self.song.set_playing(false);
+                self.song_current = Some(Arc::clone(&song));
+                self.song_name = Some(name.clone());
+                self.song_peaks = peaks;
+                let _ = self.song_tx.send(song);
+                Some(format!("song {name:?} loaded ({secs:.0}s)"))
+            }
+            SongLoad::Failed(e) => Some(e),
+        }
+    }
+
+    pub fn song_play(&mut self) -> String {
+        if self.song_current.is_none() {
+            return "no song loaded".into();
+        }
+        self.song.set_playing(true);
+        "song playing".into()
+    }
+    pub fn song_stop(&mut self) -> String {
+        self.song.set_playing(false);
+        "song stopped".into()
+    }
+    pub fn song_toggle(&mut self) -> String {
+        if self.song.playing() {
+            self.song_stop()
+        } else {
+            self.song_play()
+        }
+    }
+    pub fn song_is_playing(&self) -> bool {
+        self.song.playing()
+    }
+    pub fn has_song(&self) -> bool {
+        self.song_current.is_some()
+    }
+    pub fn song_name(&self) -> Option<&str> {
+        self.song_name.as_deref()
+    }
+    pub fn song_peaks(&self) -> &[f32] {
+        &self.song_peaks
+    }
+    pub fn song_frames(&self) -> usize {
+        self.song_current.as_ref().map_or(0, |s| s.frames())
+    }
+    pub fn song_seconds(&self) -> f32 {
+        self.song_current.as_ref().map_or(0.0, |s| s.seconds())
+    }
+    /// Current play position as a fraction `0..1` (for the GUI progress bar).
+    pub fn song_fraction(&self) -> f32 {
+        let total = self.song_frames();
+        if total == 0 {
+            0.0
+        } else {
+            (self.song.pos_frames() as f32 / total as f32).clamp(0.0, 1.0)
+        }
+    }
+
+    pub fn set_song_speed(&mut self, speed: f32) -> String {
+        self.song.set_speed(speed);
+        format!("song speed {:.0}%", self.song.speed() * 100.0)
+    }
+    pub fn song_speed(&self) -> f32 {
+        self.song.speed()
+    }
+    pub fn set_song_semitones(&mut self, semitones: f32) -> String {
+        self.song.set_semitones(semitones);
+        format!("song transpose {:+.0} st", self.song.semitones())
+    }
+    pub fn song_semitones(&self) -> f32 {
+        self.song.semitones()
+    }
+    pub fn set_song_mix(&mut self, mix: f32) -> String {
+        self.song.set_mix(mix);
+        format!("song mix {:.0}%", self.song.mix() * 100.0)
+    }
+    pub fn song_mix(&self) -> f32 {
+        self.song.mix()
+    }
+
+    /// Seek to a fraction `0..1` of the song.
+    pub fn song_seek_fraction(&mut self, frac: f32) {
+        let frame = (frac.clamp(0.0, 1.0) * self.song_frames() as f32) as u32;
+        self.song.seek(frame);
+    }
+
+    /// Set the A-B loop from fractions of the song (`a >= b` clears it).
+    pub fn set_song_loop_fraction(&mut self, a: f32, b: f32) -> String {
+        let total = self.song_frames() as f32;
+        let fa = (a.clamp(0.0, 1.0) * total) as u32;
+        let fb = (b.clamp(0.0, 1.0) * total) as u32;
+        self.song.set_loop(fa, fb);
+        if fb > fa {
+            format!(
+                "song loop {:.0}s–{:.0}s",
+                a * self.song_seconds(),
+                b * self.song_seconds()
+            )
+        } else {
+            "song loop cleared".into()
+        }
+    }
+    pub fn clear_song_loop(&mut self) -> String {
+        self.song.set_loop(0, 0);
+        "song loop cleared".into()
+    }
+    /// The A-B loop as fractions `0..1`, if set.
+    pub fn song_loop_fraction(&self) -> Option<(f32, f32)> {
+        let (a, b) = self.song.loop_range();
+        let total = self.song_frames() as f32;
+        (b > a && total > 0.0).then(|| (a as f32 / total, b as f32 / total))
+    }
+
     /// Re-derive every tempo-locked control from the global BPM. Called on the
     /// control loop (GUI frame tick / REPL poll) after [`Session::tick_morph`].
     /// Delegates to [`lh_engine::ChainHandle::apply_tempo_sync`]; returns
@@ -2010,6 +2530,11 @@ impl Session {
         kind: AssetKind,
         lines: &mut Vec<String>,
     ) {
+        // The song is not a chain asset — it never reaches here (preset/resume
+        // routing only ever passes NAM/IR), but keep the match total.
+        if kind == AssetKind::Song {
+            return;
+        }
         match reference {
             Some(r) => match lh_assets::resolve_asset(r, Some(fallback_dir)) {
                 Ok((path, warnings)) => {
@@ -2018,6 +2543,7 @@ impl Session {
                         AssetKind::Nam => self.load_nam(&path),
                         AssetKind::Ir => self.load_ir(&path),
                         AssetKind::IrB => self.load_ir_b(&path),
+                        AssetKind::Song => unreachable!(), // guarded above
                     };
                     match loaded {
                         Ok(msg) => lines.push(msg),
@@ -2031,6 +2557,7 @@ impl Session {
                     AssetKind::Nam => self.unload_nam(),
                     AssetKind::Ir => self.unload_ir(),
                     AssetKind::IrB => self.unload_ir_b(),
+                    AssetKind::Song => unreachable!(), // guarded above
                 };
             }
         }

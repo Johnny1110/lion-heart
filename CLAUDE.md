@@ -578,9 +578,73 @@ worst-case click block (`metronome_click` bench, **off the RT budget** — playe
 thread); the aux sum is below a bench's noise floor. 7 metronome DSP tests
 (beat phase/accent/meter/volume/count-in restart/tempo tracking/multi-rate
 finite) + 4 engine aux tests (empty = bit-transparent, stereo sum, underrun
-gap, tap excludes aux). **Phases 2 (drum groove) & 3 (song player: `symphonia`
-decode, A-B loop, WSOLA varispeed, ±semitone) are deferred** — they render
-into the same aux ring from the same player thread.
+gap, tap excludes aux). **Phase 3 (song player: `symphonia` decode, A-B loop,
+WSOLA varispeed, ±semitone) is deferred** — it renders into the same aux ring
+from the same player thread.
+
+**Practice tools — drum groove (Phase 2) — code landed (uncommitted).** Specced
+in PRD 019 Phase 2, recorded as **ADR 021**. A **procedural drum machine**
+(`lh_dsp::practice::DrumMachine`) that synthesises the beat **at the exact global
+BPM** rather than stretching a sample — a deliberate deviation from the PRD's
+sample+WSOLA sketch (ADR 021): can't ship quality drum-recording binaries, and
+synth-at-target-tempo locks tighter than any stretched loop with zero assets. A
+5-voice analog-style kit (kick = pitch-swept sine + beater click; snare = tone +
+HP noise; closed/open hi-hat = HP noise; tom = pitch-swept sine), clocked off an
+internal 16th-note counter like the metronome. **Deterministic** (seeded
+xorshift noise → reproducible bars, the tests lean on it). 4 built-in patterns
+(`rock`/`funk`/`metal`/`ballad`, append-only velocity tables on a 16-step grid)
++ a one-bar tom-roll **fill** armed on the next downbeat. **Reuses Phase 1's aux
+lane + player thread**: the player now renders metronome *and* drums and sums
+both into the aux ring (audio thread unchanged — still just reads + adds); both
+track the one global tempo. A second `GrooveShared` atomic block (enabled/
+pattern/volume/fill-gen/restart-gen) carries the control and rides a device
+restart via `CarryOver`. **Standalone-only, app-global, no preset/plugin change**
+(ADR 020's reasoning). **WSOLA deferred to Phase 3** (procedural drums need no
+stretch; its real consumer is the song player). Surfaces: footer `drums` toggle
+(lit amber = playing) + a pattern-cycle chip; REPL `groove <name>|on|off` /
+`groove vol <n>` / `fill`. Same post-limiter placement as the click, so the
+groove stays polite (conservative level). ~0.82 µs to render the busiest bar
+(`drum_groove_funk` bench, **off the RT budget** — player thread);
+`assert_no_alloc`-clean with drums + click both on (null-device jam, exit 0). 7
+DrumMachine DSP tests (grid timing, pattern-energy differences, tempo scaling,
+volume/silence, determinism, fill-adds-energy, bounded/finite multi-rate).
+
+**Practice tools — song player (Phase 3) — code landed (uncommitted).** Specced
+in PRD 019 Phase 3, recorded as **ADR 022** — completes the practice tools.
+Load a backing track (WAV/MP3) and practice against it: slow a solo without
+dropping pitch, transpose to your key, loop a hard bar. Three pieces:
+(1) **`lh_dsp::practice::Wsola`** — a hand-written **WSOLA time-stretch**
+(varispeed, pitch-preserving): overlap-add of Hann grains, each placed by a
+normalised cross-correlation search so the pitch period survives (plain OLA
+smears it); **stereo-linked** (offset chosen from L, applied to both).
+(2) **`lh_dsp::practice::SongPlayer`** — pipeline `source → WSOLA(tempo) →
+GrainShift(±semitone) → mix`, reusing the octaver's `blocks::grain::GrainShift`
+(ADR 016) for transpose; two independent granular stages rather than one
+combined stretch (each testable). A-B loop by cursor reset (seam, no crossfade
+yet); stop at end with no loop. (3) **`symphonia` decode** in the **app crate
+only** (kept out of the plugin) — a **background loader thread** decodes +
+`lh_assets::resample_sinc`s to engine rate, hands an `Arc<SongBuffer>` to the
+player thread; the RT path only reads the immutable buffer. It's a **third aux
+source** on the existing player thread (renders stereo song alongside mono
+metronome+drums, sums into the aux ring — audio thread unchanged, ADR 020). A
+`SongShared` atomic block carries the transport (play/speed/semitones/mix/A-B/
+seek) and publishes the play position back for the GUI; the song runs on its
+**own transport**, not the global tempo. GUI: a dedicated **`song` view tab** —
+draw-only waveform Canvas (peak envelope + playhead + shaded loop region), a
+seek slider, A/B/clear-loop buttons, speed/transpose/level sliders; the file
+browser gained `AssetKind::Song` (.wav/.mp3). REPL `song load|play|stop|speed|
+pitch|mix|seek|loop`. **Standalone-only, no preset/plugin change** (symphonia
+never enters the plugin build). **Not carried across a device restart** (large
+buffer on the player thread — reload after a device change; metronome/drums are
+carried, the song isn't). ~38 µs to render a 64-frame block at 75 % speed +2 st
+(`song_player_stretch_shift` bench, **off the RT budget** — player thread, WSOLA
+correlation is the cost; ~1.2 ms compute per ~3 ms fill, no underruns);
+`assert_no_alloc`-clean with song+drums+click all mixing (null-device jam, exit
+0). 14 tests: WSOLA (5 — pitch preserved at 0.5×/2×, neutral transparent, cursor
+advance, bounded), SongPlayer (8 — plays/stopped/transpose-octave/half-speed-
+keeps-pitch/A-B-loop/stop-at-end/mix/peaks), symphonia loader (1 — WAV round
+trip). **All three practice-tools phases are complete** (metronome ADR 020,
+drums ADR 021, song player ADR 022) — one aux lane, one player thread.
 
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
@@ -687,6 +751,24 @@ the guitar without clipping on loud transients; **the click bypasses the amp**
 the spectrum analyzer/EQ does *not* show the click; a device/buffer change in
 settings keeps the click running; **confirm `assert_no_alloc` stays quiet**
 with the click on while switching presets/pedals),
+**the drum groove by ear** (footer `drums` toggle starts a beat locked to the
+tempo; the pattern chip steps rock → funk → metal → ballad; `fill` drops a
+one-bar tom roll on the next downbeat; tap the BPM chip / `tempo` and the beat
+follows; play along and confirm it stays *in time* on the click — the synth kit
+is a drum-machine voice, not sampled acoustic drums, which is expected; drums +
+metronome together sit under the guitar without clipping; REPL `groove funk`
+starts playing, `groove vol 60`, `fill`; **confirm `assert_no_alloc` stays
+quiet** with drums + click on while editing the board),
+**the song player by ear** (song tab → load a backing track WAV/MP3; play — it
+mixes under the guitar; drag `speed` to 60–70 % and confirm a solo slows down
+**without dropping pitch** (WSOLA); `transpose` ±a few semitones lands in a new
+key without changing tempo; set A then B to loop a hard bar (the playhead wraps
+A→B — a small seam is expected); the `level` slider balances it against the
+guitar; the song bypasses the amp (clean backing regardless of drive/EQ);
+granular warble at extreme speed/transpose is acceptable for practice; an MP3
+loads as well as a WAV; REPL `song load|play|speed|pitch|loop`; **confirm
+`assert_no_alloc` stays quiet** with song + drums + click all playing while
+editing the board; a device/buffer change drops the song by design — reload it),
 plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**

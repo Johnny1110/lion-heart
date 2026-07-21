@@ -212,6 +212,43 @@ fn bench_effects(c: &mut Criterion) {
         });
     }
 
+    // Procedural drum groove (PRD 019 Phase 2): the busiest built-in pattern
+    // (funk, 16th hats) rendered steadily — also a player-thread source.
+    {
+        let mut drums = lh_dsp::practice::DrumMachine::new();
+        drums.prepare(SR);
+        drums.set_pattern(lh_dsp::practice::pattern_index("funk").unwrap());
+        drums.set_bpm(140.0);
+        let mut mono = vec![0.0f32; BLOCK];
+        group.bench_function("drum_groove_funk", |b| {
+            b.iter(|| drums.render(black_box(&mut mono)));
+        });
+    }
+
+    // Song player (PRD 019 Phase 3): WSOLA varispeed + a semitone transpose,
+    // the worst-case pipeline. Player thread, off the RT budget; the WSOLA
+    // correlation search is the cost.
+    {
+        let src: Vec<f32> = signal().iter().cycle().take(SR as usize).copied().collect();
+        let song = std::sync::Arc::new(lh_dsp::practice::SongBuffer {
+            r: src.clone(),
+            l: src,
+            sample_rate: SR,
+        });
+        let mut player = lh_dsp::practice::SongPlayer::new();
+        player.prepare(SR);
+        player.set_song(song);
+        player.set_speed(0.75); // varispeed engages WSOLA
+        player.set_semitones(2.0); // transpose engages the grain shifter
+        player.set_loop(0, SR as usize / 2); // loop so it never stops mid-bench
+        player.play();
+        let mut sl = vec![0.0f32; BLOCK];
+        let mut sr = vec![0.0f32; BLOCK];
+        group.bench_function("song_player_stretch_shift", |b| {
+            b.iter(|| player.render(black_box(&mut sl), black_box(&mut sr)));
+        });
+    }
+
     group.finish();
 }
 

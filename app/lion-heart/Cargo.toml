@@ -24,3 +24,9 @@ serde.workspace = true
 serde_json.workspace = true
 # Spectrum analyzer FFT (GUI thread only — never on the audio path).
 realfft.workspace = true
+# Song-player decode (loader thread only — never on the audio path).
+symphonia.workspace = true
+
+[dev-dependencies]
+# Write WAV fixtures for the song-loader round-trip test.
+hound.workspace = true

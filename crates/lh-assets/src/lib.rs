@@ -312,9 +312,10 @@ pub fn resolve_asset(
 }
 
 /// Offline windowed-sinc resampler (arbitrary ratio). Quality is bounded by
-/// the 64-tap Blackman-windowed kernel (~-74 dB stopband) — plenty for IRs;
+/// the 64-tap Blackman-windowed kernel (~-74 dB stopband) — plenty for IRs and
+/// for a monitor backing track (the song player reuses it per channel);
 /// audio-path resampling would want a proper polyphase design.
-fn resample_sinc(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
+pub fn resample_sinc(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     const HALF_TAPS: isize = 32;
     let ratio = f64::from(dst_rate) / f64::from(src_rate);
     // Anti-alias when downsampling: cut at the destination Nyquist.

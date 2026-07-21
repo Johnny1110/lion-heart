@@ -7,6 +7,33 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-21 (practice tools: song player) — Linux dev container (relative)
+
+The song player (PRD 019 Phase 3 / ADR 022) is a WSOLA varispeed stage plus a
+GrainShift transpose. Like the metronome and drums it renders on the player
+thread, **off the RT budget**. WSOLA's per-grain cross-correlation search
+dominates: the worst case below is 75 % speed **and** a +2-semitone transpose
+(both granular stages active). The player thread fills ~2048 frames per wake
+(~1.2 ms of this compute) every ~3 ms, so there is ample slack; the null-device
+run showed no underruns. The correlation search is the obvious optimization
+target (decimate / SIMD) if it ever needs trimming.
+
+| Bench                              | Median      | Note                        |
+| ---------------------------------- | ----------- | --------------------------- |
+| song_player_stretch_shift          | ~38 µs      | player thread, off RT budget |
+
+## 2026-07-21 (practice tools: drum groove) — Linux dev container (relative)
+
+The procedural drum groove (PRD 019 Phase 2 / ADR 021) is a five-voice synth
+kit clocked at the exact global BPM. Like the metronome it renders on the
+player thread, **off the RT budget**; the audio-thread aux cost is unchanged (a
+ring read + a stereo add). The number is the busiest pattern (funk, 16th hats)
+rendered steadily.
+
+| Bench                              | Median      | Note                        |
+| ---------------------------------- | ----------- | --------------------------- |
+| drum_groove_funk (5 voices)        | ~0.82 µs    | player thread, off RT budget |
+
 ## 2026-07-21 (practice tools: metronome) — Linux dev container (relative)
 
 The metronome (PRD 019, Phase 1 / ADR 020) is an aux **monitor** source: it

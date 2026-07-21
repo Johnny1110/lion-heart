@@ -1,7 +1,8 @@
 # PRD 019: 練習工具組 — 節拍器 → 鼓 Groove → Song Player
 
-狀態：**Phase 1（節拍器）已實作（ADR 020）；Phase 2/3 待開發**
-日期：2026-07-20（Phase 1 落地 2026-07-21）
+狀態：**全部三期已實作**（Phase 1 節拍器 ADR 020、Phase 2 鼓 groove ADR 021、
+Phase 3 song player ADR 022）
+日期：2026-07-20（三期全部落地 2026-07-21）
 里程碑：M22（2026-07-20 路線圖第 9 項，**分三期**）
 關聯：PRD 012（全域 tempo——節拍器/鼓的時鐘源）、PRD 018（pitch shifter
 ——song player 移調共用）、PRD 003（輸出級——monitor mix 落點）、白皮書
@@ -35,18 +36,35 @@ AmpliTube standalone、Spark/Katana 類產品的殺手鐧是練習工具。Lion-
 - 落地備註：click 合成用純正弦（非雜訊 burst，保持確定性/可測）；節拍器
   設定為 app-global 環境（不進 preset），僅跨裝置重啟由 CarryOver 保留。
 
-**Phase 2 — 鼓 Groove（M22b）**：
-- 內建鼓 loop 樣本播放（bundled WAV，或使用者 `~/.lion-heart/grooves/`）。
-- 掛全域 tempo：固定拍速 loop 用 WSOLA time-stretch 對到當前 BPM（見
-  Phase 3 共用），或分速度檔選最近。
-- pattern/style 選單、fill、音量。GUI：groove 選單 + play/stop。
+**Phase 2 — 鼓 Groove（M22b）✅ 已實作（ADR 021）**：
+- ~~內建鼓 loop 樣本播放~~ → **改為程序合成鼓機**（`lh_dsp::practice::
+  DrumMachine`，ADR 021 記錄此偏離）：無法內建高品質鼓 sample binary，且
+  「在目標 BPM 直接合成」比拉伸 loop 對拍更緊、無 stretch artifact、零資產。
+- 掛全域 tempo：合成器內部 16 分音符 clock 直接跑在當前 BPM（不需 WSOLA）。
+- pattern（rock/funk/metal/ballad）+ fill + 音量。GUI：footer `drums` 開關 +
+  pattern 循環 chip；REPL `groove <name>|on|off`、`groove vol <n>`、`fill`。
+- 合成鼓 5 voice（kick/snare/closed+open hat/tom，seeded PRNG 確定性）。
+- **WSOLA 延到 Phase 3**：程序鼓不需拉伸，WSOLA 的真正消費者是 song player。
+  未來若要 sample kit，可載使用者 `~/.lion-heart/grooves/` WAV 用 Phase 3 的
+  WSOLA 對拍（aux lane 已支援）。
 
-**Phase 3 — Song Player（M22c）**：
-- 載入 WAV/MP3（**新依賴 `symphonia`**——純 Rust、permissive；解碼在
-  player 執行緒**非 audio thread**，RT 無涉，但仍依政策讀其解碼路徑）。
-- A-B 段落循環、**變速不變調**（WSOLA 手寫 time-stretch）、**±半音移調**
-  （重用 PRD 018 的 grain shifter）、混音電平。
-- GUI：song player 面板（波形/進度、A-B 標記、速度/移調滑桿）。
+**Phase 3 — Song Player（M22c）✅ 已實作（ADR 022）**：
+- 載入 WAV/MP3（**新依賴 `symphonia`**，純 Rust、permissive；解碼在**背景
+  loader 執行緒非 audio thread**，sinc 重取樣到引擎速率後交給 player 執行緒）。
+  symphonia 只加在 **app crate**（不進 plugin）。
+- A-B 段落循環、**變速不變調**（`lh_dsp::practice::Wsola` 手寫 WSOLA
+  time-stretch，correlation 對齊、stereo-linked）、**±半音移調**（重用 PRD 018
+  的 `blocks::grain::GrainShift`，兩級 pipeline：WSOLA 變速 → GrainShift 移調）、
+  混音電平。
+- 第三個 aux 來源，跟節拍器/鼓共用 player 執行緒與 aux mixer（audio thread
+  不變）。SongShared atomics 傳輸 transport，回報播放位置給 GUI。
+- GUI：`song` view tab（波形 canvas + playhead + loop 區 shading、seek 滑桿、
+  A/B/clear loop 按鈕、speed/transpose/level 滑桿）；檔案瀏覽器加
+  `AssetKind::Song`（.wav/.mp3）。REPL `song load|play|stop|speed|pitch|mix|
+  seek|loop`。
+- 落地備註：**不跨裝置重啟保留**（buffer 大、在 player 執行緒；重啟後重載）；
+  A-B loop 用 cursor reset（接縫，未做 crossfade）；granular 在極端變速/移調
+  會 warble（time-domain granular 本質，同 octaver）。
 
 **共用基礎**：
 - **aux monitor mix**：輸出級新增 aux 輸入環 + 相加（節拍器/鼓/伴奏合成後

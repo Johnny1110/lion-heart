@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod gui;
 mod session;
+mod song_loader;
 
 use anyhow::Result;
 use clap::Parser;

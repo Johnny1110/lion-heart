@@ -19,13 +19,15 @@ mod meter;
 mod spectrum;
 mod theme;
 mod tuner;
+mod waveform;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use iced::widget::canvas::{self, Canvas};
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, scrollable, space, text, text_input,
+    button, column, container, mouse_area, pick_list, row, scrollable, slider, space, text,
+    text_input,
 };
 use iced::{Element, Length, Size, Subscription, Theme, window};
 use lh_dsp::tuner::Tuner;
@@ -121,6 +123,20 @@ pub enum Message {
     ToggleMetronome,
     /// Step the metronome's beats-per-bar through the common meters.
     CycleTimeSig,
+    /// Toggle the practice drum groove (PRD 019 Phase 2): the footer drums chip.
+    ToggleGroove,
+    /// Step the drum groove through the built-in patterns.
+    CycleGroove,
+    /// Song player (PRD 019 Phase 3): transport + sliders.
+    SongToggle,
+    SongSeek(f32),
+    SongSpeed(f32),
+    SongTranspose(f32),
+    SongMix(f32),
+    /// Set the A-B loop start / end to the current position, or clear it.
+    SongLoopA,
+    SongLoopB,
+    SongLoopClear,
     /// A looper transport momentary press (PRD 013): `action` is
     /// `"rec"`/`"undo"`/`"clear"`, fired as a 1.0→0.0 pulse by the session.
     LooperPress {
@@ -219,6 +235,8 @@ pub enum Panel {
     Eq,
     /// Stage mode: big preset name, prev/next, big meters.
     Live,
+    /// Practice song player: backing track + varispeed/transpose/loop (PRD 019).
+    Song,
 }
 
 /// What the main panel is showing. [`Panel`] tabs cover the first four;
@@ -228,6 +246,8 @@ enum View {
     Tuner,
     Eq,
     Live,
+    /// Practice song player (PRD 019 Phase 3).
+    Song,
     Browser(Browser),
     /// Audio I/O settings: devices, input channel, buffer size.
     Settings(SettingsDraft),
@@ -1290,6 +1310,38 @@ impl Running {
                 };
                 self.status = self.session.set_beats_per_bar(next);
             }
+            Message::ToggleGroove => {
+                self.status = self.session.toggle_groove();
+            }
+            Message::CycleGroove => {
+                self.status = self.session.cycle_groove_pattern();
+            }
+            Message::SongToggle => {
+                self.status = self.session.song_toggle();
+            }
+            Message::SongSeek(frac) => self.session.song_seek_fraction(frac),
+            Message::SongSpeed(v) => {
+                self.status = self.session.set_song_speed(v);
+            }
+            Message::SongTranspose(v) => {
+                self.status = self.session.set_song_semitones(v);
+            }
+            Message::SongMix(v) => {
+                self.status = self.session.set_song_mix(v);
+            }
+            Message::SongLoopA => {
+                let (_, b) = self.session.song_loop_fraction().unwrap_or((0.0, 1.0));
+                let a = self.session.song_fraction();
+                self.status = self.session.set_song_loop_fraction(a, b.max(a));
+            }
+            Message::SongLoopB => {
+                let (a, _) = self.session.song_loop_fraction().unwrap_or((0.0, 1.0));
+                let b = self.session.song_fraction();
+                self.status = self.session.set_song_loop_fraction(a.min(b), b);
+            }
+            Message::SongLoopClear => {
+                self.status = self.session.clear_song_loop();
+            }
             Message::LooperPress { slot, action } => {
                 if let Err(e) = self.session.looper_press(&slot, action) {
                     self.status = e;
@@ -1300,6 +1352,7 @@ impl Running {
                 let remembered = match kind {
                     AssetKind::Nam => self.session.config.nam_dir.clone(),
                     AssetKind::Ir | AssetKind::IrB => self.session.config.ir_dir.clone(),
+                    AssetKind::Song => self.session.config.song_dir.clone(),
                 };
                 let start = remembered
                     .map(PathBuf::from)
@@ -1314,17 +1367,26 @@ impl Running {
             }
             Message::BrowserPick(path) => {
                 if let View::Browser(browser) = &self.view {
-                    let result = match browser.kind {
-                        AssetKind::Nam => self.session.load_nam(&path),
-                        AssetKind::Ir => self.session.load_ir(&path),
-                        AssetKind::IrB => self.session.load_ir_b(&path),
-                    };
-                    match result {
-                        Ok(msg) => {
-                            self.status = msg;
-                            self.view = View::Board;
+                    let kind = browser.kind;
+                    // A song loads on a background thread and lands in its own
+                    // panel; the chain assets return to the board.
+                    if kind == AssetKind::Song {
+                        self.status = self.session.load_song(&path);
+                        self.view = View::Song;
+                    } else {
+                        let result = match kind {
+                            AssetKind::Nam => self.session.load_nam(&path),
+                            AssetKind::Ir => self.session.load_ir(&path),
+                            AssetKind::IrB => self.session.load_ir_b(&path),
+                            AssetKind::Song => unreachable!(),
+                        };
+                        match result {
+                            Ok(msg) => {
+                                self.status = msg;
+                                self.view = View::Board;
+                            }
+                            Err(e) => self.status = format!("error: {e}"),
                         }
-                        Err(e) => self.status = format!("error: {e}"),
                     }
                 }
             }
@@ -1334,6 +1396,8 @@ impl Running {
                     AssetKind::Nam => (self.session.unload_nam(), "nam"),
                     AssetKind::Ir => (self.session.unload_ir(), "ir"),
                     AssetKind::IrB => (self.session.unload_ir_b(), "ir blend"),
+                    // The song is not a chain asset — no unload routing.
+                    AssetKind::Song => (false, "song"),
                 };
                 if had {
                     self.status = format!("{label}: unloaded");
@@ -1688,6 +1752,7 @@ impl Running {
                 | (View::Tuner, Panel::Tuner)
                 | (View::Eq, Panel::Eq)
                 | (View::Live, Panel::Live)
+                | (View::Song, Panel::Song)
         );
         if already {
             return;
@@ -1695,6 +1760,7 @@ impl Running {
         self.view = match panel {
             Panel::Board => View::Board,
             Panel::Eq => View::Eq,
+            Panel::Song => View::Song,
             // Tuner runs in live mode too; stale tap contents would smear
             // the first estimate.
             Panel::Tuner | Panel::Live => {
@@ -1743,6 +1809,11 @@ impl Running {
         // only when a locked time/rate actually moved.
         if self.session.tick_tempo() {
             self.refresh_slots();
+        }
+
+        // A backing track finished decoding on its loader thread (PRD 019).
+        if let Some(msg) = self.session.poll_song() {
+            self.status = msg;
         }
 
         // Foot controller: apply queued MIDI and mirror the result in the UI.
@@ -1970,6 +2041,7 @@ impl Running {
                 tab("board", Panel::Board, matches!(self.view, View::Board)),
                 tab("tuner", Panel::Tuner, matches!(self.view, View::Tuner)),
                 tab("eq", Panel::Eq, matches!(self.view, View::Eq)),
+                tab("song", Panel::Song, matches!(self.view, View::Song)),
                 tab("live", Panel::Live, matches!(self.view, View::Live)),
             ]
             .spacing(2),
@@ -2205,10 +2277,110 @@ impl Running {
             .into(),
             View::Live => self.live_view(),
             View::Eq => self.eq_view(),
+            View::Song => self.song_view(),
             View::Settings(draft) => self.settings_view(draft),
             View::Presets(pm) => self.presets_view(pm),
             View::Board => self.params_panel(),
         }
+    }
+
+    /// The practice song player (PRD 019 Phase 3): a backing track with
+    /// varispeed (pitch-locked), transpose, an A-B loop, and a level. The
+    /// waveform shows the playhead + loop region; the slider seeks.
+    fn song_view(&self) -> Element<'_, Message> {
+        let has = self.session.has_song();
+        let playing = self.session.song_is_playing();
+        let name = self.session.song_name().unwrap_or("(no backing track)");
+
+        let pos = self.session.song_fraction();
+        let total = self.session.song_seconds();
+        let time = format!("{}  /  {}", clock(pos * total), clock(total));
+
+        let transport = row![
+            button(text(if playing { "■ stop" } else { "▶ play" }).size(14))
+                .padding([6, 16])
+                .on_press_maybe(has.then_some(Message::SongToggle))
+                .style(theme::primary),
+            button(text("load…").size(13))
+                .padding([6, 14])
+                .on_press(Message::OpenBrowser(AssetKind::Song))
+                .style(theme::action),
+            text(name).size(14).color(theme::TEXT_BRIGHT),
+            space().width(Length::Fill),
+            text(time)
+                .size(13)
+                .font(iced::Font::MONOSPACE)
+                .color(theme::TEXT_DIM),
+        ]
+        .spacing(12)
+        .align_y(iced::Alignment::Center);
+
+        let wave = Canvas::new(waveform::Waveform {
+            peaks: self.session.song_peaks(),
+            position: pos,
+            loop_range: self.session.song_loop_fraction(),
+        })
+        .width(Length::Fill)
+        .height(Length::Fixed(120.0));
+
+        let seek = slider(0.0f32..=1.0, pos, Message::SongSeek).step(0.001f32);
+
+        let loop_label = match self.session.song_loop_fraction() {
+            Some((a, b)) => format!("loop {}–{}", clock(a * total), clock(b * total)),
+            None => "loop off".to_string(),
+        };
+        let loops = row![
+            text(loop_label).size(13).color(theme::TEXT_DIM),
+            space().width(Length::Fill),
+            button(text("set A").size(12))
+                .padding([4, 12])
+                .on_press(Message::SongLoopA)
+                .style(theme::action),
+            button(text("set B").size(12))
+                .padding([4, 12])
+                .on_press(Message::SongLoopB)
+                .style(theme::action),
+            button(text("clear").size(12))
+                .padding([4, 12])
+                .on_press(Message::SongLoopClear)
+                .style(theme::action),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        // Labelled sliders: varispeed, transpose, level.
+        let speed = self.session.song_speed();
+        let semis = self.session.song_semitones();
+        let mix = self.session.song_mix();
+        let label = |t: String| text(t).size(13).width(Length::Fixed(150.0));
+
+        column![
+            transport,
+            wave,
+            seek,
+            loops,
+            row![
+                label(format!("speed  {:.0}%", speed * 100.0)),
+                slider(0.25f32..=2.0, speed, Message::SongSpeed).step(0.01f32),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+            row![
+                label(format!("transpose  {semis:+.0} st")),
+                slider(-12.0f32..=12.0, semis, Message::SongTranspose).step(1.0f32),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+            row![
+                label(format!("level  {:.0}%", mix * 100.0)),
+                slider(0.0f32..=1.0, mix, Message::SongMix).step(0.01f32),
+            ]
+            .spacing(12)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(14)
+        .padding(4)
+        .into()
     }
 
     /// The preset management page (opened from the preset bar). Lists every
@@ -3046,7 +3218,8 @@ impl Running {
                         AssetKind::IrB,
                     ));
                 }
-                AssetKind::IrB => {} // never a family mount
+                AssetKind::IrB => {}  // never a family mount
+                AssetKind::Song => {} // never a family mount
             }
         }
 
@@ -3107,6 +3280,8 @@ impl Running {
         let bpm = format!("♩ {:.0}", self.session.tempo_bpm());
         let metro_on = self.session.metronome_on();
         let sig = format!("{}/4", self.session.beats_per_bar());
+        let groove_on = self.session.groove_on();
+        let groove = self.session.groove_pattern_name().to_string();
         row![
             // The global tempo (ADR 014): click to tap. Delay faceplates
             // have their own TAP button; this is the one always in view.
@@ -3123,6 +3298,16 @@ impl Running {
             button(text(sig).size(12).font(iced::Font::MONOSPACE))
                 .padding([2, 8])
                 .on_press(Message::CycleTimeSig)
+                .style(theme::chip(false)),
+            // Practice drum groove (PRD 019 Phase 2): lit when playing; the
+            // pattern chip steps rock → funk → metal → ballad.
+            button(text("drums").size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 10])
+                .on_press(Message::ToggleGroove)
+                .style(theme::chip(groove_on)),
+            button(text(groove).size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 8])
+                .on_press(Message::CycleGroove)
                 .style(theme::chip(false)),
             text(self.status.clone()).size(12).color(theme::TEXT_DIM),
             space().width(Length::Fill),
@@ -3146,6 +3331,12 @@ impl Running {
         .spacing(10)
         .into()
     }
+}
+
+/// `m:ss` clock string for a duration in seconds (song player readouts).
+fn clock(seconds: f32) -> String {
+    let s = seconds.max(0.0) as u32;
+    format!("{}:{:02}", s / 60, s % 60)
 }
 
 fn format_value(real: f32, unit: &str) -> String {

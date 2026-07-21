@@ -46,6 +46,16 @@ commands:
   click <0-100>                metronome volume (percent)
   timesig <n>                  beats per bar (accent on 1)
   countin                      (re)start the click on beat 1
+  groove <name>|on|off         drum groove (rock/funk/metal/ballad) at the tempo
+  groove vol <0-100>           drum volume (percent)
+  fill                         arm a one-bar drum fill on the next downbeat
+  song load <path>             load a backing track (WAV/MP3)
+  song play|stop               start / stop the backing track
+  song speed <0.25-2.0>        varispeed (pitch unchanged)
+  song pitch <-12..12>         transpose in semitones
+  song mix <0-100>             backing-track level (percent)
+  song seek <0.0-1.0>          jump to a fraction of the track
+  song loop <a> <b>            A-B loop in seconds (no args clears it)
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
@@ -112,6 +122,9 @@ pub fn run(args: JamArgs) -> Result<()> {
         session.tick_tempo();
         for line in session.drain_midi() {
             println!("  {line}");
+        }
+        if let Some(msg) = session.poll_song() {
+            println!("  {msg}");
         }
 
         match line_rx.recv_timeout(Duration::from_millis(200)) {
@@ -485,6 +498,81 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             None => println!("  time signature is {}/4", session.beats_per_bar()),
         },
         Some("countin") | Some("count") => println!("  {}", session.count_in()),
+        Some("groove") | Some("drums") => match parts.next() {
+            Some("off") => println!("  {}", session.set_groove(false)),
+            Some("on") => println!("  {}", session.set_groove(true)),
+            Some("vol") | Some("volume") => match parts.next() {
+                Some(pct) => match pct.parse::<f32>() {
+                    Ok(v) => println!("  {}", session.set_groove_volume(v / 100.0)),
+                    Err(_) => println!("  not a number: {pct}"),
+                },
+                None => println!("  drum volume is {:.0}%", session.groove_volume() * 100.0),
+            },
+            Some("fill") => println!("  {}", session.groove_fill()),
+            // `groove <name>` selects the pattern and starts playing.
+            Some(name) => match session.set_groove_pattern(name) {
+                Ok(msg) => {
+                    session.set_groove(true);
+                    println!("  {msg} — playing");
+                }
+                Err(e) => println!("  {e}"),
+            },
+            None => println!(
+                "  groove is {} on {:?} — usage: groove <name>|on|off|vol <n>|fill",
+                if session.groove_on() { "on" } else { "off" },
+                session.groove_pattern_name(),
+            ),
+        },
+        Some("fill") => println!("  {}", session.groove_fill()),
+        Some("song") => match parts.next() {
+            Some("load") => match parts.next() {
+                Some(path) => println!("  {}", session.load_song(std::path::Path::new(path))),
+                None => println!("  usage: song load <path.wav|.mp3>"),
+            },
+            Some("play") => println!("  {}", session.song_play()),
+            Some("stop") => println!("  {}", session.song_stop()),
+            Some("speed") => match parts.next().map(|s| s.parse::<f32>()) {
+                Some(Ok(v)) => println!("  {}", session.set_song_speed(v)),
+                _ => println!("  usage: song speed <0.25-2.0>"),
+            },
+            Some("pitch") | Some("transpose") => match parts.next().map(|s| s.parse::<f32>()) {
+                Some(Ok(v)) => println!("  {}", session.set_song_semitones(v)),
+                _ => println!("  usage: song pitch <-12..12 semitones>"),
+            },
+            Some("mix") => match parts.next().map(|s| s.parse::<f32>()) {
+                Some(Ok(v)) => println!("  {}", session.set_song_mix(v / 100.0)),
+                _ => println!("  usage: song mix <0-100>"),
+            },
+            Some("seek") => match parts.next().map(|s| s.parse::<f32>()) {
+                // A fraction 0..1 of the song.
+                Some(Ok(v)) => {
+                    session.song_seek_fraction(v);
+                    println!("  seek to {:.0}%", v * 100.0);
+                }
+                _ => println!("  usage: song seek <0.0-1.0>"),
+            },
+            Some("loop") => {
+                let a = parts.next().and_then(|s| s.parse::<f32>().ok());
+                let b = parts.next().and_then(|s| s.parse::<f32>().ok());
+                let secs = session.song_seconds().max(1e-3);
+                match (a, b) {
+                    // Seconds → fractions.
+                    (Some(a), Some(b)) => {
+                        println!("  {}", session.set_song_loop_fraction(a / secs, b / secs))
+                    }
+                    _ => println!("  {}", session.clear_song_loop()),
+                }
+            }
+            _ => println!(
+                "  song: {} {} — usage: song load|play|stop|speed|pitch|mix|seek|loop",
+                session.song_name().unwrap_or("(none)"),
+                if session.song_is_playing() {
+                    "▶"
+                } else {
+                    "■"
+                },
+            ),
+        },
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }
     true
