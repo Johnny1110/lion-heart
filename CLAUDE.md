@@ -571,7 +571,8 @@ the metronome's runtime state rides a device restart via `CarryOver` (BPM
 re-reads from the persisted config). **App-global environment, not tone** — no
 preset schema bump, not in presets; **plugin unchanged** (hosts own their
 metronome, the spillover/ADR 013 precedent). Surfaces: footer `click` toggle
-(lit amber = running) + a stepped time-sig chip + the shared BPM chip; REPL
+(lit amber = running) + a **click-level slider** (0–100 %, beside the chip) + a
+stepped time-sig chip + the shared BPM chip (tap **or** a typed-BPM field); REPL
 `metronome on|off` / `click <0-100>` / `timesig <n>` / `countin`. Click level
 kept moderate (default accent ≈ −9 dBFS) since the aux sums post-limiter — a
 coincident full-scale guitar+click peak can clip (accepted for a practice

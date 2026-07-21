@@ -126,6 +126,8 @@ pub enum Message {
     BpmSet,
     /// Toggle the practice metronome (PRD 019): the footer click chip.
     ToggleMetronome,
+    /// Set the click level (PRD 019): the footer slider beside the click chip.
+    ClickVolume(f32),
     /// Step the metronome's beats-per-bar through the common meters.
     CycleTimeSig,
     /// Toggle the practice drum groove (PRD 019 Phase 2): the footer drums chip.
@@ -1333,6 +1335,9 @@ impl Running {
             }
             Message::ToggleMetronome => {
                 self.status = self.session.toggle_metronome();
+            }
+            Message::ClickVolume(v) => {
+                self.status = self.session.set_click_volume(v);
             }
             Message::ToggleRecord => {
                 self.status = self.session.toggle_recording();
@@ -3336,6 +3341,7 @@ impl Running {
         let xruns = stats.underrun_events + stats.overrun_events;
         let bpm = format!("♩ {:.0}", self.session.tempo_bpm());
         let metro_on = self.session.metronome_on();
+        let click_vol = self.session.click_volume();
         let sig = format!("{}/4", self.session.beats_per_bar());
         let groove_on = self.session.groove_on();
         let groove = self.session.groove_pattern_name().to_string();
@@ -3363,6 +3369,14 @@ impl Running {
                 .padding([2, 10])
                 .on_press(Message::ToggleMetronome)
                 .style(theme::chip(metro_on)),
+            // Click level (PRD 019): drag to set the monitor volume.
+            slider(0.0f32..=1.0, click_vol, Message::ClickVolume)
+                .step(0.01f32)
+                .width(Length::Fixed(64.0)),
+            text(format!("{:.0}%", click_vol * 100.0))
+                .size(11)
+                .color(theme::TEXT_DIM)
+                .font(iced::Font::MONOSPACE),
             button(text(sig).size(12).font(iced::Font::MONOSPACE))
                 .padding([2, 8])
                 .on_press(Message::CycleTimeSig)
