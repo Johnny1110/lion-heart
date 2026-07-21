@@ -29,10 +29,13 @@ use lh_dsp::pitch::Pitch;
 use lh_dsp::practice::{DrumMachine, Metronome};
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
-use lh_engine::{ChainHandle, build_chain};
+use lh_engine::{ChainHandle, RecordTapState, build_chain};
+
+use crate::recorder::{RecStatus, RecSummary, Recorder};
 
 // The ~/.lion-heart disk layout lives in lh-assets, shared with the plugin
 // (the preset list order is a cross-binary contract).
+pub use lh_assets::wav::WavBits;
 pub use lh_assets::{app_dir, list_presets, presets_dir, read_preset_order, save_preset_order};
 use lh_io::passthrough::{DuplexRunner, RunnerOpts};
 use lh_io::stats::Snapshot;
@@ -43,6 +46,10 @@ use serde::{Deserialize, Serialize};
 const TUNER_TAP_CAPACITY: usize = 4_096;
 /// Samples of output buffered for the spectrum analyzer (~170 ms at 48 kHz).
 const SPECTRUM_TAP_CAPACITY: usize = 8_192;
+/// Rate the recording tap rings are sized for (PRD 014). Fixed high value so
+/// the buffer holds ≥1 s at any real stream rate — depth is only disk-stall
+/// slack, so oversizing is harmless.
+const RECORD_RING_RATE: u32 = 96_000;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -82,6 +89,14 @@ pub struct AppConfig {
     /// restart.
     #[serde(default = "tempo_default")]
     pub tempo_bpm: f32,
+    /// Where recordings land (PRD 014). Absent = `~/.lion-heart/recordings`.
+    /// App-global — a monitor recorder, not part of any preset.
+    #[serde(default)]
+    pub recordings_dir: Option<String>,
+    /// Recording bit depth: 16, 24, or 32 (32 = IEEE float). Default 24 —
+    /// plenty of headroom at half the size of float.
+    #[serde(default = "record_bits_default")]
+    pub record_bits: u16,
 }
 
 fn spillover_default() -> bool {
@@ -90,6 +105,10 @@ fn spillover_default() -> bool {
 
 fn tempo_default() -> f32 {
     lh_core::tempo::DEFAULT_BPM
+}
+
+fn record_bits_default() -> u16 {
+    24
 }
 
 impl Default for AppConfig {
@@ -108,6 +127,8 @@ impl Default for AppConfig {
             morph_ms: 0,
             spillover: spillover_default(),
             tempo_bpm: tempo_default(),
+            recordings_dir: None,
+            record_bits: record_bits_default(),
         }
     }
 }
@@ -248,6 +269,10 @@ pub struct Session {
     song_peaks: Vec<f32>,
     /// The aux player thread's handle, joined on drop.
     player_join: Option<JoinHandle<()>>,
+    /// Monitor recorder (PRD 014): DI + wet tracks to disk. Owns the tap
+    /// consumers; a take does not survive a device restart (a fresh session
+    /// gets a fresh recorder, and the old one finalizes its WAV on drop).
+    recorder: Recorder,
 }
 
 impl Drop for Session {
@@ -965,8 +990,10 @@ pub fn asset_kind(family_key: &str) -> Option<AssetKind> {
 }
 
 /// Build a fresh effect for a family key (PRD 002's factory seam — the
-/// registry owns the concrete effect crates).
-fn build_family_effect(
+/// registry owns the concrete effect crates). `pub(crate)` so the offline
+/// re-amp path (PRD 014) can reconstruct a preset's chain headlessly, exactly
+/// as the live session does.
+pub(crate) fn build_family_effect(
     nam: &mut AssetHandle<NamAsset>,
     cab: &mut AssetHandle<IrAsset>,
     rebuilt: &mut (bool, bool),
@@ -1019,6 +1046,21 @@ impl Session {
         let (aux_prod, aux_cons) = rtrb::RingBuffer::new(AUX_RING_FRAMES * 2);
         chain.set_aux_input(aux_cons);
 
+        // Recording taps (PRD 014): DI at chain entry, wet after the output
+        // stage. Always wired but dormant (one atomic load/block) until a take
+        // arms them. Sized generously (~2 s @ 96k) and decoupled from the
+        // stream rate — the depth only buys slack against a disk stall.
+        let rec_state = Arc::new(RecordTapState::default());
+        let rec_cap = Recorder::ring_capacity(RECORD_RING_RATE);
+        let (di_prod, di_cons) = rtrb::RingBuffer::new(rec_cap);
+        let (wet_prod, wet_cons) = rtrb::RingBuffer::new(rec_cap);
+        chain.set_record_taps(
+            di_prod,
+            Arc::clone(&rec_state),
+            wet_prod,
+            Arc::clone(&rec_state),
+        );
+
         // Config is needed before the stream for the metronome's initial tempo.
         let config = load_config();
 
@@ -1061,6 +1103,18 @@ impl Session {
             runner.sample_rate,
         );
 
+        // Recorder owns the tap consumers; the WAV headers use the true stream
+        // rate. Recording is app-global environment (like the metronome), so it
+        // does not carry across a device restart.
+        let recorder = Recorder::new(
+            di_cons,
+            wet_cons,
+            rec_state,
+            runner.sample_rate,
+            recordings_dir(&config),
+            WavBits::from_number(config.record_bits),
+        );
+
         Ok(Self {
             chain: chain_handle,
             nam: nam_handle,
@@ -1090,6 +1144,7 @@ impl Session {
             song_name: None,
             song_peaks: Vec::new(),
             player_join: Some(player_join),
+            recorder,
         })
     }
 
@@ -1186,6 +1241,48 @@ impl Session {
     /// The spectrum analyzer's post-output consumer (GUI, once at startup).
     pub fn take_spectrum_tap(&mut self) -> Option<rtrb::Consumer<f32>> {
         self.spectrum_tap.take()
+    }
+
+    // --- recording (PRD 014) ---
+
+    /// Start a take: DI + wet WAVs under the recordings directory. Returns the
+    /// two paths.
+    pub fn start_recording(&mut self) -> Result<(PathBuf, PathBuf), String> {
+        self.recorder.start()
+    }
+
+    /// Stop the current take and finalize the WAVs. Returns the summary.
+    pub fn stop_recording(&mut self) -> Result<RecSummary, String> {
+        self.recorder.stop()
+    }
+
+    /// Toggle recording; returns a user-facing message.
+    pub fn toggle_recording(&mut self) -> String {
+        if self.recorder.is_recording() {
+            match self.stop_recording() {
+                Ok(summary) => summary.human(),
+                Err(e) => format!("error: {e}"),
+            }
+        } else {
+            match self.start_recording() {
+                Ok((di, _wet)) => format!(
+                    "recording → {}",
+                    di.parent()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ),
+                Err(e) => format!("error: {e}"),
+            }
+        }
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_recording()
+    }
+
+    /// Live take status (elapsed, dropped frames) for the UI; `None` when idle.
+    pub fn recording_status(&self) -> Option<RecStatus> {
+        self.recorder.status()
     }
 
     // --- global output EQ (PRD 003) ---
@@ -2847,6 +2944,17 @@ pub(crate) fn load_config() -> AppConfig {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Where takes are written (PRD 014): the configured directory, else
+/// `~/.lion-heart/recordings`, else the current dir if `$HOME` is unavailable.
+fn recordings_dir(config: &AppConfig) -> PathBuf {
+    if let Some(dir) = &config.recordings_dir {
+        return PathBuf::from(dir);
+    }
+    app_dir()
+        .map(|d| d.join("recordings"))
+        .unwrap_or_else(|| PathBuf::from("recordings"))
 }
 
 fn save_config(config: &AppConfig) {

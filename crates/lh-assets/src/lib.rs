@@ -5,6 +5,8 @@
 //! to the engine rate, length capping, energy normalization, and partitioned
 //! convolver construction. NAM loading lives next to its effect in `lh-nam`.
 
+pub mod wav;
+
 use std::path::Path;
 
 use fft_convolver::FFTConvolver;

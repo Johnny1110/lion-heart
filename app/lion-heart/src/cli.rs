@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 use lh_io::DEFAULT_SAMPLE_RATE;
 
@@ -26,6 +28,8 @@ pub enum Command {
     Latency(LatencyArgs),
     /// Play through the pedalboard (gate → drive → amp → cab → delay) with a live REPL
     Jam(JamArgs),
+    /// Re-amp a DI recording through a preset, entirely offline (PRD 014)
+    Render(RenderArgs),
 }
 
 #[derive(Args)]
@@ -137,6 +141,21 @@ mod tests {
         assert_eq!(io(Some(128)).buffer_opt(), Some(128));
         assert_eq!(io(None).in_channel(), 1);
     }
+}
+
+#[derive(Args)]
+pub struct RenderArgs {
+    /// DI WAV to re-process (must be at the engine rate, 48 kHz)
+    pub di: PathBuf,
+    /// Preset name to render through (from ~/.lion-heart/presets)
+    #[arg(long)]
+    pub preset: String,
+    /// Output WAV path (default: <di>-<preset>.wav next to the DI)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+    /// Extra seconds rendered after the DI so delay/reverb tails finish
+    #[arg(long, default_value_t = 2.0)]
+    pub tail: f32,
 }
 
 #[derive(Args)]

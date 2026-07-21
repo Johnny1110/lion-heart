@@ -1,6 +1,8 @@
 mod cli;
 mod commands;
 mod gui;
+mod recorder;
+mod render;
 mod session;
 mod song_loader;
 
@@ -24,5 +26,6 @@ fn main() -> Result<()> {
         Some(Command::Run(args)) => commands::run::run(args),
         Some(Command::Latency(args)) => commands::latency::run(args),
         Some(Command::Jam(args)) => commands::jam::run(args),
+        Some(Command::Render(args)) => commands::render::run(args),
     }
 }

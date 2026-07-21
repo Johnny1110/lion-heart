@@ -415,8 +415,10 @@ anything moved. `Session::tick_tempo` delegates each control tick after
 `tick_morph`; `apply_tempo_now` is the non-persisting apply the MIDI-clock path
 shares. Per-slot **tap + `subdivision` stay** — a *Free* delay's TAP still sets
 its own `time` from tap × subdivision. GUI: the `sync` division renders as a
-stepped dropdown in the selector row (not a boolean chip); the footer BPM chip
-is the always-in-view tap. MIDI: virtual `tempo.tap` target (`SetParam` gated on
+stepped dropdown in the selector row (not a boolean chip); the footer ♩ BPM
+chip is the always-in-view tap, beside a **typed-BPM field** (`set` / Enter →
+`set_tempo_bpm`, digits-only draft) for exact tempi — the tap chip was
+tap-only before. MIDI: virtual `tempo.tap` target (`SetParam` gated on
 `norm >= 0.5` — the press, PRD 008's `snapshot.select` pattern). **Plugin:**
 `apply_tempo_sync` runs once per block; while the active delay pedal's `sync` ≠
 Free, `context.transport().tempo` (via `lh_core::tempo::synced_time_ms`, split
@@ -646,6 +648,47 @@ keeps-pitch/A-B-loop/stop-at-end/mix/peaks), symphonia loader (1 — WAV round
 trip). **All three practice-tools phases are complete** (metronome ADR 020,
 drums ADR 021, song player ADR 022) — one aux lane, one player thread.
 
+**M17 (recorder + re-amp) — code landed (uncommitted).** Specced in PRD 014,
+recorded as **ADR 023**. First item of the 2026-07-20 roadmap not yet built;
+lands white-paper success metric #1 ("record a guitar track"). Two features on
+one offline base. (1) **Live DI + wet recording.** The engine grew **two
+recording taps** (`Chain::set_record_taps`, same install pattern as the PRD 003
+spectrum tap, no new `EngineMsg`): a **DI tap** at chain entry (raw input,
+before any slot) and a **wet tap** after the output stage (global EQ → safety
+limiter) but **before** the aux mix — so a take carries no metronome/backing
+bleed (`wet_tap` is guitar-only, like the spectrum tap). Both are stereo
+interleaved `StereoTap`s over `rtrb` producers, sharing an
+`Arc<RecordTapState>` (`armed: AtomicBool` + `dropped: AtomicU64`): **disarmed =
+one relaxed load/block** (bit-transparent, ring untouched), armed = interleave +
+count the shortfall when the disk falls behind (drops = a defect, surfaced, not
+silent). A `Recorder` (app) owns the tap consumers between takes; `start()`
+drains stale ring contents, opens two `hound` WAVs
+(`~/.lion-heart/recordings/<UTC>-di.wav`/`-wet.wav`, timestamped control-side),
+spawns a **`lh-recorder` disk thread** that streams both rings to disk, then
+arms; `stop()` disarms, joins (final drain + finalize), reclaims the rings;
+`Recorder::drop` finalizes any in-progress take. **App-global environment**
+(`AppConfig.recordings_dir` + `record_bits` 16/24/32f, default 24) — no preset
+schema bump; a take **does not** survive a device restart (fresh session = fresh
+recorder; the old one finalizes on drop). (2) **Offline re-amp** — new
+`lion-heart render <di.wav> --preset <name> [-o out] [--tail secs]`. Reuses the
+**exact live chain** (`build_chain` + `ChainHandle::apply_preset_chain` + the
+same `lh-assets`/`lh-nam` loaders), driven by hand: empty chain → reconcile to
+the preset → mount assets → pump silent warm-up blocks (drain the control
+messages, settle fades) → feed the DI → `--tail` of silence so delay/reverb
+tails finish. **Reproducible**: global EQ (environment) is left flat, so a DI
+renders identically anywhere; the always-on safety limiter still applies; the DI
+must be 48 kHz (mismatch = hard error, matching NAM rate-lock — no offline
+resample). New shared **`lh_assets::wav`** (read/write-all + a streaming
+`WavStream` + `WavBits`) is the one WAV path, CI-tested (bit-exact float
+round-trip). GUI: a header **● REC** button (red + elapsed while recording, ⚠ on
+dropped frames); REPL `record start|stop`. **Plugin unchanged** — a DAW is the
+recorder/re-amp host there (ADR 013/020 precedent), so no param-id change,
+clap-validator unaffected. Tests: `lh-assets::wav` round-trip/interleave/stream
+(5), engine tap correctness + drop-counting + disarmed-transparency (2), offline
+render processed-output/rate-mismatch/tail/passthrough (4), recorder
+timestamp/civil-date/ring-capacity (3). Zero DSP/RT cost when idle; the disk
+thread does all I/O. **Unblocks PRD 016** (LUFS leveling reuses `render`).
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -769,6 +812,21 @@ granular warble at extreme speed/transpose is acceptable for practice; an MP3
 loads as well as a WAV; REPL `song load|play|speed|pitch|loop`; **confirm
 `assert_no_alloc` stays quiet** with song + drums + click all playing while
 editing the board; a device/buffer change drops the song by design — reload it),
+**the recorder by ear** (header ● REC starts a take — DI + wet WAVs land in
+`~/.lion-heart/recordings/`; play a phrase, stop; the **wet** plays back = what
+you heard, the **DI** = dry input; with the metronome/drums on, confirm the
+**wet track has no click/drum bleed** — the wet tap is pre-aux; a long take keeps
+the header dropped-frames indicator at 0 (⚠ appears only if the disk stalls);
+REPL `record start|stop`; **confirm `assert_no_alloc` stays quiet** on a debug
+build while `record start`/`record stop` mid-note under a null-device jam — a
+take must not SIGABRT; a device/buffer change ends the take (WAV finalized) by
+design),
+**offline re-amp** (`lion-heart render <old-di.wav> --preset <name>` produces a
+re-processed WAV — the tone matches loading that preset live, delay/reverb tails
+complete within `--tail`; render the same DI through two presets and hear the
+difference; a non-48 kHz DI errors clearly; a missing preset/file errors
+cleanly; confirm the render is amp-tone only — the machine's global EQ does not
+color it),
 plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
@@ -809,6 +867,7 @@ cargo run -p lion-heart -- devices             # list devices
 cargo run -p lion-heart --release -- run       # passthrough (Ctrl-C to stop)
 cargo run -p lion-heart --release -- jam       # pedalboard + control REPL
 cargo run -p lion-heart --release -- latency   # RTL measurement (loopback cable)
+cargo run -p lion-heart --release -- render di.wav --preset lead  # offline re-amp (PRD 014)
 ```
 
 Plugin bundling: `cargo xtask bundle lion-heart-plugin --release` →
@@ -831,7 +890,7 @@ CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |
 | `lh-midi`        | MIDI foot control: PC/CC parsing, mapping, midir input            | —             |
-| `lh-assets`      | IR WAV loading (decode, sinc-resample, normalize, build convolver) + the `~/.lion-heart` disk layout shared by app & plugin | dsp           |
+| `lh-assets`      | IR WAV loading (decode, sinc-resample, normalize, build convolver), general WAV read/write (`wav`, PRD 014) + the `~/.lion-heart` disk layout shared by app & plugin | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
 | `plugin/…`       | CLAP/VST3 wrapper via nih-plug (GPLv3 for VST3 builds)            | core→assets   |
 

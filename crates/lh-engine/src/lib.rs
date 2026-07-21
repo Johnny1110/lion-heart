@@ -16,7 +16,7 @@
 //! untouched slots keep their state, so delay/reverb tails survive edits.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use std::collections::BTreeMap;
 
@@ -304,6 +304,67 @@ impl OutputStage {
     }
 }
 
+/// Control-side handle to a recording tap (PRD 014): flip `armed` on/off and
+/// read `dropped`. Shared (`Arc`) with the [`StereoTap`] the chain holds.
+#[derive(Debug, Default)]
+pub struct RecordTapState {
+    /// The audio thread writes to the ring only while this is set; off, the
+    /// tap is a single relaxed load per block (bit-transparent, no ring touch).
+    pub armed: AtomicBool,
+    /// Frames the ring could not accept while armed (disk not keeping up) —
+    /// a recording defect, surfaced to the UI. Reset by the control side at
+    /// the start of each take.
+    pub dropped: AtomicU64,
+}
+
+/// A stereo, interleaved (`L,R,L,R…`) output tap for recording (PRD 014). Like
+/// the spectrum/tuner taps it is lock-free and drop-on-full — an unread or
+/// backed-up tap must never stall the callback — but it counts the shortfall
+/// (dropped frames) and only writes while armed, so the idle cost is one
+/// relaxed atomic load.
+struct StereoTap {
+    prod: rtrb::Producer<f32>,
+    state: Arc<RecordTapState>,
+}
+
+impl StereoTap {
+    /// Interleave `left`/`right` into the ring. No-op (one atomic load) when
+    /// disarmed; counts frames it cannot fit when armed.
+    fn write(&mut self, left: &[f32], right: &[f32]) {
+        if !self.state.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        let want = left.len();
+        let avail = self.prod.slots() / 2; // whole L/R frames the ring can take
+        let n = want.min(avail);
+        if n < want {
+            self.state
+                .dropped
+                .fetch_add((want - n) as u64, Ordering::Relaxed);
+        }
+        if n == 0 {
+            return;
+        }
+        if let Ok(mut chunk) = self.prod.write_chunk(2 * n) {
+            // The ring may wrap: the chunk is two contiguous slices.
+            let (a, b) = chunk.as_mut_slices();
+            let a_len = a.len();
+            let mut put = |i: usize, v: f32| {
+                if i < a_len {
+                    a[i] = v;
+                } else {
+                    b[i - a_len] = v;
+                }
+            };
+            for f in 0..n {
+                put(2 * f, left[f]);
+                put(2 * f + 1, right[f]);
+            }
+            chunk.commit_all();
+        }
+    }
+}
+
 /// The audio-thread side. RT rules apply to [`Chain::process`] and
 /// [`Chain::reset`]; [`Chain::prepare`] allocates and runs before streams start.
 pub struct Chain {
@@ -344,6 +405,13 @@ pub struct Chain {
     /// something the amp tone or the safety limiter should touch. Drop-on-empty:
     /// an underrun is a brief gap, never a stall.
     aux: Option<rtrb::Consumer<f32>>,
+    /// Recording DI tap (PRD 014): stereo copy of the raw input at chain
+    /// entry, before any slot — the dry "negative" for offline re-amp.
+    di_tap: Option<StereoTap>,
+    /// Recording wet tap (PRD 014): stereo copy of the processed output after
+    /// the output stage (global EQ → safety limiter) but **before** the aux
+    /// mix, so the recorded guitar track carries no metronome/backing bleed.
+    wet_tap: Option<StereoTap>,
 }
 
 impl Chain {
@@ -390,6 +458,28 @@ impl Chain {
     /// the audio thread.
     pub fn set_aux_input(&mut self, aux: rtrb::Consumer<f32>) {
         self.aux = Some(aux);
+    }
+
+    /// Install the recording taps (PRD 014): a DI (raw-input) and a wet
+    /// (post-output-stage) stereo producer, each sharing a [`RecordTapState`]
+    /// with the control side. Call before the chain moves to the audio thread;
+    /// the taps stay dormant (one atomic load per block) until the control side
+    /// arms them for a take.
+    pub fn set_record_taps(
+        &mut self,
+        di: rtrb::Producer<f32>,
+        di_state: Arc<RecordTapState>,
+        wet: rtrb::Producer<f32>,
+        wet_state: Arc<RecordTapState>,
+    ) {
+        self.di_tap = Some(StereoTap {
+            prod: di,
+            state: di_state,
+        });
+        self.wet_tap = Some(StereoTap {
+            prod: wet,
+            state: wet_state,
+        });
     }
 
     /// Send an effect down the chute; park it if the chute is full (retried
@@ -628,6 +718,12 @@ impl Chain {
             }
         }
 
+        // Recording DI tap (PRD 014): the dry input, before any slot. Stereo
+        // interleaved so a re-amp reads it straight back; dormant until armed.
+        if let Some(tap) = &mut self.di_tap {
+            tap.write(left, right);
+        }
+
         for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
             for i in 0..self.order.len() {
                 let Some(slot) = self
@@ -677,6 +773,12 @@ impl Chain {
 
         // Output stage (PRD 003): global EQ → safety limiter → spectrum tap.
         self.output.process(left, right);
+
+        // Recording wet tap (PRD 014): the processed guitar, captured *before*
+        // the aux mix below so a recorded take carries no click/backing bleed.
+        if let Some(tap) = &mut self.wet_tap {
+            tap.write(left, right);
+        }
 
         // Aux monitor mix (PRD 019): metronome/backing summed *after* the amp
         // chain and the safety limiter — a clean click, not amp-processed. The
@@ -1568,6 +1670,8 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             telemetry: Arc::clone(&telemetry),
             tap: None,
             aux: None,
+            di_tap: None,
+            wet_tap: None,
         },
         ChainHandle {
             tx,

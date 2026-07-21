@@ -119,6 +119,11 @@ pub enum Message {
     /// per-slot behavior, preserved).
     Tap,
     TapTempo(String),
+    /// The footer BPM field changed (PRD 012): a manually-typed tempo, not yet
+    /// applied.
+    BpmInputChanged(String),
+    /// Apply the typed BPM (Enter in the footer field, or the ✓ button).
+    BpmSet,
     /// Toggle the practice metronome (PRD 019): the footer click chip.
     ToggleMetronome,
     /// Step the metronome's beats-per-bar through the common meters.
@@ -174,6 +179,9 @@ pub enum Message {
     /// default layout.
     PedalEqFlat(String),
     ToggleSettings,
+    /// Toggle recording (PRD 014): the header ● REC button. Writes DI + wet
+    /// WAVs under the recordings directory.
+    ToggleRecord,
     SettingsInput(DeviceChoice),
     SettingsOutput(DeviceChoice),
     SettingsChannel(u16),
@@ -754,6 +762,10 @@ struct Running {
     drag: Option<DragState>,
     view: View,
     preset_name: String,
+    /// Draft text of the footer BPM field (PRD 012): a manually-typed tempo,
+    /// applied on Enter. Transient — cleared once applied; the live tempo shows
+    /// in the ♩ tap chip beside it.
+    bpm_input: String,
     presets: Vec<String>,
     active_preset: Option<String>,
     status: String,
@@ -892,6 +904,7 @@ impl Running {
             drag: None,
             view: View::Board,
             preset_name: active_preset.clone().unwrap_or_default(),
+            bpm_input: String::new(),
             presets: list_presets(),
             active_preset,
             status,
@@ -1297,8 +1310,32 @@ impl Running {
                     self.status = msg;
                 }
             }
+            Message::BpmInputChanged(text) => {
+                // Keep it to digits and a decimal point so the field can only
+                // ever hold a tempo.
+                self.bpm_input = text
+                    .chars()
+                    .filter(|c| c.is_ascii_digit() || *c == '.')
+                    .collect();
+            }
+            Message::BpmSet => {
+                let typed = self.bpm_input.trim();
+                if typed.is_empty() {
+                    return;
+                }
+                match typed.parse::<f32>() {
+                    Ok(bpm) => {
+                        self.status = self.session.set_tempo_bpm(bpm);
+                        self.bpm_input.clear();
+                    }
+                    Err(_) => self.status = format!("not a tempo: {typed}"),
+                }
+            }
             Message::ToggleMetronome => {
                 self.status = self.session.toggle_metronome();
+            }
+            Message::ToggleRecord => {
+                self.status = self.session.toggle_recording();
             }
             Message::CycleTimeSig => {
                 // Step through the common meters: 4 → 3 → 6 → 2 → 4…
@@ -2048,6 +2085,25 @@ impl Running {
         )
         .padding(3)
         .style(theme::tab_group);
+        // Record button (PRD 014): shows elapsed while a take runs; ⚠ if the
+        // disk fell behind (dropped frames). The label re-reads status every
+        // frame, so the timer ticks.
+        let recording = self.session.is_recording();
+        let rec_label = match self.session.recording_status() {
+            Some(s) => {
+                let warn = if s.dropped > 0 { " ⚠" } else { "" };
+                format!("● {:.0}s{warn}", s.elapsed.as_secs_f32())
+            }
+            None => "● REC".to_string(),
+        };
+        let rec = button(text(rec_label).size(13).color(if recording {
+            theme::METER_HOT
+        } else {
+            theme::TEXT_DIM
+        }))
+        .padding([5, 13])
+        .on_press(Message::ToggleRecord)
+        .style(theme::chip(recording));
         row![
             row![
                 text("LION").size(19).color(theme::TEXT_BRIGHT),
@@ -2055,6 +2111,7 @@ impl Running {
             ],
             tabs,
             space().width(Length::Fill),
+            rec,
             button(text("settings").size(13))
                 .padding([5, 13])
                 .on_press(Message::ToggleSettings)
@@ -3283,11 +3340,22 @@ impl Running {
         let groove_on = self.session.groove_on();
         let groove = self.session.groove_pattern_name().to_string();
         row![
-            // The global tempo (ADR 014): click to tap. Delay faceplates
+            // The global tempo (ADR 014): click ♩ to tap. Delay faceplates
             // have their own TAP button; this is the one always in view.
             button(text(bpm).size(12).font(iced::Font::MONOSPACE))
                 .padding([2, 10])
                 .on_press(Message::Tap)
+                .style(theme::action),
+            // …or type a tempo directly and press Enter / set (PRD 012).
+            text_input("bpm", &self.bpm_input)
+                .on_input(Message::BpmInputChanged)
+                .on_submit(Message::BpmSet)
+                .style(theme::input)
+                .size(12)
+                .width(Length::Fixed(48.0)),
+            button(text("set").size(12).font(iced::Font::MONOSPACE))
+                .padding([2, 8])
+                .on_press(Message::BpmSet)
                 .style(theme::action),
             // Practice metronome (PRD 019): lit amber when running; the
             // time-sig chip steps the accent's bar length.

@@ -57,6 +57,7 @@ commands:
   song seek <0.0-1.0>          jump to a fraction of the track
   song loop <a> <b>            A-B loop in seconds (no args clears it)
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
+  record start|stop            record DI + wet WAVs (re-amp with `render`)
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
   stats                        stream health (xruns, callback time)
@@ -187,6 +188,28 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
             println!("  chain: {}", session.chain.order_handles().join(" → "));
             print_state(session);
         }
+        Some("record") | Some("rec") => match parts.next() {
+            Some("start") | Some("on") => match session.start_recording() {
+                Ok((di, wet)) => {
+                    println!("  recording → {}", di.display());
+                    println!("             {}", wet.display());
+                }
+                Err(e) => println!("  error: {e}"),
+            },
+            Some("stop") | Some("off") => match session.stop_recording() {
+                Ok(summary) => println!("  {}", summary.human()),
+                Err(e) => println!("  error: {e}"),
+            },
+            None => match session.recording_status() {
+                Some(s) => println!(
+                    "  recording {:.1}s (dropped {} frames)",
+                    s.elapsed.as_secs_f32(),
+                    s.dropped
+                ),
+                None => println!("  not recording — usage: record start|stop"),
+            },
+            _ => println!("  usage: record start|stop"),
+        },
         Some("meter") | Some("m") => println!("  {}", session.chain.meter_line()),
         Some("stats") => {
             let s = session.stats();
