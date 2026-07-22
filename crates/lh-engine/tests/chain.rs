@@ -184,6 +184,67 @@ fn bypassing_everything_becomes_a_passthrough() {
 }
 
 #[test]
+fn master_trim_scales_output_and_stays_transparent_at_unity() {
+    // PRD 016: the output-stage master trim is a per-preset loudness offset.
+    // 0 dB is bit-transparent; a negative trim scales the whole output; an
+    // over-generous positive trim is caught by the always-on safety limiter.
+    let passthrough = || {
+        let (mut chain, mut handle) = build_chain(pedalboard());
+        chain.prepare(SR);
+        handle.set_active("gate", false).unwrap();
+        handle.set_active("drive", false).unwrap();
+        handle.set_active("delay", false).unwrap();
+        (chain, handle)
+    };
+    let warm = |chain: &mut lh_engine::Chain| {
+        let mut w: Vec<f32> = sine(SR, 220.0, SR as usize / 5)
+            .iter()
+            .map(|s| s * 0.5)
+            .collect();
+        let mut wr = w.clone();
+        for (l, r) in w.chunks_mut(64).zip(wr.chunks_mut(64)) {
+            chain.process(l, r);
+        }
+    };
+    let render = |chain: &mut lh_engine::Chain| -> Vec<f32> {
+        let x: Vec<f32> = sine(SR, 220.0, 8_192).iter().map(|s| s * 0.5).collect();
+        let mut y = x.clone();
+        let mut yr = x.clone();
+        for (l, r) in y.chunks_mut(64).zip(yr.chunks_mut(64)) {
+            chain.process(l, r);
+        }
+        assert_finite("trim output", &y);
+        y
+    };
+
+    // 0 dB (default): bit-exact passthrough.
+    let (mut c0, _h0) = passthrough();
+    warm(&mut c0);
+    let x: Vec<f32> = sine(SR, 220.0, 8_192).iter().map(|s| s * 0.5).collect();
+    assert_eq!(render(&mut c0), x, "trim 0 dB must be bit-transparent");
+
+    // −6 dB: output halves (≈ 0.501 linear).
+    let (mut c6, mut h6) = passthrough();
+    h6.set_master_trim_db(-6.0).unwrap();
+    warm(&mut c6);
+    let y = render(&mut c6);
+    let ratio = rms(&y) / rms(&x);
+    assert!((ratio - 0.501).abs() < 0.02, "−6 dB trim ratio {ratio}");
+
+    // +24 dB into a half-scale sine would clip; the safety limiter holds it
+    // under the −0.3 dBFS ceiling (with a little smoother/recovery headroom).
+    let (mut ch, mut hh) = passthrough();
+    hh.set_master_trim_db(24.0).unwrap();
+    warm(&mut ch);
+    let y = render(&mut ch);
+    let peak = y.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    assert!(
+        peak <= 1.0,
+        "safety limiter must hold the boosted trim: peak {peak}"
+    );
+}
+
+#[test]
 fn unknown_keys_are_rejected() {
     let (_chain, mut handle) = build_chain(pedalboard());
     assert!(handle.set_param("wah", "position", 0.5).is_err());

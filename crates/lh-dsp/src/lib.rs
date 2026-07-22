@@ -30,6 +30,7 @@ pub mod dynamics;
 pub mod eq;
 pub mod filter;
 pub mod looper;
+pub mod loudness;
 pub mod modulation;
 pub mod pitch;
 pub mod power;

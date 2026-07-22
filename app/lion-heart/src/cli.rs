@@ -30,6 +30,8 @@ pub enum Command {
     Jam(JamArgs),
     /// Re-amp a DI recording through a preset, entirely offline (PRD 014)
     Render(RenderArgs),
+    /// Measure preset loudness (LUFS) and write per-preset trims (PRD 016)
+    Level(LevelArgs),
 }
 
 #[derive(Args)]
@@ -156,6 +158,25 @@ pub struct RenderArgs {
     /// Extra seconds rendered after the DI so delay/reverb tails finish
     #[arg(long, default_value_t = 2.0)]
     pub tail: f32,
+}
+
+#[derive(Args)]
+pub struct LevelArgs {
+    /// Preset name to measure (from ~/.lion-heart/presets). Omit with --all.
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub preset: Option<String>,
+    /// Measure every preset in the directory.
+    #[arg(long)]
+    pub all: bool,
+    /// Target integrated loudness in LUFS.
+    #[arg(long, default_value_t = crate::leveling::DEFAULT_TARGET_LUFS)]
+    pub target: f32,
+    /// Reference DI WAV (must be 48 kHz). Omit to use the built-in synthesized DI.
+    #[arg(long)]
+    pub reference: Option<PathBuf>,
+    /// Measure and print only; do not write levels.json.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args)]

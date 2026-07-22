@@ -201,6 +201,35 @@ pub enum Message {
     /// Preset management page (opened from the preset bar's "manage" button):
     /// list / save-as / load / rename / duplicate / delete.
     Preset(PresetMsg),
+    /// Setlist management page (PRD 016).
+    Setlist(SetlistMsg),
+    /// Nudge / reset the current preset's loudness trim (PRD 016), persisted
+    /// to levels.json and applied live.
+    TrimNudge(f32),
+    TrimReset,
+}
+
+/// Messages for the setlist management page (PRD 016), nested like [`PresetMsg`].
+#[derive(Debug, Clone)]
+pub enum SetlistMsg {
+    Open,
+    Close,
+    /// The "new setlist name…" field, and creating it.
+    NewNameChanged(String),
+    Create,
+    /// Show a list's songs for editing.
+    Edit(String),
+    /// Make a list the active one (drives prev/next & MIDI PC), or step back to
+    /// the sorted directory.
+    Activate(String),
+    Deactivate,
+    Delete(String),
+    /// Append the currently-loaded preset to the list being edited.
+    AddCurrent,
+    /// Reorder / remove a song within the list being edited.
+    MoveUp(usize),
+    MoveDown(usize),
+    RemoveAt(usize),
 }
 
 /// Messages for the preset management page. Nested under [`Message::Preset`]
@@ -263,6 +292,18 @@ enum View {
     Settings(SettingsDraft),
     /// Preset management: list every saved preset with CRUD + duplicate.
     Presets(PresetManager),
+    /// Setlist management (PRD 016): create/activate lists, edit their order.
+    Setlists(SetlistManager),
+}
+
+/// State for the setlist management page (PRD 016). Everything else is read
+/// live from the session; this only holds the two bits of transient UI state.
+#[derive(Default)]
+struct SetlistManager {
+    /// The "new setlist name…" field.
+    new_name: String,
+    /// Which list's songs are shown for editing (defaults to the active one).
+    editing: Option<String>,
 }
 
 /// State for the preset management page (opened from the preset bar). Owns a
@@ -1118,6 +1159,12 @@ impl Running {
     /// The preset `step` away from the active one; with none active, next
     /// starts at the first and prev at the last.
     fn preset_neighbor(&self, step: isize) -> Option<String> {
+        // An active setlist drives prev/next through its order (PRD 016);
+        // otherwise walk the sorted directory as before.
+        if self.session.setlists().is_active() {
+            let current = self.active_preset.as_deref().unwrap_or("");
+            return self.session.adjacent_preset(current, step);
+        }
         if self.presets.is_empty() {
             return None;
         }
@@ -1129,6 +1176,92 @@ impl Running {
         let next = pos + step;
         (next >= 0 && (next as usize) < self.presets.len())
             .then(|| self.presets[next as usize].clone())
+    }
+
+    /// The setlist currently open for editing in the manager, if any.
+    fn editing_list(&self) -> Option<String> {
+        match &self.view {
+            View::Setlists(sm) => sm.editing.clone(),
+            _ => None,
+        }
+    }
+
+    /// Setlist management (PRD 016). All list state lives in the session; the
+    /// manager holds only the new-name field and which list is being edited.
+    fn update_setlist(&mut self, msg: SetlistMsg) {
+        match msg {
+            SetlistMsg::Open => {
+                let editing = self.session.setlists().active.clone();
+                self.view = View::Setlists(SetlistManager {
+                    new_name: String::new(),
+                    editing,
+                });
+            }
+            SetlistMsg::Close => self.view = View::Board,
+            SetlistMsg::NewNameChanged(s) => {
+                if let View::Setlists(sm) = &mut self.view {
+                    sm.new_name = s;
+                }
+            }
+            SetlistMsg::Create => {
+                let name = match &self.view {
+                    View::Setlists(sm) => sm.new_name.trim().to_string(),
+                    _ => return,
+                };
+                if name.is_empty() {
+                    return;
+                }
+                if self.session.setlist_create(&name).is_ok()
+                    && let View::Setlists(sm) = &mut self.view
+                {
+                    sm.editing = Some(name);
+                    sm.new_name.clear();
+                }
+            }
+            SetlistMsg::Edit(name) => {
+                if let View::Setlists(sm) = &mut self.view {
+                    sm.editing = Some(name);
+                }
+            }
+            SetlistMsg::Activate(name) => {
+                let _ = self.session.set_active_setlist(Some(&name));
+            }
+            SetlistMsg::Deactivate => {
+                let _ = self.session.set_active_setlist(None);
+            }
+            SetlistMsg::Delete(name) => {
+                let _ = self.session.setlist_delete(&name);
+                if let View::Setlists(sm) = &mut self.view
+                    && sm.editing.as_deref() == Some(name.as_str())
+                {
+                    sm.editing = None;
+                }
+            }
+            SetlistMsg::AddCurrent => {
+                let Some(list) = self.editing_list() else {
+                    return;
+                };
+                let Some(preset) = self.session.current_preset().map(str::to_string) else {
+                    return;
+                };
+                let _ = self.session.setlist_add(&list, &preset);
+            }
+            SetlistMsg::MoveUp(i) => {
+                if let Some(list) = self.editing_list() {
+                    let _ = self.session.setlist_move(&list, i, -1);
+                }
+            }
+            SetlistMsg::MoveDown(i) => {
+                if let Some(list) = self.editing_list() {
+                    let _ = self.session.setlist_move(&list, i, 1);
+                }
+            }
+            SetlistMsg::RemoveAt(i) => {
+                if let Some(list) = self.editing_list() {
+                    let _ = self.session.setlist_remove_at(&list, i);
+                }
+            }
+        }
     }
 
     fn update(&mut self, message: Message) {
@@ -1576,6 +1709,18 @@ impl Running {
             }
             Message::LoadPreset(name) => self.apply_preset_load(name),
             Message::Preset(msg) => self.update_preset(msg),
+            Message::Setlist(msg) => self.update_setlist(msg),
+            Message::TrimNudge(delta) => {
+                if let Some(name) = self.active_preset.clone() {
+                    let cur = self.session.master_trim_db();
+                    let _ = self.session.set_preset_trim(&name, Some(cur + delta));
+                }
+            }
+            Message::TrimReset => {
+                if let Some(name) = self.active_preset.clone() {
+                    let _ = self.session.set_preset_trim(&name, None);
+                }
+            }
         }
     }
 
@@ -2163,6 +2308,11 @@ impl Running {
                     .padding([4, 12])
                     .on_press(Message::Preset(PresetMsg::Open))
                     .style(theme::chip(matches!(self.view, View::Presets(_)))),
+                button(text("setlists").size(12))
+                    .padding([4, 12])
+                    .on_press(Message::Setlist(SetlistMsg::Open))
+                    .style(theme::chip(matches!(self.view, View::Setlists(_)))),
+                self.setlist_indicator(),
                 space().width(Length::Fixed(18.0)),
                 self.snapshot_chips_row(),
                 space().width(Length::Fill),
@@ -2184,6 +2334,26 @@ impl Running {
         .width(Length::Fill)
         .style(theme::panel)
         .into()
+    }
+
+    /// The active-setlist readout for the preset bar (PRD 016): "▶ name · 3/12"
+    /// when a setlist is active, nothing otherwise.
+    fn setlist_indicator(&self) -> Element<'_, Message> {
+        let current = self.active_preset.as_deref().unwrap_or("");
+        match self.session.setlist_position(current) {
+            Some((name, pos, total)) => {
+                let pos_str = if pos == 0 {
+                    "–".to_string()
+                } else {
+                    pos.to_string()
+                };
+                text(format!("▶ {name} · {pos_str}/{total}"))
+                    .size(11)
+                    .color(theme::ACCENT)
+                    .into()
+            }
+            None => space().width(Length::Shrink).into(),
+        }
     }
 
     /// The scene chips (PRD 009): A–D, click to switch (or store into an
@@ -2342,6 +2512,7 @@ impl Running {
             View::Song => self.song_view(),
             View::Settings(draft) => self.settings_view(draft),
             View::Presets(pm) => self.presets_view(pm),
+            View::Setlists(sm) => self.setlists_view(sm),
             View::Board => self.params_panel(),
         }
     }
@@ -2853,6 +3024,213 @@ impl Running {
 
     /// Audio I/O settings: pick devices/channel/buffer, apply restarts the
     /// stream (chain state and assets carry over).
+    /// Setlist management page (PRD 016): the active status, a create field,
+    /// every list (edit / activate / delete), and the songs of the list being
+    /// edited (reorder with ▲▼, remove, add the current preset).
+    fn setlists_view<'a>(&'a self, sm: &'a SetlistManager) -> Element<'a, Message> {
+        use SetlistMsg as M;
+        let sl = self.session.setlists();
+
+        let header = row![
+            text("SETLISTS").size(15).color(theme::TEXT_BRIGHT),
+            space().width(Length::Fill),
+            button(text("close").size(12))
+                .padding([4, 12])
+                .on_press(Message::Setlist(M::Close))
+                .style(theme::action),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        let active_line: Element<'_, Message> = if let Some(order) = sl.active_order() {
+            row![
+                text("Active:").size(12).color(theme::TEXT_DIM),
+                text(sl.active.clone().unwrap_or_default())
+                    .size(13)
+                    .color(theme::ACCENT),
+                text(format!("· {} songs", order.len()))
+                    .size(12)
+                    .color(theme::TEXT_DIM),
+                space().width(Length::Fixed(10.0)),
+                button(text("off").size(11))
+                    .padding([2, 10])
+                    .on_press(Message::Setlist(M::Deactivate))
+                    .style(theme::action),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            text("No active setlist — prev/next & MIDI PC walk the sorted directory")
+                .size(12)
+                .color(theme::TEXT_DIM)
+                .into()
+        };
+
+        let create = row![
+            text_input("new setlist name…", &sm.new_name)
+                .on_input(|s| Message::Setlist(M::NewNameChanged(s)))
+                .on_submit(Message::Setlist(M::Create))
+                .style(theme::input)
+                .size(13)
+                .width(Length::Fixed(220.0)),
+            button(text("create").size(12))
+                .padding([4, 14])
+                .on_press(Message::Setlist(M::Create))
+                .style(theme::primary),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let mut lists = column![].spacing(6);
+        if sl.lists.is_empty() {
+            lists = lists.push(text("no setlists yet").size(12).color(theme::TEXT_DIM));
+        }
+        for (name, songs) in &sl.lists {
+            let is_active = sl.active.as_deref() == Some(name.as_str());
+            let editing = sm.editing.as_deref() == Some(name.as_str());
+            lists = lists.push(
+                row![
+                    text(if is_active { "▶" } else { " " })
+                        .size(13)
+                        .color(theme::ACCENT)
+                        .width(Length::Fixed(14.0)),
+                    text(name.clone()).size(13).color(if editing {
+                        theme::TEXT_BRIGHT
+                    } else {
+                        theme::TEXT
+                    }),
+                    text(format!("({})", songs.len()))
+                        .size(11)
+                        .color(theme::TEXT_DIM),
+                    space().width(Length::Fill),
+                    button(text("edit").size(11))
+                        .padding([2, 10])
+                        .on_press(Message::Setlist(M::Edit(name.clone())))
+                        .style(theme::chip(editing)),
+                    button(text(if is_active { "active" } else { "activate" }).size(11))
+                        .padding([2, 10])
+                        .on_press(Message::Setlist(M::Activate(name.clone())))
+                        .style(theme::chip(is_active)),
+                    button(text("✕").size(11))
+                        .padding([2, 9])
+                        .on_press(Message::Setlist(M::Delete(name.clone())))
+                        .style(theme::action),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            );
+        }
+
+        let mut editor = column![].spacing(6);
+        if let Some(list) = &sm.editing
+            && let Some(songs) = sl.lists.get(list)
+        {
+            editor = editor.push(
+                row![
+                    text(format!("Editing “{list}”"))
+                        .size(13)
+                        .color(theme::TEXT_BRIGHT),
+                    space().width(Length::Fill),
+                    button(text("+ add current preset").size(11))
+                        .padding([3, 12])
+                        .on_press_maybe(
+                            self.session
+                                .current_preset()
+                                .map(|_| Message::Setlist(M::AddCurrent))
+                        )
+                        .style(theme::action),
+                ]
+                .align_y(iced::Alignment::Center),
+            );
+            if songs.is_empty() {
+                editor = editor.push(
+                    text("empty — add the current preset")
+                        .size(11)
+                        .color(theme::TEXT_DIM),
+                );
+            }
+            let last = songs.len().saturating_sub(1);
+            for (i, song) in songs.iter().enumerate() {
+                editor = editor.push(
+                    row![
+                        text(format!("{}.", i + 1))
+                            .size(12)
+                            .color(theme::TEXT_DIM)
+                            .width(Length::Fixed(24.0)),
+                        text(song.clone()).size(13).color(theme::TEXT),
+                        space().width(Length::Fill),
+                        button(text("▲").size(11))
+                            .padding([2, 8])
+                            .on_press_maybe((i > 0).then_some(Message::Setlist(M::MoveUp(i))))
+                            .style(theme::action),
+                        button(text("▼").size(11))
+                            .padding([2, 8])
+                            .on_press_maybe((i < last).then_some(Message::Setlist(M::MoveDown(i))))
+                            .style(theme::action),
+                        button(text("✕").size(11))
+                            .padding([2, 9])
+                            .on_press(Message::Setlist(M::RemoveAt(i)))
+                            .style(theme::action),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+        }
+
+        let has_preset = self.active_preset.is_some();
+        let trim = row![
+            text("LOUDNESS TRIM").size(11).color(theme::TEXT_DIM),
+            text(format!(
+                "{}: {:+.1} dB",
+                self.active_preset.as_deref().unwrap_or("(no preset)"),
+                self.session.master_trim_db(),
+            ))
+            .size(12)
+            .color(theme::TEXT),
+            text(format!(
+                "target {:.0} LUFS",
+                self.session.levels().target_lufs
+            ))
+            .size(11)
+            .color(theme::TEXT_DIM),
+            space().width(Length::Fill),
+            button(text("−0.5").size(11))
+                .padding([2, 10])
+                .on_press_maybe(has_preset.then_some(Message::TrimNudge(-0.5)))
+                .style(theme::action),
+            button(text("+0.5").size(11))
+                .padding([2, 10])
+                .on_press_maybe(has_preset.then_some(Message::TrimNudge(0.5)))
+                .style(theme::action),
+            button(text("reset").size(11))
+                .padding([2, 10])
+                .on_press_maybe(has_preset.then_some(Message::TrimReset))
+                .style(theme::action),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let body = column![
+            header,
+            active_line,
+            create,
+            text("LISTS").size(11).color(theme::TEXT_DIM),
+            lists,
+            editor,
+            trim,
+        ]
+        .spacing(14)
+        .padding(4);
+
+        container(scrollable(body))
+            .style(theme::panel)
+            .padding(12)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
     fn settings_view<'a>(&'a self, draft: &'a SettingsDraft) -> Element<'a, Message> {
         let body = column![
             text("AUDIO I/O").size(11).color(theme::TEXT_DIM),

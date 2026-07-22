@@ -56,6 +56,11 @@ commands:
   song mix <0-100>             backing-track level (percent)
   song seek <0.0-1.0>          jump to a fraction of the track
   song loop <a> <b>            A-B loop in seconds (no args clears it)
+  setlist                      list setlists (▶ = active)
+  setlist <name>|off           activate a setlist / back to sorted order
+  setlist add <list> <preset>  append a preset to a setlist (creates it)
+  setlist delete <list>        remove a setlist
+  trim [<db>|off]              show/set this preset's loudness trim (levels.json)
   on <slot> / off <slot>       enable / bypass a pedal (crossfaded)
   record start|stop            record DI + wet WAVs (re-amp with `render`)
   list                         pedals, values, and loaded assets
@@ -595,6 +600,62 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                     "■"
                 },
             ),
+        },
+        Some("setlist") | Some("setlists") => {
+            let show = |r: Result<String, String>| match r {
+                Ok(m) => println!("  {m}"),
+                Err(e) => println!("  error: {e}"),
+            };
+            match parts.next() {
+                None | Some("list") | Some("ls") => {
+                    let sl = session.setlists();
+                    if sl.lists.is_empty() {
+                        println!("  no setlists — `setlist add <list> <preset>`");
+                    } else {
+                        for (name, presets) in &sl.lists {
+                            let mark = if sl.active.as_deref() == Some(name.as_str()) {
+                                "▶"
+                            } else {
+                                " "
+                            };
+                            let body = if presets.is_empty() {
+                                "(empty)".to_string()
+                            } else {
+                                presets.join(", ")
+                            };
+                            println!("  {mark} {name} — {body}");
+                        }
+                    }
+                }
+                Some("off") => show(session.set_active_setlist(None)),
+                Some("add") => match (parts.next(), parts.next()) {
+                    (Some(list), Some(preset)) => show(session.setlist_add(list, preset)),
+                    _ => println!("  usage: setlist add <list> <preset>"),
+                },
+                Some("delete") | Some("del") | Some("rm") => match parts.next() {
+                    Some(list) => show(session.setlist_delete(list)),
+                    None => println!("  usage: setlist delete <list>"),
+                },
+                // `setlist <name>` activates it.
+                Some(name) => show(session.set_active_setlist(Some(name))),
+            }
+        }
+        Some("trim") => match session.current_preset().map(str::to_string) {
+            None => println!("  no preset loaded — load one first"),
+            Some(name) => match parts.next() {
+                None => println!("  {name:?} trim {:+.1} dB", session.master_trim_db()),
+                Some("off") | Some("clear") => match session.set_preset_trim(&name, None) {
+                    Ok(m) => println!("  {m}"),
+                    Err(e) => println!("  error: {e}"),
+                },
+                Some(db) => match db.parse::<f32>() {
+                    Ok(v) => match session.set_preset_trim(&name, Some(v)) {
+                        Ok(m) => println!("  {m}"),
+                        Err(e) => println!("  error: {e}"),
+                    },
+                    Err(_) => println!("  not a number: {db}"),
+                },
+            },
         },
         Some(other) => println!("  unknown command {other:?} — try `help`"),
     }

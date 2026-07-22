@@ -33,6 +33,9 @@ use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{ChainHandle, RecordTapState, build_chain};
 
+use crate::leveling::Levels;
+use crate::setlist::{self, Setlists};
+
 use crate::recorder::{RecStatus, RecSummary, Recorder};
 
 // The ~/.lion-heart disk layout lives in lh-assets, shared with the plugin
@@ -275,6 +278,12 @@ pub struct Session {
     /// consumers; a take does not survive a device restart (a fresh session
     /// gets a fresh recorder, and the old one finalizes its WAV on drop).
     recorder: Recorder,
+    /// Named setlists (PRD 016) — app-global, disk-backed. When one is active
+    /// it drives prev/next and MIDI Program Change through its order.
+    setlists: Setlists,
+    /// Per-preset loudness trims (PRD 016) — app-global, disk-backed; applied
+    /// to the output-stage master trim on preset load.
+    levels: Levels,
 }
 
 impl Drop for Session {
@@ -1163,6 +1172,11 @@ impl Session {
             song_peaks: Vec::new(),
             player_join: Some(player_join),
             recorder,
+            // App-global, disk-backed (PRD 016): reloaded on every start, and
+            // every mutation saves immediately, so a device restart preserves
+            // them without threading through CarryOver.
+            setlists: Setlists::load(),
+            levels: Levels::load(),
         })
     }
 
@@ -1691,14 +1705,13 @@ impl Session {
                 Ok(mut msgs) => lines.append(&mut msgs),
                 Err(e) => lines.push(format!("midi: preset {name:?}: {e}")),
             },
-            lh_midi::Action::LoadPresetIndex(index) => match list_presets().get(index as usize) {
-                Some(name) => {
-                    let name = name.clone();
-                    match self.load_preset(&name) {
-                        Ok(mut msgs) => lines.append(&mut msgs),
-                        Err(e) => lines.push(format!("midi: preset {name:?}: {e}")),
-                    }
-                }
+            lh_midi::Action::LoadPresetIndex(index) => match self.preset_for_pc(index as usize) {
+                // The active setlist (if any) drives the walk; otherwise the
+                // sorted directory — the existing cross-binary contract (PRD 016).
+                Some(name) => match self.load_preset(&name) {
+                    Ok(mut msgs) => lines.append(&mut msgs),
+                    Err(e) => lines.push(format!("midi: preset {name:?}: {e}")),
+                },
                 None => lines.push(format!("midi: no preset at PC {index}")),
             },
             lh_midi::Action::SetParam {
@@ -2356,6 +2369,11 @@ impl Session {
         save_config(&self.config);
     }
 
+    /// The name of the most recently loaded preset, if any.
+    pub fn current_preset(&self) -> Option<&str> {
+        self.config.last_preset.as_deref()
+    }
+
     /// Persist the applied I/O configuration (GUI settings panel). These
     /// become the defaults for the next launch; explicit CLI flags still win.
     pub fn remember_io(&mut self, opts: &SessionOpts) {
@@ -2630,12 +2648,184 @@ impl Session {
             self.chain.order_handles().join(" → ")
         ));
         self.remember_preset(name);
+        // Apply this preset's loudness trim to the output-stage master trim
+        // (PRD 016) — 0 dB if none is stored.
+        self.apply_preset_level(name);
         // Every param may have moved out from under a pedal: pickup-gated
         // controllers must re-engage before they speak again (PRD 008).
         self.midi_desync_all();
         // A fresh board rebuilds any looper slots empty (PRD 013 LED mirror).
         self.looper_leds.clear();
         Ok(lines)
+    }
+
+    /// Apply the stored loudness trim for `name` to the output-stage master
+    /// trim (PRD 016). No stored trim → 0 dB (unity).
+    fn apply_preset_level(&mut self, name: &str) {
+        let trim = self.levels.trim_db(name);
+        let _ = self.chain.set_master_trim_db(trim);
+    }
+
+    // --- Setlists & loudness leveling (PRD 016) --------------------------
+
+    /// The preset a MIDI Program Change selects: the active setlist's n-th
+    /// entry (clamped), else the n-th sorted preset (the zero-config
+    /// cross-binary contract the plugin also honors). `None` only when there
+    /// is nothing to select.
+    pub fn preset_for_pc(&self, index: usize) -> Option<String> {
+        match self.setlists.active_order() {
+            Some(order) => setlist::preset_at_pc(order, index).map(str::to_string),
+            None => list_presets().get(index).cloned(),
+        }
+    }
+
+    /// The preset `delta` steps from `current` in the active navigation order
+    /// (the active setlist, else the sorted directory), clamped to the ends.
+    pub fn adjacent_preset(&self, current: &str, delta: isize) -> Option<String> {
+        match self.setlists.active_order() {
+            Some(order) => setlist::step(order, current, delta).map(str::to_string),
+            None => setlist::step(&list_presets(), current, delta).map(str::to_string),
+        }
+    }
+
+    /// The setlists model (GUI/REPL read).
+    pub fn setlists(&self) -> &Setlists {
+        &self.setlists
+    }
+
+    /// The active setlist name plus the 1-based position of `current` within
+    /// it and the list length, for a live "setlist · 3/12" readout. `None`
+    /// when no setlist is active.
+    pub fn setlist_position(&self, current: &str) -> Option<(String, usize, usize)> {
+        let name = self.setlists.active.clone()?;
+        let order = self.setlists.active_order()?;
+        let pos = setlist::position(order, current)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        Some((name, pos, order.len()))
+    }
+
+    /// Activate a setlist by name (must exist), or `None` to fall back to the
+    /// sorted directory. Persists.
+    pub fn set_active_setlist(&mut self, name: Option<&str>) -> Result<String, String> {
+        match name {
+            Some(n) => {
+                if !self.setlists.lists.contains_key(n) {
+                    return Err(format!("no setlist named {n:?}"));
+                }
+                self.setlists.active = Some(n.to_string());
+                self.setlists.save();
+                Ok(format!("setlist {n:?} active"))
+            }
+            None => {
+                self.setlists.active = None;
+                self.setlists.save();
+                Ok("setlist off — sorted directory".into())
+            }
+        }
+    }
+
+    /// Create an empty setlist `name`. Persists. Errors if it already exists.
+    pub fn setlist_create(&mut self, name: &str) -> Result<String, String> {
+        if name.trim().is_empty() {
+            return Err("setlist name required".into());
+        }
+        if self.setlists.lists.contains_key(name) {
+            return Err(format!("setlist {name:?} already exists"));
+        }
+        self.setlists.lists.insert(name.to_string(), Vec::new());
+        self.setlists.save();
+        Ok(format!("created setlist {name:?}"))
+    }
+
+    /// Append `preset` to setlist `list` (created if new). Persists.
+    pub fn setlist_add(&mut self, list: &str, preset: &str) -> Result<String, String> {
+        if list.is_empty() {
+            return Err("setlist name required".into());
+        }
+        let entry = self.setlists.lists.entry(list.to_string()).or_default();
+        entry.push(preset.to_string());
+        let n = entry.len();
+        self.setlists.save();
+        Ok(format!("added {preset:?} to {list:?} (#{n})"))
+    }
+
+    /// Delete setlist `list` (deactivating it if active). Persists.
+    pub fn setlist_delete(&mut self, list: &str) -> Result<String, String> {
+        if self.setlists.lists.remove(list).is_none() {
+            return Err(format!("no setlist named {list:?}"));
+        }
+        if self.setlists.active.as_deref() == Some(list) {
+            self.setlists.active = None;
+        }
+        self.setlists.save();
+        Ok(format!("removed setlist {list:?}"))
+    }
+
+    /// Move the entry at `index` within setlist `list` by `delta` (reorder).
+    /// Persists. Clamped to the list bounds.
+    pub fn setlist_move(&mut self, list: &str, index: usize, delta: isize) -> Result<(), String> {
+        let entries = self
+            .setlists
+            .lists
+            .get_mut(list)
+            .ok_or_else(|| format!("no setlist named {list:?}"))?;
+        if index >= entries.len() {
+            return Err("index out of range".into());
+        }
+        let target = (index as isize + delta).clamp(0, entries.len() as isize - 1) as usize;
+        if target != index {
+            let item = entries.remove(index);
+            entries.insert(target, item);
+            self.setlists.save();
+        }
+        Ok(())
+    }
+
+    /// Remove the entry at `index` from setlist `list`. Persists.
+    pub fn setlist_remove_at(&mut self, list: &str, index: usize) -> Result<(), String> {
+        let entries = self
+            .setlists
+            .lists
+            .get_mut(list)
+            .ok_or_else(|| format!("no setlist named {list:?}"))?;
+        if index >= entries.len() {
+            return Err("index out of range".into());
+        }
+        entries.remove(index);
+        self.setlists.save();
+        Ok(())
+    }
+
+    /// The current output-stage master loudness trim (dB).
+    pub fn master_trim_db(&self) -> f32 {
+        self.chain.master_trim_db()
+    }
+
+    /// The stored loudness target + per-preset trims (GUI/REPL read).
+    pub fn levels(&self) -> &Levels {
+        &self.levels
+    }
+
+    /// Set (or clear, with `None`) the current preset's loudness trim, persist
+    /// it to `levels.json`, and apply it live. Clamped to the trim range.
+    pub fn set_preset_trim(&mut self, name: &str, trim_db: Option<f32>) -> Result<String, String> {
+        let applied = match trim_db {
+            Some(db) => {
+                let db = db.clamp(-crate::leveling::MAX_TRIM_DB, crate::leveling::MAX_TRIM_DB);
+                self.levels.trims.insert(name.to_string(), db);
+                db
+            }
+            None => {
+                self.levels.trims.remove(name);
+                0.0
+            }
+        };
+        self.levels.save();
+        self.chain
+            .set_master_trim_db(applied)
+            .map_err(|e| e.to_string())?;
+        Ok(format!("{name:?} trim {applied:+.1} dB"))
     }
 
     fn apply_asset(
