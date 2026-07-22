@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const PRESET_SCHEMA_VERSION: u32 = 7;
+pub const PRESET_SCHEMA_VERSION: u32 = 8;
 
 /// Snapshot slot letters, in order (PRD 009). A preset stores at most this
 /// many scenes; the GUI shows one chip per letter.
@@ -93,6 +93,13 @@ pub const REVERB_PEDALS: [&str; 12] = [
     "nonlinear",
     "reflections",
 ];
+
+/// The compressor family's pedal keys in registry order (PRD 015). `vca`
+/// leads because it *is* the old single `comp` pedal: the v7→v8 migration
+/// renames the old `comp` pedal onto it, and sparse slots (no pedal recorded)
+/// default to the family's first pedal — both paths must land on the old
+/// sound. A test in `lh-dsp` pins this to `comp::FAMILY.pedals`.
+pub const COMP_PEDALS: [&str; 3] = ["vca", "opto", "fet"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Preset {
@@ -228,6 +235,9 @@ impl Preset {
         }
         if preset.schema_version < 5 {
             migrate_v4_reverb_pedal(&mut preset);
+        }
+        if preset.schema_version < 8 {
+            migrate_v7_comp_pedal(&mut preset);
         }
         preset.schema_version = PRESET_SCHEMA_VERSION;
         Ok(preset)
@@ -370,6 +380,27 @@ fn migrate_v4_reverb_pedal(preset: &mut Preset) {
     const OLD: &str = "reverb";
     let new = REVERB_PEDALS[0];
     for slot in preset.chain.iter_mut().filter(|s| s.key == "reverb") {
+        if slot.pedal.as_deref() == Some(OLD) || slot.pedal.is_none() {
+            slot.pedal = Some(new.to_string());
+        }
+        if let Some(values) = slot.pedals.remove(OLD) {
+            slot.pedals.entry(new.to_string()).or_insert(values);
+        }
+    }
+}
+
+/// v7 → v8 (PRD 015): the compressor slot became a multi-pedal family, so its
+/// lone `comp` pedal is renamed to the family's first pedal, `vca`. That
+/// faceplate is a superset — `threshold`/`ratio`/`attack`/`release`/`makeup`
+/// carry over verbatim (same keys, same ranges), the new shared knobs
+/// (`blend`/`sc_hpf`) default to neutral (fully-compressed / bypassed
+/// sidechain) — so old files sound the same. Runs for every file below v8
+/// (v5–v7 gained only `#[serde(default)]` fields, no comp change) so any
+/// `comp`-keyed pedal values land on `vca` regardless of intervening versions.
+fn migrate_v7_comp_pedal(preset: &mut Preset) {
+    const OLD: &str = "comp";
+    let new = COMP_PEDALS[0];
+    for slot in preset.chain.iter_mut().filter(|s| s.key == "comp") {
         if slot.pedal.as_deref() == Some(OLD) || slot.pedal.is_none() {
             slot.pedal = Some(new.to_string());
         }
@@ -739,5 +770,72 @@ mod tests {
         assert_eq!(p.chain[0].pedal.as_deref(), Some("shimmer"));
         assert_eq!(p.chain[0].pedals["shimmer"]["amount"], 0.6);
         assert_eq!(p.chain[0].pedals["spring"]["dwell"], 0.4);
+    }
+
+    #[test]
+    fn v7_comp_pedal_migrates_to_vca() {
+        // The old single `comp` pedal becomes the `vca` voice of the new
+        // family, its threshold/ratio/attack/release/makeup intact — so the
+        // compressor sounds identical.
+        let v7 = r#"{
+            "schema_version": 7,
+            "name": "squash",
+            "chain": [{"key": "comp", "pedal": "comp",
+                       "pedals": {"comp": {"threshold": -18.0, "ratio": 6.0,
+                                           "attack": 8.0, "release": 200.0,
+                                           "makeup": 4.0}}}]
+        }"#;
+        let p = Preset::from_json(v7).unwrap();
+        assert_eq!(p.schema_version, PRESET_SCHEMA_VERSION);
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("vca"));
+        assert!(!slot.pedals.contains_key("comp"), "old key renamed");
+        let v = &slot.pedals["vca"];
+        assert_eq!(v["threshold"], -18.0);
+        assert_eq!(v["ratio"], 6.0);
+        assert_eq!(v["attack"], 8.0);
+        assert_eq!(v["release"], 200.0);
+        assert_eq!(v["makeup"], 4.0);
+    }
+
+    #[test]
+    fn v7_sparse_comp_slot_selects_vca() {
+        // A bare comp slot (no pedal, no values) still lands on vca.
+        let v7 = r#"{"schema_version": 7, "name": "s", "chain": [{"key": "comp"}]}"#;
+        let p = Preset::from_json(v7).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("vca"));
+    }
+
+    #[test]
+    fn old_comp_values_migrate_through_to_vca() {
+        // A v3 file (comp already per-pedal keyed by the family name) survives
+        // every intervening version and lands on vca with its values.
+        let v3 = r#"{
+            "schema_version": 3,
+            "name": "old squash",
+            "chain": [{"key": "comp",
+                       "pedals": {"comp": {"threshold": -30.0, "ratio": 3.0}}}]
+        }"#;
+        let p = Preset::from_json(v3).unwrap();
+        let slot = &p.chain[0];
+        assert_eq!(slot.pedal.as_deref(), Some("vca"));
+        assert_eq!(slot.pedals["vca"]["threshold"], -30.0);
+        assert_eq!(slot.pedals["vca"]["ratio"], 3.0);
+    }
+
+    #[test]
+    fn v8_comp_slots_are_not_remapped() {
+        // Native v8: the opto/fet voices survive untouched.
+        let v8 = r#"{
+            "schema_version": 8,
+            "name": "new",
+            "chain": [{"key": "comp", "pedal": "opto",
+                       "pedals": {"opto": {"peak_reduction": 0.6},
+                                  "fet": {"ratio": 3.0}}}]
+        }"#;
+        let p = Preset::from_json(v8).unwrap();
+        assert_eq!(p.chain[0].pedal.as_deref(), Some("opto"));
+        assert_eq!(p.chain[0].pedals["opto"]["peak_reduction"], 0.6);
+        assert_eq!(p.chain[0].pedals["fet"]["ratio"], 3.0);
     }
 }

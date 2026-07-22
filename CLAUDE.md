@@ -723,7 +723,49 @@ bench). 11 DSP tests (drive-harmonics, bias even-harmonics, sag compresses loud
 bounded/finite, multi-rate/block, near-unity defaults, click-free sweep, ships
 bypassed) + existing registry/plugin/theme pins stay green (381 total).
 
-Pending user verification on the Mac: pedal switching by ear (per-pedal
+**M18 (comp family) — code landed (uncommitted).** Specced in PRD 015, recorded
+as **ADR 025**. 5th item of the 2026-07-20 roadmap. The `comp` slot became a
+**three-pedal family** (`vca`/`opto`/`fet`, family key unchanged, one file per
+pedal under `dynamics/comp/`, delay/reverb pattern): one shared detector →
+gain-computer engine reading a per-voice `VoiceDef` (knee, ratio law, release
+law) in the hot loop, no per-sample vtable. **vca** = the old digital VCA
+verbatim (full Threshold/Ratio/Attack/Release, hard knee — **bit-exact at its
+defaults** bar a new denormal flush on the detector envelope, RT-hygiene the old
+code lacked); **opto** (LA-2A) = fixed 10 ms attack + **program-dependent**
+two-stage release (100 ms→1.5 s, sliding by GR depth) + **rising** ratio
+(2.5→8:1, leveling→limiting) + soft 12 dB knee, face = Peak Reduction/Gain only;
+**fet** (1176) = microsecond attack (20–800 µs) + hard knee + **stepped** ratio
+(4/8/12/20/**All**, all-buttons drops threshold −8 dB for the pump). Two **shared
+knobs** on every voice: `blend` (parallel/NY comp, `dry·(1−b)+comp·b`, default
+1.0) and `sc_hpf` (sidechain-**detector**-only high-pass 20–300 Hz, bypassed at
+the 20 Hz floor). Preset **schema v7→v8** (`migrate_v7_comp_pedal` renames the
+old `comp` pedal → `vca`, gated `<8` so a `comp` slot from any older version
+lands right; `COMP_PEDALS` pins the registry; sparse slots → vca). **DEFAULT_CHAIN
+unchanged** (comp stays after gate/filter, before drive; `default_active("comp")`
+still true = ships engaged). Deltas from PRD (ADR 025): schema is **7→8 not the
+PRD's 6→7** (dual-IR/snapshots already took v6/v7); **fet keeps a `threshold`
+knob** (models the 1176's INPUT-into-fixed-threshold — a compressor with no
+threshold is undialable). Engine/session/**plugin zero code changes** (multi-pedal
+path + generic `from_families` expansion cover it); theme gained opto gold / fet
+steel liveries (vca keeps family blue), distinct-livery pin now 8 families.
+**Plugin pre-v0.1 id break**: `comp_threshold`→`comp_vca_threshold`,
+`comp_opto_*`/`comp_fet_*` + `comp_pedal` selector appear — re-run clap-validator.
+~0.56 µs vca/fet, ~1.23 µs opto per block (worst 0.092 %, under the 0.15 % bar;
+`comp_{vca,opto,fet}` benches). 14 DSP tests (registry pin, the 4 preserved vca
+curve/unity/ratio/makeup tests = migration parity, blend-0 bit-transparent,
+sc_hpf spares lows, fet-faster-than-opto attack, opto program-dependent release,
+fet all-buttons slams+bounded, topologies distinct, every-voice fuzz +
+silence-in-out, pedal-switch finite, multi-rate) + 4 lh-core migration tests.
+
+Pending user verification on the Mac: **the three compressors by ear** (vca
+transparent leveling unchanged vs old comp presets; opto slow/round/sticky with
+the program-dependent release breathing on a fading note; fet fast attack biting
+transients, all-buttons-in pumping; `blend` parallel comp keeping the pick
+transient while squashing under it; `sc_hpf` up — a bass note stops pumping the
+whole mix; an old `comp` preset saved/reloaded still sounds the same as vca;
+plugin ids re-checked — `comp_threshold`→`comp_vca_threshold` rename plus
+`comp_opto_*`/`comp_fet_*` + `comp_pedal`, pre-v0.1 break),
+pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
 **monster5150 by ear** (chug tightness, sustain, fizz level, Low-knob
