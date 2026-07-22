@@ -7,6 +7,23 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-22 (M20 power amp) — Linux dev container (relative)
+
+The hand-written valve power stage (PRD 017 / ADR 024): a 4× oversampled
+push-pull waveshaper with sag, bracketed by presence/depth shelves and a
+transformer stage. Its cost sits with the drive family's 4× pedals — the
+oversampler round trip dominates, the sag/shelves are cheap. Benched driven
+into saturation (its worst case); **zero cost while bypassed**, which is how
+it ships (`default_active("power") == false`). The reference drive rows are
+from the same run for calibration (this box runs hotter than the Apple-Silicon
+sections below).
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| power_4x_oversampled               | ~12.5 µs    | 0.94 %                 |
+| drive_ts9_4x_oversampled (ref)     | ~11.5 µs    | 0.86 %                 |
+| drive_monster5150_4x (ref)         | ~12.5 µs    | 0.94 %                 |
+
 ## 2026-07-21 (practice tools: song player) — Linux dev container (relative)
 
 The song player (PRD 019 Phase 3 / ADR 022) is a WSOLA varispeed stage plus a

@@ -47,6 +47,10 @@ const FILTER: Color = Color::from_rgb(0.72, 0.83, 0.32);
 const WAH: Color = Color::from_rgb(0.76, 0.79, 0.84);
 const COMP: Color = Color::from_rgb(0.44, 0.64, 0.94);
 const AMP: Color = Color::from_rgb(1.0, 0.70, 0.36);
+/// Hot valve-glow orange — the power stage's pushed output tubes. Deliberately
+/// the most saturated of the warm trio it flanks (softer amber `AMP`, redder
+/// `LIMITER`) so the amp→power pair reads as neighbours without merging.
+const POWER: Color = Color::from_rgb(0.93, 0.52, 0.20);
 const EQ: Color = Color::from_rgb(0.36, 0.77, 0.72);
 /// The parametric pedal wears analyzer ice; the 3-band keeps the family teal.
 const PARAMETRIC: Color = Color::from_rgb(0.58, 0.86, 0.98);
@@ -126,6 +130,7 @@ pub fn family_color(key: &str) -> Color {
         "filter" => FILTER,
         "comp" => COMP,
         "amp" => AMP,
+        "power" => POWER,
         "eq" => EQ,
         "mod" => MODULATION,
         "delay" => DELAY,

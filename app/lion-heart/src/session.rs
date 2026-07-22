@@ -27,6 +27,7 @@ use lh_dsp::filter::Filter;
 use lh_dsp::looper::Looper;
 use lh_dsp::modulation::Modulation;
 use lh_dsp::pitch::Pitch;
+use lh_dsp::power::PowerAmp;
 use lh_dsp::practice::{DrumMachine, Metronome};
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
@@ -899,7 +900,7 @@ pub struct FamilyEntry {
 /// pins the subsequence relation
 /// and the invariants; the plugin's fixed chain is pinned to `DEFAULT_CHAIN`
 /// directly.
-pub static FAMILY_REGISTRY: [FamilyEntry; 14] = [
+pub static FAMILY_REGISTRY: [FamilyEntry; 15] = [
     FamilyEntry {
         desc: &lh_dsp::dynamics::gate::FAMILY,
         asset: None,
@@ -936,6 +937,13 @@ pub static FAMILY_REGISTRY: [FamilyEntry; 14] = [
             rebuilt.0 = true;
             Box::new(amp)
         },
+    },
+    // Hand-written valve power stage (PRD 017): after the amp (NAM preamp),
+    // before the cab. Ships bypassed on the default board (see `default_active`).
+    FamilyEntry {
+        desc: &lh_dsp::power::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(PowerAmp::new()),
     },
     FamilyEntry {
         desc: &lh_dsp::eq::FAMILY,

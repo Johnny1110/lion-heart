@@ -40,6 +40,7 @@ use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
 use lh_dsp::filter::Filter;
 use lh_dsp::modulation::Modulation;
+use lh_dsp::power::PowerAmp;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 use lh_engine::{Chain, ChainHandle, build_chain};
@@ -85,6 +86,7 @@ impl Default for LionHeartPlugin {
             Box::new(Compressor::new()),
             Box::new(Drive::new()),
             Box::new(nam_amp),
+            Box::new(PowerAmp::new()),
             Box::new(Eq::new()),
             Box::new(Modulation::new()),
             Box::new(Delay::new()),

@@ -16,6 +16,7 @@
 //! - [`looper`] — record / overdub / undo loop pedal (a chain slot)
 //! - [`modulation`] — chorus / flanger / phaser / tremolo (one shared voice)
 //! - [`pitch`] — octave / interval shifters (granular, one shared engine)
+//! - [`power`] — hand-written valve power-amp stage (sag, push-pull saturation)
 //! - [`time`] — delay, reverb
 //! - [`cab`] — cabinet IR convolution
 //! - [`tuner`] — pitch analysis (not an effect; feeds the GUI)
@@ -31,6 +32,7 @@ pub mod filter;
 pub mod looper;
 pub mod modulation;
 pub mod pitch;
+pub mod power;
 pub mod practice;
 pub mod testutil;
 pub mod time;

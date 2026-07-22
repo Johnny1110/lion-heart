@@ -19,18 +19,23 @@ pub mod tempo;
 /// cannot drift apart.
 ///
 /// `filter` sits before the compressor on purpose: its envelope follower
-/// feeds on playing dynamics, which the compressor exists to squash.
-pub const DEFAULT_CHAIN: [&str; 11] = [
-    "gate", "filter", "comp", "drive", "amp", "eq", "mod", "delay", "reverb", "cab", "limiter",
+/// feeds on playing dynamics, which the compressor exists to squash. `power`
+/// (the hand-written valve power stage, PRD 017) sits after `amp` and before
+/// `cab` — post-preamp, pre-speaker, exactly where a real power section lives.
+pub const DEFAULT_CHAIN: [&str; 12] = [
+    "gate", "filter", "comp", "drive", "amp", "power", "eq", "mod", "delay", "reverb", "cab",
+    "limiter",
 ];
 
 /// Whether a family's slot ships **active** on the default board. Almost
 /// everything does — their defaults are transparent (gate low, comp gentle,
-/// limiter above the music). A filter has no transparent knob position (it
-/// colors the signal wherever it sits), so it ships bypassed and lights up
-/// when the player engages it (PRD 007).
+/// limiter above the music). Two families ship **bypassed**: a `filter` has no
+/// transparent knob position (it colors the signal wherever it sits) and lights
+/// up when the player engages it (PRD 007); the `power` stage would
+/// double-colour a full-amp NAM capture that already contains a power section,
+/// so preamp-only players light it deliberately (PRD 017).
 pub fn default_active(family_key: &str) -> bool {
-    family_key != "filter"
+    !matches!(family_key, "filter" | "power")
 }
 
 /// Decibels → linear amplitude.

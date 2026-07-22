@@ -690,6 +690,39 @@ render processed-output/rate-mismatch/tail/passthrough (4), recorder
 timestamp/civil-date/ring-capacity (3). Zero DSP/RT cost when idle; the disk
 thread does all I/O. **Unblocks PRD 016** (LUFS leveling reuses `render`).
 
+**M20 (power amp) — code landed (uncommitted).** Specced in PRD 017, recorded as
+**ADR 024**. 7th item of the 2026-07-20 roadmap; supplies the post-preamp feel
+the (preamp-only) NAM captures miss. New **single-pedal family `power`** in
+`lh-dsp/src/power.rs`, placed in `DEFAULT_CHAIN` **after `amp`, before `cab`**
+(board **11→12**). Hand-written, 4× oversampled (drive family's `Oversampler4x`)
+per channel: presence high-shelf pre-emphasis → **push-pull asymmetric
+waveshaper** `supply·(tanh(g·x/supply + BIAS) − tanh(BIAS))` (fixed BIAS →
+even harmonics; the `supply` divide/multiply is the **sag** — a drooping rail
+clips earlier and lowers the ceiling → dynamic compression + "give") →
+output transformer (≈35 Hz low-cut doubling as DC blocker + gentle `tanh` core)
+→ depth low-shelf resonance → master (`drive_law` level). **One linked sag
+detector** feeds both channels (shared supply, gate/comp precedent); stereo
+otherwise independent. Faceplate 5 knobs `drive/sag/presence/depth/master`
+(all 0..10; presence/depth **boost-only**). **Ships bypassed**
+(`default_active("power")==false`, 2nd family after filter — a full-amp capture
+already has a power stage; the engine skips a settled-bypassed slot's `process`,
+so it's **zero CPU / zero latency** until engaged, ~24-sample OS latency when
+on, like drive). **`MAX_SLOTS` 12→16** (board fills 12/12; headroom for `add` +
+off-board pitch/looper/acoustic — engine fixed arrays just grow, no logic
+change). **No preset schema bump** (new family = vocabulary; old presets
+reconcile the absent slot away). `FAMILY_REGISTRY` 14→15 (power between amp/eq),
+plugin fixed chain grows one slot, theme adds a valve-glow orange livery.
+Deltas from PRD (ADR 024): **depth is post-waveshaper** (resonance is a
+post-tube/transformer/speaker phenomenon; presence stays pre = NFB high-end
+lift), presence/depth **boost-only 0..10** (real amp panel, not ±dB). **Plugin
+pre-v0.1 additive id break**: `power_{drive,sag,presence,depth,master}` +
+`power_active` (default off) appear, no renames — re-run clap-validator. ~12.5 µs
+/ block driven (0.94 %, on par with the drive 4× pedals; `power_4x_oversampled`
+bench). 11 DSP tests (drive-harmonics, bias even-harmonics, sag compresses loud
+> quiet, presence/depth shelves, oversample alias floor, DC-block, slammed
+bounded/finite, multi-rate/block, near-unity defaults, click-free sweep, ships
+bypassed) + existing registry/plugin/theme pins stay green (381 total).
+
 Pending user verification on the Mac: pedal switching by ear (per-pedal
 values restored, faceplates correct), **red-charlie by ear** (crunch vs
 the other drives, bright low-gain edge, B/M/T reach, unity at defaults),
@@ -828,6 +861,15 @@ complete within `--tail`; render the same DI through two presets and hear the
 difference; a non-48 kHz DI errors clearly; a missing preset/file errors
 cleanly; confirm the render is amp-tone only — the machine's global EQ does not
 color it),
+**the power amp by ear** (it starts on the default board but **bypassed** — a
+full-amp NAM capture should sound unchanged until you light the LED; load a
+**preamp-only** capture and engage power: it should "come alive" — sag give on
+hard picking, push-pull fatness, presence adding top-end bite and depth adding
+low-end thump/resonance; roll the guitar volume back and feel the sag breathe;
+crank drive for power-amp saturation without fizz/aliasing; confirm double-
+stacking on a full-amp capture sounds worse — the reason it ships off; drag it
+before/after in the chain if you `add` a second one; plugin re-check — `power_*`
+params + `power_active` (off) appeared, pre-v0.1 additive id break),
 plus the standing M7 items
 (stereo width by ear, foot controller end-to-end, `--buffer 32` on hardware,
 RTL numbers into `docs/latency.md`). **v0.1 tagging is the user's call**
