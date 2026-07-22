@@ -46,6 +46,10 @@ const FILTER: Color = Color::from_rgb(0.72, 0.83, 0.32);
 /// hardware, not another green box.
 const WAH: Color = Color::from_rgb(0.76, 0.79, 0.84);
 const COMP: Color = Color::from_rgb(0.44, 0.64, 0.94);
+// Comp voices (PRD 015): vca keeps the clean family blue; opto wears warm
+// optical-tube gold (LA-2A), fet a fast steel grey (1176's silver faceplate).
+const COMP_OPTO: Color = Color::from_rgb(0.88, 0.66, 0.36);
+const COMP_FET: Color = Color::from_rgb(0.72, 0.75, 0.82);
 const AMP: Color = Color::from_rgb(1.0, 0.70, 0.36);
 /// Hot valve-glow orange — the power stage's pushed output tubes. Deliberately
 /// the most saturated of the warm trio it flanks (softer amber `AMP`, redder
@@ -164,6 +168,11 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
         "filter" => match pedal_key {
             "wah" => WAH,
             _ => FILTER, // autowah wears the family lime
+        },
+        "comp" => match pedal_key {
+            "opto" => COMP_OPTO,
+            "fet" => COMP_FET,
+            _ => COMP, // the vca voice wears the family blue
         },
         "eq" => match pedal_key {
             "parametric" => PARAMETRIC,
@@ -528,8 +537,9 @@ mod tests {
     /// cards.
     #[test]
     fn every_selectable_pedal_wears_its_own_livery() {
-        let families: [&lh_core::FamilyDesc; 7] = [
+        let families: [&lh_core::FamilyDesc; 8] = [
             &lh_dsp::drive::FAMILY,
+            &lh_dsp::dynamics::comp::FAMILY,
             &lh_dsp::filter::FAMILY,
             &lh_dsp::eq::FAMILY,
             &lh_dsp::modulation::FAMILY,

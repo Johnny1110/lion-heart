@@ -131,9 +131,12 @@ fn bench_effects(c: &mut Criterion) {
         .unwrap();
     bench_stereo!(group, "cab_ir_100ms", cab, buf, buf_r);
 
-    let mut comp = Compressor::new();
-    comp.prepare(SR);
-    bench_stereo!(group, "comp", comp, buf, buf_r);
+    for (index, pedal) in lh_dsp::dynamics::comp::FAMILY.pedals.iter().enumerate() {
+        let mut comp = Compressor::new();
+        comp.prepare(SR);
+        comp.select_pedal(index);
+        bench_stereo!(group, format!("comp_{}", pedal.key), comp, buf, buf_r);
+    }
 
     for (index, pedal) in lh_dsp::filter::FAMILY.pedals.iter().enumerate() {
         let mut filter = lh_dsp::filter::Filter::new();
