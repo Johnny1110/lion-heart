@@ -10,6 +10,7 @@ use lh_dsp::dynamics::Compressor;
 use lh_dsp::dynamics::NoiseGate;
 use lh_dsp::eq::Eq;
 use lh_dsp::modulation::Modulation;
+use lh_dsp::power::PowerAmp;
 use lh_dsp::time::Delay;
 use lh_dsp::time::Reverb;
 
@@ -55,6 +56,13 @@ fn bench_effects(c: &mut Criterion) {
             buf_r
         );
     }
+
+    // Power amp: 4× oversampled push-pull + sag, driven so the shaper is in
+    // its nonlinear region (its worst case).
+    let mut power = PowerAmp::new();
+    power.prepare(SR);
+    power.set_param(0, 0.8); // drive
+    bench_stereo!(group, "power_4x_oversampled", power, buf, buf_r);
 
     for (index, pedal) in lh_dsp::time::delay::FAMILY.pedals.iter().enumerate() {
         let mut delay = Delay::new();

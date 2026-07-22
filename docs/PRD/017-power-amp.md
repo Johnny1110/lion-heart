@@ -1,8 +1,14 @@
 # PRD 017: Power Amp 模擬 — 後級飽和、Sag 與喇叭壓縮
 
-狀態：**草案（待開發）**
+狀態：**已實作（ADR 024，2026-07-22）**
 日期：2026-07-20
 里程碑：M20（2026-07-20 路線圖第 7 項）
+
+> 實作落差（詳見 ADR 024）：(1) 無 preset schema bump（power = 新家族 = 新詞彙，
+> 舊 preset reconcile 掉缺席 slot，比照 filter/pitch）；(2) **depth 改後置**
+> ——presence 是負回授高頻臨場、留在削波前，depth/resonance 是後級/變壓器/喇叭
+> 的低頻共振、放在變壓器之後才真實（也避免低頻灌進削波器變糊）；(3) presence/
+> depth 為 **boost-only 0..10** 旋鈕（0 = 平），比照真實 amp 面板而非雙極 ±dB。
 關聯：白皮書 §5.3（NAM 音色核心）、PRD 002（動態鏈）、PRD 007（新家族
 + default_active 旗標前例）、drive 家族（oversample 前例）
 

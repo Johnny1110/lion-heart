@@ -32,8 +32,12 @@ use thiserror::Error;
 /// Engine-internal processing granularity. Device callbacks may hand us
 /// bigger blocks; `Chain::process` slices them down to this.
 pub const MAX_BLOCK: usize = 1024;
-/// Upper bound on chain length (fits the order message on the ring).
-pub const MAX_SLOTS: usize = 12;
+/// Upper bound on chain length (fits the order message on the ring). The
+/// default board is 12 slots since `power` landed (PRD 017); the headroom
+/// above that lets players `add` extra instances and the off-board families
+/// (pitch, looper, acoustic). The fixed-capacity slot/order arrays simply grow
+/// with this — no logic depends on the exact value.
+pub const MAX_SLOTS: usize = 16;
 const MSG_CAPACITY: usize = 256;
 /// Bypass toggles crossfade over this window instead of hard-switching.
 const BYPASS_FADE_MS: f32 = 10.0;
