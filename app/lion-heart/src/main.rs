@@ -1,9 +1,11 @@
 mod cli;
 mod commands;
 mod gui;
+mod leveling;
 mod recorder;
 mod render;
 mod session;
+mod setlist;
 mod song_loader;
 
 use anyhow::Result;
@@ -27,5 +29,6 @@ fn main() -> Result<()> {
         Some(Command::Latency(args)) => commands::latency::run(args),
         Some(Command::Jam(args)) => commands::jam::run(args),
         Some(Command::Render(args)) => commands::render::run(args),
+        Some(Command::Level(args)) => commands::level::run(args),
     }
 }

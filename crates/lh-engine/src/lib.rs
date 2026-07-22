@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use lh_core::global_eq::{BAND_COUNT, Band, GlobalEqState};
 use lh_core::preset::{SlotState, Snapshot, SnapshotSlot};
-use lh_core::{FamilyDesc, ParamDesc, ParamId, lin_to_db};
+use lh_core::{FamilyDesc, ParamDesc, ParamId, db_to_lin, lin_to_db};
 use lh_dsp::Effect;
 use lh_dsp::blocks::smooth::Smoothed;
 use lh_dsp::dynamics::Limiter;
@@ -99,6 +99,10 @@ pub enum EngineMsg {
     },
     /// Master toggle of the output-stage global EQ (crossfaded).
     SetEqActive(bool),
+    /// Output-stage master loudness trim (PRD 016): a smoothed linear gain
+    /// applied after the global EQ and before the safety limiter. The session
+    /// sets it per-preset from `levels.json`; `1.0` is bit-transparent.
+    SetMasterTrim(f32),
 }
 
 #[derive(Debug, Error)]
@@ -240,11 +244,20 @@ impl SpillLane {
 /// boosts too.
 const SAFETY_CEILING_DB: f32 = -0.3;
 
-/// Fixed output stage (PRD 003): chain → global EQ → safety limiter →
-/// spectrum tap. Runs after the master fade, so structure edits are already
-/// silent by the time they reach it.
+/// Master-trim smoothing time — a loudness trim only changes on preset load,
+/// so this just declicks that step.
+const MASTER_TRIM_SMOOTH_MS: f32 = 20.0;
+
+/// Fixed output stage (PRD 003): chain → global EQ → master trim → safety
+/// limiter → spectrum tap. Runs after the master fade, so structure edits are
+/// already silent by the time they reach it. The master trim (PRD 016) is a
+/// per-preset loudness offset; it sits before the safety limiter so an
+/// over-generous trim is still caught at −0.3 dBFS.
 struct OutputStage {
     eq: GlobalEq,
+    /// Per-preset loudness trim (PRD 016), a smoothed linear gain. `1.0`
+    /// (0 dB) multiplies bit-transparently.
+    trim: Smoothed,
     safety: Limiter,
     /// Post-stage mono sum for the GUI spectrum analyzer. Lock-free,
     /// drop-on-full: an unread tap must never stall the callback.
@@ -257,6 +270,7 @@ impl OutputStage {
     fn new() -> Self {
         Self {
             eq: GlobalEq::new(),
+            trim: Smoothed::new(1.0),
             safety: Limiter::new(),
             tap: None,
             mono: Vec::new(),
@@ -265,6 +279,8 @@ impl OutputStage {
 
     fn prepare(&mut self, sample_rate: u32) {
         self.eq.prepare(sample_rate);
+        self.trim.configure(MASTER_TRIM_SMOOTH_MS, sample_rate);
+        self.trim.snap_to_target();
         self.safety.prepare(sample_rate);
         // Look the ceiling up by key: a faceplate reorder must fail loudly
         // here (covered by engine tests), never silently misconfigure the
@@ -278,14 +294,25 @@ impl OutputStage {
         self.mono = vec![0.0; MAX_BLOCK];
     }
 
+    /// Set the master-trim target (linear gain). Smoothed to the new value.
+    fn set_trim(&mut self, gain: f32) {
+        self.trim.set_target(gain);
+    }
+
     fn reset(&mut self) {
         self.eq.reset();
+        self.trim.snap_to_target();
         self.safety.reset();
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
             self.eq.process(chunk_l, chunk_r);
+            for (l, r) in chunk_l.iter_mut().zip(chunk_r.iter_mut()) {
+                let g = self.trim.tick();
+                *l *= g;
+                *r *= g;
+            }
             self.safety.process(chunk_l, chunk_r);
             if let Some(tap) = &mut self.tap {
                 let n = chunk_l.len().min(self.mono.len()).min(tap.slots());
@@ -673,6 +700,9 @@ impl Chain {
                 Ok(EngineMsg::SetEqBand { band, state }) => {
                     self.output.eq.set_band(band as usize, state);
                 }
+                Ok(EngineMsg::SetMasterTrim(gain)) => {
+                    self.output.set_trim(gain);
+                }
                 Ok(EngineMsg::SetEqActive(on)) => {
                     self.output.eq.set_enabled(on);
                 }
@@ -873,6 +903,9 @@ pub struct ChainHandle {
     retired_rx: rtrb::Consumer<Box<dyn Effect>>,
     /// Output-stage global EQ shadow (PRD 003).
     eq: GlobalEqState,
+    /// Output-stage master loudness trim shadow, in dB (PRD 016). `0.0` =
+    /// unity. Environment, not tone — the session owns it from `levels.json`.
+    master_trim_db: f32,
     telemetry: Arc<Telemetry>,
 }
 
@@ -934,6 +967,22 @@ impl ChainHandle {
             .push(EngineMsg::SetEqActive(enabled))
             .map_err(|_| EngineError::QueueFull)?;
         self.eq.enabled = enabled;
+        Ok(())
+    }
+
+    /// The current output-stage master trim, in dB (PRD 016).
+    pub fn master_trim_db(&self) -> f32 {
+        self.master_trim_db
+    }
+
+    /// Set the output-stage master loudness trim in dB (PRD 016). Sent as a
+    /// linear gain to the audio thread and smoothed there; `0.0 dB` is
+    /// bit-transparent. The safety limiter still catches an over-generous trim.
+    pub fn set_master_trim_db(&mut self, trim_db: f32) -> Result<(), EngineError> {
+        self.tx
+            .push(EngineMsg::SetMasterTrim(db_to_lin(trim_db)))
+            .map_err(|_| EngineError::QueueFull)?;
+        self.master_trim_db = trim_db;
         Ok(())
     }
 
@@ -1685,6 +1734,7 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
             next_free: count % MAX_SLOTS,
             retired_rx,
             eq: GlobalEqState::default(),
+            master_trim_db: 0.0,
             telemetry,
         },
     )

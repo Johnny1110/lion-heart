@@ -757,7 +757,53 @@ sc_hpf spares lows, fet-faster-than-opto attack, opto program-dependent release,
 fet all-buttons slams+bounded, topologies distinct, every-voice fuzz +
 silence-in-out, pedal-switch finite, multi-rate) + 4 lh-core migration tests.
 
-Pending user verification on the Mac: **the three compressors by ear** (vca
+**M19 (setlists + loudness leveling) — code landed (uncommitted).** Specced in
+PRD 016, recorded as **ADR 026**. 6th (last) item of the 2026-07-20 roadmap. Two
+live-stage features sharing the ADR 023 render pipeline; the only RT change is
+one output-stage gain. (1) **Setlists** — `~/.lion-heart/setlists.json`
+(`{active, lists:{name→[preset…]}}`, `app::setlist`), app-global, not in presets,
+absent from the plugin. **Session-side override of the walk**: `preset_for_pc` /
+`adjacent_preset` follow the active setlist, else fall back to the sorted
+directory — so the **MIDI PC cross-binary contract holds** (PC n → n-th sorted
+preset when no setlist active; plugin unaffected). Pure nav math (`preset_at_pc`
+clamps, `step`/`position` clamp at ends). GUI setlist manager view
+(create/activate/delete/reorder ▲▼/add-current), a preset-bar "▶ name · 3/12"
+indicator, prev/next honor the list; REPL `setlist [<name>|off|list|add|delete]`.
+(2) **Loudness leveling** — new **`lh_dsp::loudness::integrated_lufs`** (from-
+scratch ITU-R BS.1770-4: K-weighting = +4 dB shelf → ~38 Hz HP via the existing
+RBJ biquads so it's rate-correct; 400 ms/75 %-overlap MS blocks; −70 LUFS
+absolute + −10 LU relative gating; a −18 dBFS sine reads within 0.7 LU of −18).
+**Output-stage master trim** (`EngineMsg::SetMasterTrim` → a smoothed gain in
+`OutputStage`, **after global EQ, before the safety limiter** — first output-
+stage signal change since PRD 003; 0 dB bit-transparent, over-boost caught at
+−0.3 dBFS; `ChainHandle::set_master_trim_db` mirrors, session applies per-preset
+on load). `~/.lion-heart/levels.json` (`{target_lufs, trims:{preset→dB}}`,
+app-global like global_eq.json — **no preset schema bump**, not in the plugin).
+New **`lion-heart level [--preset|--all] [--target -18] [--reference <di>]
+[--dry-run]`** renders a reference DI through each preset, measures LUFS, writes
+the trim (`target−measured`, clamped ±12 dB). Deltas from PRD (ADR 026): the
+built-in reference DI is **synthesized** (6 decaying open-string plucks, −8 dBFS
+— no shipped binary, ADR 021 precedent; `--reference` overrides); the manual trim
+control lives on the **setlists page**, not audio-settings; reorder is **▲▼
+buttons** not drag; footswitch prev/next rides **PC** (a dedicated increment-CC
+target deferred). **Plugin unchanged** (no setlists/levels; master trim not
+exposed — hosts own loudness), clap-validator unaffected. Setlists/levels are
+disk-backed, reloaded each `Session::start`, saved on mutation (survive a device
+restart without CarryOver). 17 new tests (loudness 6, leveling 5, setlist 5,
+engine master-trim 1; nav/round-trip/calibration/gating). Full suite 411 green;
+fmt/clippy clean.
+
+Pending user verification on the Mac: **setlists by ear** (build a 5-song list
+in the setlists page, activate it — prev/next and the footswitch/MIDI PC now
+walk the list, the preset bar shows "▶ name · 3/12"; reorder with ▲▼, add the
+current preset, `setlist off` returns to the sorted directory; plugin PC still
+walks the sorted index unchanged), **loudness leveling** (`lion-heart level
+--all` measures every preset and writes `levels.json`; switch presets live and
+the volume jumps shrink markedly; the trim readout/±0.5/reset on the setlists
+page nudges the current preset; `--reference <di.wav>` uses a real DI; a
+non-48 kHz reference errors clearly; confirm 0 dB trim is transparent and a big
+boost is caught by the safety limiter, no clipping),
+**the three compressors by ear** (vca
 transparent leveling unchanged vs old comp presets; opto slow/round/sticky with
 the program-dependent release breathing on a fading note; fet fast attack biting
 transients, all-buttons-in pumping; `blend` parallel comp keeping the pick
