@@ -21,6 +21,7 @@
 //! - [`tuner`] — pitch analysis (not an effect; feeds the GUI)
 //! - [`blocks`] — shared building blocks the effects are made of
 
+pub mod acoustic;
 pub mod blocks;
 pub mod cab;
 pub mod drive;

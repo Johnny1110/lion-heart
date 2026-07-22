@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use lh_core::preset::{AssetRef, PRESET_SCHEMA_VERSION, Preset, PresetAssets, SNAPSHOT_SLOTS};
 use lh_dsp::Effect;
+use lh_dsp::acoustic::Acoustic;
 use lh_dsp::blocks::swap::{AssetHandle, asset_channel};
 use lh_dsp::cab::{CabIr, IrAsset};
 use lh_dsp::drive::Drive;
@@ -893,11 +894,12 @@ pub struct FamilyEntry {
 /// place that knows the full rig. [`lh_core::DEFAULT_CHAIN`] (the board that
 /// ships) is an in-order **subsequence** of this: the registry may carry
 /// extra opt-in families that ship *off* the board and are added from the ＋
-/// menu — `pitch` (ADR 016) and the standalone-only `looper` (PRD 013, also
-/// absent from the host-driven plugin). A test pins the subsequence relation
+/// menu — `pitch` (ADR 016), the standalone-only `looper` (PRD 013, also
+/// absent from the host-driven plugin), and the `acoustic` simulator. A test
+/// pins the subsequence relation
 /// and the invariants; the plugin's fixed chain is pinned to `DEFAULT_CHAIN`
 /// directly.
-pub static FAMILY_REGISTRY: [FamilyEntry; 13] = [
+pub static FAMILY_REGISTRY: [FamilyEntry; 14] = [
     FamilyEntry {
         desc: &lh_dsp::dynamics::gate::FAMILY,
         asset: None,
@@ -975,6 +977,14 @@ pub static FAMILY_REGISTRY: [FamilyEntry; 13] = [
         desc: &lh_dsp::looper::FAMILY,
         asset: None,
         build: |_, _, _| Box::new(Looper::new()),
+    },
+    // `acoustic` is opt-in like `pitch`: the acoustic simulator colors wherever
+    // it sits (no transparent position), so it ships off the default board and
+    // is added from the ＋ menu — but active when added (you want the sound).
+    FamilyEntry {
+        desc: &lh_dsp::acoustic::FAMILY,
+        asset: None,
+        build: |_, _, _| Box::new(Acoustic::new()),
     },
 ];
 
@@ -3018,7 +3028,8 @@ mod tests {
         // The default board is an in-order subsequence of the registry: every
         // shipped family is registered, in the same relative order, but the
         // registry may carry extra opt-in families that ship *off* the board —
-        // `pitch` (ADR 016) and the standalone-only `looper` (PRD 013).
+        // `pitch` (ADR 016), the standalone-only `looper` (PRD 013), and the
+        // `acoustic` simulator.
         let mut cursor = keys.iter();
         for want in lh_core::DEFAULT_CHAIN {
             assert!(
@@ -3035,7 +3046,7 @@ mod tests {
             .collect();
         assert_eq!(
             off_board,
-            ["pitch", "looper"],
+            ["pitch", "looper", "acoustic"],
             "off-board opt-in families, in registry order"
         );
         for (i, a) in keys.iter().enumerate() {

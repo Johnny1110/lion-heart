@@ -59,6 +59,9 @@ const LOOPER: Color = Color::from_rgb(0.80, 0.40, 0.92);
 /// Orchid magenta — the pitch family (ADR 016): an otherworldly octave color,
 /// distinct from the modulation/reverb violets.
 const PITCH: Color = Color::from_rgb(0.85, 0.42, 0.78);
+/// Honey-wheat — the acoustic simulator: natural spruce/maple warmth, lighter
+/// and yellower than the cab's mic'd-wood brown and the amp's amber.
+const ACOUSTIC: Color = Color::from_rgb(0.85, 0.73, 0.48);
 
 const TS9: Color = Color::from_rgb(0.35, 0.77, 0.45);
 const BD2: Color = Color::from_rgb(0.42, 0.58, 0.94);
@@ -76,6 +79,10 @@ const JAN_RAY: Color = Color::from_rgb(0.82, 0.60, 0.30);
 /// Dallas Arbiter turquoise — the round enclosure everyone pictures. Cyan
 /// enough that no other drive box comes near it.
 const FUZZ_FACE: Color = Color::from_rgb(0.15, 0.65, 0.70);
+/// Cool periwinkle for the DaisySP-ported Overdrive — the one violet in a
+/// family of greens, golds and reds, and a nod to Electrosmith's modular
+/// heritage rather than any guitar-pedal enclosure.
+const OVERDRIVE: Color = Color::from_rgb(0.55, 0.52, 0.88);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -127,6 +134,7 @@ pub fn family_color(key: &str) -> Color {
         "limiter" => LIMITER,
         "looper" => LOOPER,
         "pitch" => PITCH,
+        "acoustic" => ACOUSTIC,
         _ => ACCENT, // drive family: the pedal picks the color
     }
 }
@@ -145,6 +153,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "angry-charlie" => ANGRY_CHARLIE,
             "jan-ray" => JAN_RAY,
             "fuzz-face" => FUZZ_FACE,
+            "overdrive" => OVERDRIVE,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

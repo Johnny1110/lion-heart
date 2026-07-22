@@ -38,6 +38,7 @@ mod evva;
 mod fuzz_face;
 mod jan_ray;
 mod monster5150;
+mod overdrive;
 mod red_charlie;
 mod ts9;
 
@@ -78,10 +79,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &angry_charlie::DESC,
         &jan_ray::DESC,
         &fuzz_face::DESC,
+        &overdrive::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 10;
+pub const MODEL_COUNT: usize = 11;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -153,6 +155,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &fuzz_face::DESC,
         controls: &[Ctl::Drive, Ctl::Level],
         build: || Box::new(fuzz_face::FuzzFace::new()),
+    },
+    ModelDef {
+        desc: &overdrive::DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
+        build: || Box::new(overdrive::Overdrive::new()),
     },
 ];
 
@@ -575,6 +582,7 @@ mod tests {
         assert_eq!(captions(7), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
         assert_eq!(captions(8), ["Gain", "Bass", "Treble", "Volume"]);
         assert_eq!(captions(9), ["Fuzz", "Volume"]);
+        assert_eq!(captions(10), ["Drive", "Tone", "Level"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -728,7 +736,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -1600,6 +1608,77 @@ mod tests {
         assert!(
             rolled_back < 0.3 * hot,
             "rolled-back fuzz must clean up: {rolled_back:.3} vs hot {hot:.3}"
+        );
+    }
+
+    #[test]
+    fn overdrive_is_symmetric_and_suppresses_even_harmonics() {
+        // stmlib's SoftClip is an odd function and the tone/makeup stage is
+        // linear, so — like the ts9's matched feedback diodes — only odd
+        // harmonics survive: no even-harmonic warmth, a clean symmetric
+        // overdrive.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(10);
+        set_pos(&mut d, 0, 6.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
+        assert!(
+            h2 < 0.01,
+            "overdrive's odd-symmetric clip should suppress even harmonics, got h2/f0 = {h2:.4}"
+        );
+        // But it is a drive, not a wire — the odd harmonics are there.
+        let h3 = tone_at(&y, 660.0) / tone_at(&y, 220.0);
+        assert!(h3 > 0.02, "overdrive odd harmonics: h3/f0 = {h3:.4}");
+    }
+
+    #[test]
+    fn overdrive_drive_knob_takes_it_from_clean_to_dirty() {
+        // DaisySP's pre-gain blends a gentle boost into a steep `drive⁵` term,
+        // so the lower knob is nearly clean and the upper knob slams the clip.
+        let x = guitar(220.0, SR as usize);
+        let res = |pos: f32| -> f64 {
+            let mut d = prepared(10);
+            set_pos(&mut d, 0, pos);
+            harmonic_residual(&process_in_blocks(&mut d, &x, 256), 220.0)
+        };
+        let low = res(3.0);
+        let high = res(8.0);
+        assert!(
+            low < 0.05,
+            "low-gain overdrive should stay clean, got {low:.3}"
+        );
+        assert!(
+            high > 0.25,
+            "cranked overdrive should clip hard, got {high:.3}"
+        );
+        assert!(high > 3.0 * low.max(0.001));
+    }
+
+    #[test]
+    fn overdrive_auto_makeup_holds_level_across_the_sweep() {
+        // The technique ported from DaisySP: the post-gain is scheduled as the
+        // reciprocal of the clipper's response, so loudness barely moves as the
+        // drive climbs. Once past the knee (drive ≥ 5) the driven level sits in
+        // a tight band where a plain waveshaper would swing tens of dB — and
+        // the DRIVE_CEILING cap keeps the very top of the pot from losing the
+        // makeup window and jumping.
+        let x = guitar(220.0, SR as usize);
+        let in_rms = f64::from(rms(&x[x.len() / 2..]));
+        let db = |pos: f32| -> f64 {
+            let mut d = prepared(10);
+            set_pos(&mut d, 0, pos);
+            let y = process_in_blocks(&mut d, &x, 256);
+            20.0 * (f64::from(rms(&y[y.len() / 2..])) / in_rms).log10()
+        };
+        let levels: Vec<f64> = [5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+            .iter()
+            .map(|p| db(*p))
+            .collect();
+        let spread = levels.iter().cloned().fold(f64::MIN, f64::max)
+            - levels.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            spread < 3.0,
+            "auto-makeup must hold the driven level steady, got {spread:.1} dB spread ({levels:?})"
         );
     }
 }
