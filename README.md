@@ -108,13 +108,18 @@ docs/
 
 ## Documentation
 
+- [Installation guide](docs/install.md) — build & run on **macOS and Windows**, pick your interface, load a tone, install the plugin
 - [White paper / 白皮書](docs/white-paper.md) — vision, requirements, architecture, tech choices, milestones (Traditional Chinese)
 - [CLAUDE.md](CLAUDE.md) — engineering conventions, including the non-negotiable real-time audio rules
 - `docs/adr/` — architecture decision records (created as decisions happen)
 
 ## Building & running
 
-Requires stable Rust (macOS; Linux also builds, given `libasound2-dev` + `pkg-config`).
+> **New here?** The [installation guide](docs/install.md) walks through macOS and
+> Windows setup — installing Rust, building, choosing your interface, and loading
+> a tone — step by step. The quick reference below assumes you have Rust already.
+
+Requires stable Rust 1.85+ (macOS and Windows; Linux also builds, given `libasound2-dev` + `pkg-config`).
 
 The `Makefile` wraps the common flows — run `make` (or `make help`) for the list:
 
