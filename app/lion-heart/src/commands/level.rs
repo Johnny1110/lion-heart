@@ -14,7 +14,7 @@ use crate::render::ENGINE_RATE;
 use crate::session::presets_dir;
 
 pub fn run(args: LevelArgs) -> Result<()> {
-    let dir = presets_dir().context("cannot determine $HOME for presets")?;
+    let dir = presets_dir().context("cannot determine home directory for presets")?;
 
     // The reference DI: a user file (must be at the engine rate) or the
     // built-in synthesized yardstick.
