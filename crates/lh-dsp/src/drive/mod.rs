@@ -40,6 +40,7 @@ mod jan_ray;
 mod monster5150;
 mod overdrive;
 mod red_charlie;
+mod screamer;
 mod ts9;
 
 use lh_core::{FamilyDesc, ParamDesc, Range, db_to_lin, drive_law};
@@ -80,10 +81,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &jan_ray::DESC,
         &fuzz_face::DESC,
         &overdrive::DESC,
+        &screamer::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 11;
+pub const MODEL_COUNT: usize = 12;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -160,6 +162,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &overdrive::DESC,
         controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(overdrive::Overdrive::new()),
+    },
+    ModelDef {
+        desc: &screamer::DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
+        build: || Box::new(screamer::Screamer::new()),
     },
 ];
 
@@ -583,6 +590,7 @@ mod tests {
         assert_eq!(captions(8), ["Gain", "Bass", "Treble", "Volume"]);
         assert_eq!(captions(9), ["Fuzz", "Volume"]);
         assert_eq!(captions(10), ["Drive", "Tone", "Level"]);
+        assert_eq!(captions(11), ["Drive", "Tone", "Level"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -684,6 +692,66 @@ mod tests {
     }
 
     #[test]
+    fn screamer_makes_the_mid_hump() {
+        // The white-box TS is still a TS: the 720 Hz input high-pass keeps a
+        // low note cleaner than a mid note at the same drive.
+        let mut d = prepared(11);
+        set_pos(&mut d, 0, 6.0);
+        let lows = harmonic_residual(
+            &process_in_blocks(&mut d, &guitar(110.0, SR as usize), 256),
+            110.0,
+        );
+        d.reset();
+        let mids = harmonic_residual(
+            &process_in_blocks(&mut d, &guitar(720.0, SR as usize), 256),
+            720.0,
+        );
+        // A gentler hump than the ts9's fb-shaped clipped path, but present:
+        // the reactive clipper spreads breakup a touch more evenly.
+        assert!(
+            mids > 1.15 * lows,
+            "screamer mid-hump: mids {mids:.3} vs lows {lows:.3}"
+        );
+    }
+
+    #[test]
+    fn screamer_clip_is_symmetric() {
+        // Matched antiparallel 1N4148s: the 2nd harmonic stays small, like the
+        // ts9 and unlike the asymmetric evva/bd2.
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(11);
+        set_pos(&mut d, 0, 6.0);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
+        assert!(
+            h2 < 0.02,
+            "matched diodes → small 2nd harmonic, got {h2:.4}"
+        );
+    }
+
+    #[test]
+    fn screamer_voices_highs_differently_from_the_memoryless_ts9() {
+        // The point of shipping both: the circuit model and the static curve
+        // are genuinely different pedals, not a reskin. Up high, the WDF's
+        // harder diode knee keeps more edge than the ts9's soft `x/√(1+x²)`
+        // curve behind its aggressive 51 pF feedback lowpass — a clearly
+        // measurable difference at the same drive. (The intrinsic frequency
+        // dependence itself is pinned, unconfounded, at the WDF core in
+        // `screamer::tests::shunt_cap_makes_clipping_frequency_dependent`.)
+        let x = guitar(5_000.0, SR as usize);
+        let mut sc = prepared(11);
+        set_pos(&mut sc, 0, 8.0);
+        let sc_res = harmonic_residual(&process_in_blocks(&mut sc, &x, 256), 5_000.0);
+        let mut ts = prepared(0);
+        set_pos(&mut ts, 0, 8.0);
+        let ts_res = harmonic_residual(&process_in_blocks(&mut ts, &x, 256), 5_000.0);
+        assert!(
+            (sc_res - ts_res).abs() > 0.03,
+            "circuit model must differ audibly from the curve: screamer {sc_res:.3} vs ts9 {ts_res:.3}"
+        );
+    }
+
+    #[test]
     fn blues_driver_clips_lows_that_the_ts9_leaves_clean() {
         // Full-range vs mid-focused: at the same drive position, a 110 Hz
         // note comes out dirtier from the BD-2 than from the TS9.
@@ -736,7 +804,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));

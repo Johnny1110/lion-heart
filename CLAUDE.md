@@ -14,6 +14,46 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 
 ## Current phase
 
+> **Note:** the nine-feature roadmap (PRDs 001–019) is complete and released as
+> **v0.1.0**; the entries below are the historical build log (newest first).
+> Since v0.1.0 the work is the white paper's **§6 deep-water research line** and
+> the **cross-platform port** (ADR 027).
+
+**Deep water #1 — WDF Tube Screamer clipping stage — code landed (uncommitted).**
+Specced in PRD 020, recorded as **ADR 028**; the first white-box circuit model
+(white paper §6's named first topic). New reusable **`lh_dsp::blocks::wdf`**:
+`Capacitor` (bilinear one-port, `R=T/2C`, `b[n]=a[n−1]`), `DiodePair`
+(antiparallel `i=2·Is·sinh(v/nVt)` nonlinear root, solved by **warm-started
+damped Newton** in `f64` — step capped at `10·nVt`, 16-iter ceiling, exp-clamped
+→ bounded/finite/alloc-free by construction), and `parallel_root` (the
+reflection-free parallel-adaptor reduction `a=(ΣGₖaₖ)/ΣGₖ`, `R=1/ΣGₖ`). First
+application = new **drive pedal `screamer`** (key `screamer`, index 11): the TS
+clipping stage as a **shunt RC-diode clipper** (`R_SERIES` 2.2 kΩ, `C` 22 nF,
+1N4148 `Is 2.52n/n 1.75/Vt 25.85m`) driven at the shared TS op-amp gain law off
+the 720 Hz input high-pass, `shape()` solving one WDF sample per **4×
+oversampled** frame, summed with the unity dry path for the mid-hump, `ts9`'s
+tone tilt + makeup + DC block in `post()`. **New pedal, `ts9` untouched** — the
+memoryless model stays as the deliberate A/B reference (the whole point is
+audible white-box-vs-curve). Append-only: `DRIVE_PEDALS`/`MODEL_COUNT` 11→12,
+**no preset schema bump**, plugin auto-expands `drive_screamer_*` via
+`from_families` (**pre-v0.1 additive id break** — re-run clap-validator), theme
+gained a jade Screamer livery under the distinct-livery pin. Deltas from PRD
+(ADR 028): shunt-clipper reduction not the feedback topology (v2); bench
+**≈68 µs/block** (x86 sandbox, ~6× memoryless `ts9`, ~5.1 % deadline — the `f64
+exp` in Newton, accepted deep-water cost, only paid when selected); the
+frequency-dependent-clipping proof lives at the WDF core (`clip()` direct, no
+720 Hz confound), the full-pedal `ts9` A/B asserts "voices highs measurably
+differently" (honest: the WDF's harder knee keeps *more* high-end edge than the
+soft curve). 13 tests (7 `blocks::wdf`: diode-equation residual, symmetry,
+saturation, warm=cold, ±1e6-bounded, cap resistance, RC-settles-to-DC; 3
+screamer core: frequency-dependent clip, symmetric, silence→silence; 3 character
+via the all-model suites + registry/unity/theme pins). `blocks::wdf` is the
+substrate for the next circuit (feedback-topology TS, diode-ladder tone stack,
+triode). **Engine/session/plugin: zero code changes.** Pending user verification:
+`screamer` vs `ts9` **by ear** (transient/chord touch, frequency-dependent
+breakup, roll-back cleanup, drive/tone), re-run clap-validator (`drive_screamer_*`
+appeared).
+
 **M8 (freeboard) — code landed.** Three features, specced in `docs/PRD/`
 (001–003, zh-TW) and recorded as ADRs 004–006:
 

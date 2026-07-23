@@ -91,6 +91,10 @@ const FUZZ_FACE: Color = Color::from_rgb(0.15, 0.65, 0.70);
 /// family of greens, golds and reds, and a nod to Electrosmith's modular
 /// heritage rather than any guitar-pedal enclosure.
 const OVERDRIVE: Color = Color::from_rgb(0.55, 0.52, 0.88);
+/// Deep jade for the white-box WDF Screamer — a Tube Screamer green like the
+/// ts9's, but darker and more saturated, marking it as the circuit-modelled
+/// sibling rather than the memoryless curve.
+const SCREAMER: Color = Color::from_rgb(0.22, 0.64, 0.52);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -163,6 +167,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "jan-ray" => JAN_RAY,
             "fuzz-face" => FUZZ_FACE,
             "overdrive" => OVERDRIVE,
+            "screamer" => SCREAMER,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {
