@@ -7,6 +7,7 @@ pub mod grain;
 pub mod oversample;
 pub mod smooth;
 pub mod swap;
+pub mod wdf;
 
 /// One-pole smoothing coefficient from a time constant in milliseconds
 /// (~63% of the way per constant). 0 ms (or a zero rate) snaps.

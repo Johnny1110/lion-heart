@@ -7,6 +7,24 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-23 (deep water: WDF Tube Screamer) — Linux dev container (relative)
+
+The first white-box circuit model (PRD 020 / ADR 028): the Screamer clipping
+stage solved as a Wave Digital Filter — an antiparallel-diode root behind a
+shunt RC, a warm-started damped Newton solve in `f64` per **oversampled** sample
+per channel. This is the deep-water research line's deliberately-expensive path,
+and it shows: ~6× the memoryless `ts9`, the `exp` in the Newton loop dominating.
+Still well inside budget, and only paid when `screamer` is the selected drive
+pedal. The `ts9` row is the memoryless reference from the same run. Optimisation
+paths (an `f32` solve, a fast `exp`, below-knee oversampling bypass) are left as
+future work — correctness first for a circuit model.
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| drive_screamer_4x_oversampled      | ~68 µs      | 5.1 %                  |
+| drive_ts9_4x_oversampled (ref)     | ~11.4 µs    | 0.86 %  (memoryless)   |
+| drive_overdrive_4x_oversampled     | ~9.2 µs     | 0.69 %  (memoryless)   |
+
 ## 2026-07-22 (M20 power amp) — Linux dev container (relative)
 
 The hand-written valve power stage (PRD 017 / ADR 024): a 4× oversampled
