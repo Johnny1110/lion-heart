@@ -1531,8 +1531,8 @@ impl Running {
                 };
                 let start = remembered
                     .map(PathBuf::from)
-                    .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("/"));
+                    .or_else(lh_assets::home_dir)
+                    .unwrap_or_else(|| PathBuf::from("."));
                 self.view = View::Browser(Browser::open(kind, start));
             }
             Message::BrowserNav(path) => {

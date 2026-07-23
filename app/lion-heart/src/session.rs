@@ -2584,7 +2584,7 @@ impl Session {
         if !valid_preset_name(name) {
             return Err("preset names use letters, digits, - and _ only".into());
         }
-        let dir = presets_dir().ok_or("cannot determine $HOME")?;
+        let dir = presets_dir().ok_or("cannot determine home directory")?;
         let preset = Preset {
             schema_version: PRESET_SCHEMA_VERSION,
             name: name.to_string(),
@@ -2607,7 +2607,7 @@ impl Session {
     /// Load a preset by name: chain state, then both assets. Returns all
     /// user-facing lines (warnings included) in order.
     pub fn load_preset(&mut self, name: &str) -> Result<Vec<String>, String> {
-        let dir = presets_dir().ok_or("cannot determine $HOME")?;
+        let dir = presets_dir().ok_or("cannot determine home directory")?;
         let path = dir.join(format!("{name}.json"));
         let json = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
@@ -2872,7 +2872,7 @@ impl Session {
     /// pointed here, so a deleted name is not reloaded on the next launch, and
     /// prunes it from any custom order.
     pub fn delete_preset(&mut self, name: &str) -> Result<String, String> {
-        let dir = presets_dir().ok_or("cannot determine $HOME")?;
+        let dir = presets_dir().ok_or("cannot determine home directory")?;
         let path = delete_preset_file(&dir, name)?;
         if self.config.last_preset.as_deref() == Some(name) {
             self.config.last_preset = None;
@@ -2886,7 +2886,7 @@ impl Session {
     /// to overwrite an existing target; keeps "last preset" and the custom
     /// order pointed at it (so it holds its position).
     pub fn rename_preset(&mut self, old: &str, new: &str) -> Result<String, String> {
-        let dir = presets_dir().ok_or("cannot determine $HOME")?;
+        let dir = presets_dir().ok_or("cannot determine home directory")?;
         copy_preset_file(&dir, old, new, true)?;
         if self.config.last_preset.as_deref() == Some(old) {
             self.remember_preset(new);
@@ -2905,7 +2905,7 @@ impl Session {
     /// overwrite; leaves the active preset unchanged and, in a custom order,
     /// drops the copy right after its source.
     pub fn duplicate_preset(&mut self, src: &str, new: &str) -> Result<String, String> {
-        let dir = presets_dir().ok_or("cannot determine $HOME")?;
+        let dir = presets_dir().ok_or("cannot determine home directory")?;
         copy_preset_file(&dir, src, new, false)?;
         maintain_preset_order(|o| {
             if let Some(i) = o.iter().position(|n| n == src) {
@@ -3045,7 +3045,7 @@ pub fn preset_info(name: &str) -> PresetInfo {
         error: None,
     };
     let Some(dir) = presets_dir() else {
-        info.error = Some("cannot determine $HOME".into());
+        info.error = Some("cannot determine home directory".into());
         return info;
     };
     match read_preset_file(&dir.join(format!("{name}.json"))) {
@@ -3086,7 +3086,7 @@ fn chain_summary(preset: &Preset) -> String {
 /// keeping input/channel/pc_presets). A warning line on failure.
 fn save_midi_map(map: &lh_midi::MidiMap) -> Option<String> {
     let Some(dir) = app_dir() else {
-        return Some("warning: cannot determine $HOME — midi map not saved".into());
+        return Some("warning: cannot determine home directory — midi map not saved".into());
     };
     let write = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
@@ -3155,7 +3155,8 @@ pub(crate) fn load_config() -> AppConfig {
 }
 
 /// Where takes are written (PRD 014): the configured directory, else
-/// `~/.lion-heart/recordings`, else the current dir if `$HOME` is unavailable.
+/// `~/.lion-heart/recordings`, else the current dir if the home directory is
+/// unavailable.
 fn recordings_dir(config: &AppConfig) -> PathBuf {
     if let Some(dir) = &config.recordings_dir {
         return PathBuf::from(dir);
@@ -3404,7 +3405,7 @@ mod tests {
     // --- preset management (delete / rename / duplicate / digest) ---
     //
     // These exercise the disk helpers against an explicit temp dir, so they
-    // never touch $HOME or config.json and stay parallel-safe.
+    // never touch the home directory or config.json and stay parallel-safe.
 
     use lh_core::preset::SlotState;
 
