@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,9 @@ jobs:
         run: rustup update stable && rustup default stable && rustup component add clippy rustfmt
 
       - name: Format
+        # Formatting is OS-independent; checking it once off Windows also avoids
+        # the CRLF-vs-LF `fmt --check` false positive on Windows runners.
+        if: runner.os != 'Windows'
         run: cargo fmt --check
 
       - name: Clippy

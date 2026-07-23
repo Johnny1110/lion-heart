@@ -160,9 +160,34 @@ pub fn load_ir_pair(path: &Path, engine_rate: u32) -> Result<(IrPair, IrInfo), A
 // preset list in the same order — MIDI PC numbers and the plugin's preset
 // parameter both index into it.
 
-/// `~/.lion-heart`, the app-global config/preset directory.
+/// The current user's home directory, resolved portably: `$HOME` on Unix
+/// (macOS/Linux), falling back to `%USERPROFILE%` on Windows where `$HOME` is
+/// normally unset. Checking `$HOME` first keeps Unix paths byte-identical to
+/// every prior release. `None` only if neither is set (a service account or a
+/// stripped environment) — callers then treat the whole `~/.lion-heart` layout
+/// as unavailable and degrade gracefully.
+///
+/// Resolved from the environment rather than via the `dirs` crate: it keeps the
+/// dependency surface flat and, because `$HOME` wins, guarantees existing
+/// macOS/Linux installs never move (ADR 027).
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    resolve_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// Pure home-dir resolution, split out for unit testing (env reads are
+/// process-global and racy in tests): `$HOME` wins, `%USERPROFILE%` is the
+/// Windows fallback, `None` when neither is set.
+fn resolve_home(
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    home.or(userprofile).map(std::path::PathBuf::from)
+}
+
+/// `~/.lion-heart`, the app-global config/preset directory. `~` resolves via
+/// [`home_dir`], portable across macOS/Linux/Windows.
 pub fn app_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".lion-heart"))
+    home_dir().map(|home| home.join(".lion-heart"))
 }
 
 /// `~/.lion-heart/presets`.
@@ -228,8 +253,8 @@ fn read_order_at(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Persist a custom preset order (one name per line). Silently no-ops when
-/// `$HOME` is unavailable — ordering is a preference, never load-bearing.
+/// Persist a custom preset order (one name per line). Silently no-ops when the
+/// home directory is unavailable — ordering is a preference, never load-bearing.
 pub fn save_preset_order(order: &[String]) {
     let Some(path) = preset_order_path() else {
         return;
@@ -355,7 +380,27 @@ pub fn resample_sinc(input: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn home_resolves_home_then_userprofile() {
+        // `$HOME` (Unix) wins when present — keeps macOS/Linux byte-identical.
+        assert_eq!(
+            resolve_home(
+                Some(OsString::from("/home/u")),
+                Some(OsString::from("C:\\Users\\u"))
+            ),
+            Some(PathBuf::from("/home/u"))
+        );
+        // `%USERPROFILE%` is the fallback on Windows, where `$HOME` is unset.
+        assert_eq!(
+            resolve_home(None, Some(OsString::from("C:\\Users\\u"))),
+            Some(PathBuf::from("C:\\Users\\u"))
+        );
+        // Neither set (service account / stripped env) ⇒ layout unavailable.
+        assert_eq!(resolve_home(None, None), None);
+    }
 
     fn temp_wav(name: &str, rate: u32, channels: u16, samples: &[f32]) -> PathBuf {
         let path = std::env::temp_dir().join(format!("lion-heart-test-{name}.wav"));

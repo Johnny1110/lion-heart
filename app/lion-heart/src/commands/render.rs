@@ -14,7 +14,7 @@ use crate::session::presets_dir;
 
 pub fn run(args: RenderArgs) -> Result<()> {
     // Load the preset by name from ~/.lion-heart/presets.
-    let dir = presets_dir().context("cannot determine $HOME for presets")?;
+    let dir = presets_dir().context("cannot determine home directory for presets")?;
     let preset_path = dir.join(format!("{}.json", args.preset));
     let json = std::fs::read_to_string(&preset_path)
         .with_context(|| format!("cannot read preset {}", preset_path.display()))?;
