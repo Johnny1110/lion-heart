@@ -2124,7 +2124,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lh-assets"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "fft-convolver",
  "hound",
@@ -2136,7 +2136,7 @@ dependencies = [
 
 [[package]]
 name = "lh-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "lh-dsp"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "fft-convolver",
@@ -2155,7 +2155,7 @@ dependencies = [
 
 [[package]]
 name = "lh-engine"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "lh-core",
@@ -2166,7 +2166,7 @@ dependencies = [
 
 [[package]]
 name = "lh-io"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "assert_no_alloc 1.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "cpal",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "lh-midi"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "midir",
  "serde",
@@ -2187,7 +2187,7 @@ dependencies = [
 
 [[package]]
 name = "lh-nam"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "lh-core",
@@ -2269,7 +2269,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "lion-heart"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_no_alloc 1.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "lion-heart-plugin"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "lh-assets",
  "lh-core",
@@ -5488,7 +5488,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "nih_plug_xtask",
 ]
