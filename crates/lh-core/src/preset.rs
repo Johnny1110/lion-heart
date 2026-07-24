@@ -52,7 +52,7 @@ pub const CLASSIC_DRIVE_MODEL: f32 = 2.0;
 /// pedals past index 4 postdate v2 and are unreachable from the migration).
 /// The registry lives in `lh-dsp` (which this crate cannot see); a test over
 /// there pins the two together so they cannot drift.
-pub const DRIVE_PEDALS: [&str; 12] = [
+pub const DRIVE_PEDALS: [&str; 14] = [
     "ts9",
     "bd2",
     "classic",
@@ -65,6 +65,8 @@ pub const DRIVE_PEDALS: [&str; 12] = [
     "fuzz-face",
     "overdrive",
     "screamer",
+    "sd1",
+    "angry-charlie-v2",
 ];
 
 /// v2 modulation type indices → v3 pedal keys, same pinning contract.

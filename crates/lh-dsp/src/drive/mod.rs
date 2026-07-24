@@ -31,6 +31,7 @@
 //! mapping, preset save/load, and the plugin's per-pedal host params.
 
 mod angry_charlie;
+mod angry_charlie_v2;
 mod bd2;
 mod centaur;
 mod classic;
@@ -41,6 +42,7 @@ mod monster5150;
 mod overdrive;
 mod red_charlie;
 mod screamer;
+mod sd1;
 mod ts9;
 
 use lh_core::{FamilyDesc, ParamDesc, Range, db_to_lin, drive_law};
@@ -82,10 +84,12 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &fuzz_face::DESC,
         &overdrive::DESC,
         &screamer::DESC,
+        &sd1::DESC,
+        &angry_charlie_v2::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 12;
+pub const MODEL_COUNT: usize = 14;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -167,6 +171,16 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &screamer::DESC,
         controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
         build: || Box::new(screamer::Screamer::new()),
+    },
+    ModelDef {
+        desc: &sd1::DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
+        build: || Box::new(sd1::Sd1::new()),
+    },
+    ModelDef {
+        desc: &angry_charlie_v2::DESC,
+        controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
+        build: || Box::new(angry_charlie_v2::AngryCharlieV2::new()),
     },
 ];
 
@@ -591,6 +605,8 @@ mod tests {
         assert_eq!(captions(9), ["Fuzz", "Volume"]);
         assert_eq!(captions(10), ["Drive", "Tone", "Level"]);
         assert_eq!(captions(11), ["Drive", "Tone", "Level"]);
+        assert_eq!(captions(12), ["Drive", "Tone", "Level"]);
+        assert_eq!(captions(13), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
         assert!(
             FAMILY.pedals[0].param_index("low").is_none(),
             "no EQ knobs on ts9"
@@ -752,6 +768,93 @@ mod tests {
     }
 
     #[test]
+    fn sd1_makes_even_harmonics_where_the_screamer_does_not() {
+        // The SD-1's asymmetric feedback clipper (2 diodes vs 1) grows a strong
+        // 2nd harmonic; the screamer's matched antiparallel pair cancels it —
+        // the audible payoff of the feedback topology + asymmetric root.
+        let x = guitar(220.0, SR as usize);
+        let h2 = |y: &[f32]| tone_at(y, 440.0) / tone_at(y, 220.0);
+
+        let mut sd1 = prepared(12);
+        set_pos(&mut sd1, 0, 6.0);
+        let sd1_h2 = h2(&process_in_blocks(&mut sd1, &x, 256));
+
+        let mut sc = prepared(11);
+        set_pos(&mut sc, 0, 6.0);
+        let sc_h2 = h2(&process_in_blocks(&mut sc, &x, 256));
+
+        assert!(
+            sd1_h2 > 0.03,
+            "sd1 asymmetric clipper — expected 2nd harmonic, got {sd1_h2:.4}"
+        );
+        assert!(
+            sd1_h2 > 3.0 * sc_h2,
+            "sd1 must out-even-harmonic the matched screamer: {sd1_h2:.4} vs {sc_h2:.4}"
+        );
+    }
+
+    #[test]
+    fn sd1_makes_the_mid_hump() {
+        // Like every TS-family overdrive, a low note stays cleaner than a mid
+        // note at the same drive — but here the hump is grown by the gain
+        // leg's C_g (loop gain rolls off below its corner), not a hand-tuned
+        // input high-pass the way the screamer fakes it.
+        let mut d = prepared(12);
+        set_pos(&mut d, 0, 6.0);
+        let lows = harmonic_residual(
+            &process_in_blocks(&mut d, &guitar(110.0, SR as usize), 256),
+            110.0,
+        );
+        d.reset();
+        let mids = harmonic_residual(
+            &process_in_blocks(&mut d, &guitar(720.0, SR as usize), 256),
+            720.0,
+        );
+        assert!(
+            mids > 1.2 * lows,
+            "sd1 mid-hump: mids {mids:.3} vs lows {lows:.3}"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_v2_distorts_harder_than_the_v1() {
+        // More gain, into distortion: at the same moderate drive the V2's
+        // cascaded second clip leaves far less of the fundamental intact than
+        // the V1's single crunch stage.
+        let x = guitar(220.0, SR as usize);
+        let mut v2 = prepared(13);
+        set_pos(&mut v2, 0, 3.0);
+        let v2_res = harmonic_residual(&process_in_blocks(&mut v2, &x, 256), 220.0);
+        let mut v1 = prepared(7);
+        set_pos(&mut v1, 0, 3.0);
+        let v1_res = harmonic_residual(&process_in_blocks(&mut v1, &x, 256), 220.0);
+        assert!(
+            v2_res > 1.3 * v1_res,
+            "angry-charlie-v2 must reach distortion past the v1 crunch: v2 {v2_res:.3} vs v1 {v1_res:.3}"
+        );
+    }
+
+    #[test]
+    fn angry_charlie_v2_lifts_the_mids_over_the_v1() {
+        // The built-in 600–800 Hz boost: at a near-clean setting the V2 puts
+        // more energy at 700 Hz relative to 250 Hz than the V1. Probed quiet so
+        // the chain stays linear and the filter — not the clipping — shows.
+        let x = tones(&[250.0, 700.0, 2_000.0], SR as usize);
+        let tilt = |model: usize| -> f64 {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, 1.0);
+            let y = process_in_blocks(&mut d, &x, 256);
+            tone_at(&y, 700.0) / tone_at(&y, 250.0)
+        };
+        let v2 = tilt(13);
+        let v1 = tilt(7);
+        assert!(
+            v2 > 1.3 * v1,
+            "angry-charlie-v2 must push the 700 Hz mids over the v1: v2 {v2:.3} vs v1 {v1:.3}"
+        );
+    }
+
+    #[test]
     fn blues_driver_clips_lows_that_the_ts9_leaves_clean() {
         // Full-range vs mid-focused: at the same drive position, a 110 Hz
         // note comes out dirtier from the BD-2 than from the TS9.
@@ -804,7 +907,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
