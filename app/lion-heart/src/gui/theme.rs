@@ -80,6 +80,9 @@ const MONSTER5150: Color = Color::from_rgb(0.88, 0.86, 0.82);
 /// Hot scarlet-orange: the JHS enclosure (and its red-LED clippers),
 /// deliberately hotter than the red-charlie's crimson.
 const ANGRY_CHARLIE: Color = Color::from_rgb(0.97, 0.44, 0.20);
+/// The V2's angrier voice wears a deeper, darker blood-red — hotter-gained
+/// than the V1's scarlet-orange, and distinct from the red-charlie's crimson.
+const ANGRY_CHARLIE_V2: Color = Color::from_rgb(0.80, 0.16, 0.12);
 /// Warm bronze — the Vemuram's raw brass hardware, and a nod to the vintage
 /// Fender chime it chases. Darker and more coppery than the centaur's gold so
 /// the two transparent boosts don't read as the same box.
@@ -95,6 +98,10 @@ const OVERDRIVE: Color = Color::from_rgb(0.55, 0.52, 0.88);
 /// ts9's, but darker and more saturated, marking it as the circuit-modelled
 /// sibling rather than the memoryless curve.
 const SCREAMER: Color = Color::from_rgb(0.22, 0.64, 0.52);
+/// The Boss SD-1's canary yellow — the enclosure everyone pictures. A pure,
+/// bright yellow that no other drive box (the centaur/jan-ray golds, the
+/// tremolo/chorale ambers) comes near.
+const SD1: Color = Color::from_rgb(0.96, 0.82, 0.22);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -164,10 +171,12 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "red-charlie" => RED_CHARLIE,
             "monster5150" => MONSTER5150,
             "angry-charlie" => ANGRY_CHARLIE,
+            "angry-charlie-v2" => ANGRY_CHARLIE_V2,
             "jan-ray" => JAN_RAY,
             "fuzz-face" => FUZZ_FACE,
             "overdrive" => OVERDRIVE,
             "screamer" => SCREAMER,
+            "sd1" => SD1,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

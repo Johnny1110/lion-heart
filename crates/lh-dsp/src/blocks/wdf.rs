@@ -163,6 +163,87 @@ impl DiodePair {
     }
 }
 
+/// Antiparallel diode clipper with **asymmetric** branch counts: `m` identical
+/// diodes in series conducting one way, `k` the other. Its v–i curve is
+///
+/// ```text
+/// i(v) = Is·(exp(v / (m·nVt)) − exp(−v / (k·nVt)))
+/// ```
+///
+/// — monotonic (so Newton converges), and it reduces to [`DiodePair`]'s
+/// `2·Is·sinh(v/nVt)` exactly when `m = k = 1`. When `m ≠ k` the two clipping
+/// thresholds skew apart, so a symmetric input clips asymmetrically and grows
+/// **even** harmonics — the Boss SD-1's signature (2 diodes one way, 1 the
+/// other) and the difference from a Tube Screamer's matched pair. This is the
+/// WDF nonlinear **root** for a feedback-topology overdrive; see
+/// `drive/sd1.rs`.
+pub struct AsymDiode {
+    is: f64,
+    /// Forward thermal scale `m·n·Vt`.
+    vt_f: f64,
+    /// Reverse thermal scale `k·n·Vt`.
+    vt_r: f64,
+    /// Warm start: the voltage solved last sample (continuous audio → 1–3 steps).
+    v: f64,
+}
+
+impl AsymDiode {
+    /// `is`/`n`/`vt` are the *single*-diode parameters (1N4148 ≈
+    /// `is 2.52e-9, n 1.75, vt 25.85e-3`); `m_fwd`/`m_rev` are how many sit in
+    /// series each way (SD-1 ≈ `2` / `1`).
+    pub fn new(is: f32, n: f32, vt: f32, m_fwd: f32, m_rev: f32) -> Self {
+        let vt_n = (n * vt) as f64;
+        Self {
+            is: is as f64,
+            vt_f: m_fwd as f64 * vt_n,
+            vt_r: m_rev as f64 * vt_n,
+            v: 0.0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.v = 0.0;
+    }
+
+    /// Solve the root for incident wave `a` at port resistance `r`. Returns
+    /// `(v, b)` — the clip-node voltage and the reflected wave `2v − a`. RT-safe
+    /// exactly like [`DiodePair::solve`]: damped, warm-started `f64` Newton with
+    /// a fixed ceiling and an exp clamp (bounded and finite by construction).
+    #[inline]
+    pub fn solve(&mut self, a: f32, r: f32) -> (f32, f32) {
+        let a = a as f64;
+        let r = r as f64;
+        let is = self.is;
+        let (vt_f, vt_r) = (self.vt_f, self.vt_r);
+        // Damp against the stiffer (smaller-scale) branch so a cold, slammed
+        // input can't overshoot into the exponential and stall.
+        let dv_max = 10.0 * vt_f.min(vt_r);
+
+        let mut v = self.v;
+        for _ in 0..MAX_ITERS {
+            let uf = (v / vt_f).clamp(-60.0, 60.0);
+            let ur = (-v / vt_r).clamp(-60.0, 60.0);
+            let ef = uf.exp();
+            let er = ur.exp();
+            let i = is * (ef - er);
+            // di/dv = Is·(ef/vt_f + er/vt_r) — both terms ≥ 0, so i is monotonic.
+            let ip = is * (ef / vt_f + er / vt_r);
+            let f = v + r * i - a;
+            let fp = 1.0 + r * ip;
+            let dv = (f / fp).clamp(-dv_max, dv_max);
+            v -= dv;
+            if dv.abs() < TOL {
+                break;
+            }
+        }
+
+        self.v = v;
+        let vf = v as f32;
+        let vf = if vf.abs() < 1e-25 { 0.0 } else { vf };
+        (vf, 2.0 * vf - a as f32)
+    }
+}
+
 /// Incident wave into the adapted (reflection-free) root of a parallel adaptor,
 /// and the resistance the root sees, from the linear ports' `(conductance,
 /// reflected-wave)` pairs.
@@ -184,6 +265,23 @@ pub fn parallel_root(ports: &[(f32, f32)]) -> (f32, f32) {
         weighted += g * a;
     }
     (weighted / g_sum, 1.0 / g_sum)
+}
+
+/// Like [`parallel_root`] but with an external current source `i_src` injected
+/// into the node: the root's Thévenin voltage rises by `i_src · R`, i.e.
+/// `a = (Σ Gₖ·aₖ + i_src) / Σ Gₖ` behind the same `R = 1 / Σ Gₖ`. This is how an
+/// ideal op-amp's forced feedback current drives a diode clipper — the
+/// virtual-short reduction of a feedback-topology overdrive (`drive/sd1.rs`).
+/// `parallel_root(ports)` is exactly the `i_src = 0` case.
+#[inline]
+pub fn parallel_root_with_source(ports: &[(f32, f32)], i_src: f32) -> (f32, f32) {
+    let mut g_sum = 0.0f32;
+    let mut weighted = 0.0f32;
+    for &(g, a) in ports {
+        g_sum += g;
+        weighted += g * a;
+    }
+    ((weighted + i_src) / g_sum, 1.0 / g_sum)
 }
 
 #[cfg(test)]
@@ -295,5 +393,81 @@ mod tests {
         }
         // Capacitor fully charged, no current: node = source EMF.
         assert!((v - e).abs() < 1e-3, "settled {v}, want {e}");
+    }
+
+    fn asym(m: f32, k: f32) -> AsymDiode {
+        AsymDiode::new(2.52e-9, 1.75, 25.85e-3, m, k)
+    }
+
+    /// The matched case `m = k = 1` must reproduce the antiparallel
+    /// `DiodePair` (`2·Is·sinh`) — the asymmetric solver is a strict superset.
+    #[test]
+    fn asym_diode_matches_diode_pair_when_symmetric() {
+        let r = 2200.0f32;
+        for &a in &[-30.0, -3.0, -0.3, 0.0, 0.3, 3.0, 30.0] {
+            let (vp, bp) = DiodePair::new(2.52e-9, 1.75, 25.85e-3).solve(a, r);
+            let (va, ba) = asym(1.0, 1.0).solve(a, r);
+            assert!((vp - va).abs() < 1e-6, "a={a}: pair {vp} asym {va}");
+            assert!((bp - ba).abs() < 1e-6, "a={a}: b pair {bp} asym {ba}");
+        }
+    }
+
+    /// The returned root satisfies `a = v + R·i(v)` for the asymmetric curve.
+    #[test]
+    fn asym_diode_solves_its_equation() {
+        let r = 4700.0f32;
+        let vt_n = 1.75 * 25.85e-3f64;
+        for &a in &[-20.0, -1.0, -0.02, 0.02, 1.0, 20.0] {
+            let (v, b) = asym(2.0, 1.0).solve(a, r);
+            assert!(v.is_finite() && b.is_finite());
+            let i = 2.52e-9f64 * ((v as f64 / (2.0 * vt_n)).exp() - (-(v as f64) / vt_n).exp());
+            let residual = v as f64 + r as f64 * i - a as f64;
+            assert!(residual.abs() < 1e-4, "a={a}: residual {residual}");
+        }
+    }
+
+    /// `2` diodes one way, `1` the other: the two-diode (forward) side needs
+    /// ~twice the voltage to conduct, so it clips *later* → `v(−a) ≠ −v(a)`,
+    /// the source of even harmonics. A matched pair (above) cancels this.
+    #[test]
+    fn asym_diode_is_asymmetric() {
+        let r = 4700.0f32;
+        for &a in &[1.0f32, 5.0, 30.0] {
+            let (vp, _) = asym(2.0, 1.0).solve(a, r);
+            let (vn, _) = asym(2.0, 1.0).solve(-a, r);
+            assert!(
+                (vp + vn).abs() > 0.05,
+                "asymmetric clip must not cancel: a={a} vp={vp} vn={vn}"
+            );
+            assert!(vp > -vn, "the 2-diode side clips later: {vp} vs {}", -vn);
+        }
+    }
+
+    /// A slammed, alternating input stays finite and bounded (RT rule 7).
+    #[test]
+    fn asym_diode_bounded_when_slammed() {
+        let r = 4700.0f32;
+        let mut d = asym(2.0, 1.0);
+        for k in 0..1000 {
+            let a = if k % 2 == 0 { 1.0e6 } else { -1.0e6 };
+            let (v, b) = d.solve(a, r);
+            assert!(v.is_finite() && b.is_finite());
+            // The 2-diode forward side clamps near 2·nVt·ln(i/Is) ≈ 2.3 V under
+            // this (unphysical) slam; bounded means "no runaway", not sub-volt.
+            assert!(v.abs() < 3.0, "k={k}: v={v}");
+        }
+    }
+
+    /// The current-injected parallel root: zero source reproduces
+    /// [`parallel_root`] bit-for-bit, and a positive current lifts the node
+    /// voltage by exactly `i·R` while leaving the resistance untouched.
+    #[test]
+    fn parallel_root_source_injects_current() {
+        let ports = [(1.0 / 1000.0, 0.3f32), (1.0 / 2200.0, -0.1f32)];
+        let (a0, r0) = parallel_root(&ports);
+        assert_eq!((a0, r0), parallel_root_with_source(&ports, 0.0));
+        let (a1, r1) = parallel_root_with_source(&ports, 1e-3);
+        assert!((r1 - r0).abs() < 1e-9, "resistance unchanged by the source");
+        assert!((a1 - (a0 + 1e-3 * r0)).abs() < 1e-6, "node rises by i·R");
     }
 }

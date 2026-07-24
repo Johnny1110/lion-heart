@@ -7,6 +7,24 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-24 (deep water #2: WDF feedback overdrive) — Linux dev container (relative)
+
+The second white-box circuit (PRD 021 / ADR 029): the Boss SD-1 op-amp
+overdrive, this time the **feedback topology** (diodes in the op-amp feedback
+loop, reduced by the ideal-op-amp virtual short) with an **asymmetric** diode
+root (2 diodes one way, 1 the other). Same shape as the screamer's cost — a
+warm-started damped Newton solve in `f64` per **oversampled** sample per channel
+— so it benches essentially identical (the asymmetric root's two `exp` per
+iteration ≈ the symmetric root's `sinh`; the extra linear gain-leg bilinear is
+cheap). Deep-water price, only paid when `sd1` is the selected drive pedal; the
+optimisation paths noted for the screamer apply here too.
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| drive_sd1_4x_oversampled           | ~70.9 µs    | 5.3 %                  |
+| drive_screamer_4x_oversampled (ref)| ~70.1 µs    | 5.3 %  (WDF, matched)  |
+| drive_ts9_4x_oversampled (ref)     | ~11.4 µs    | 0.86 %  (memoryless)   |
+
 ## 2026-07-23 (deep water: WDF Tube Screamer) — Linux dev container (relative)
 
 The first white-box circuit model (PRD 020 / ADR 028): the Screamer clipping

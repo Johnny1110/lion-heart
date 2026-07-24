@@ -19,9 +19,78 @@ Lion-Heart: an open-source guitar amp & multi-effects processor for macOS, writt
 > Since v0.1.0 the work is the white paper's **§6 deep-water research line** and
 > the **cross-platform port** (ADR 027).
 
-**Deep water #1 — WDF Tube Screamer clipping stage — code landed (uncommitted).**
-Specced in PRD 020, recorded as **ADR 028**; the first white-box circuit model
-(white paper §6's named first topic). New reusable **`lh_dsp::blocks::wdf`**:
+**angry-charlie-v2 drive pedal — code landed (uncommitted).** User-requested
+2026-07-24: an "Angry Charlie V2" with a **600–800 Hz boost** and **more gain,
+into distortion**. New **append-only** drive pedal (key `angry-charlie-v2`, index
+13), same faceplate as the V1 (Gain/Bass/Middle/Treble/Volume) and the same DNA
+(red-LED symmetric hard clip outside the loop, post-clip Marshall Baxandall stack
+90/500/2800 Hz), with two changes: (1) a fixed **~700 Hz peaking boost**
+(`Biquad::set_peaking`, +6 dB, Q 2.0, **pre-clip** inside the 4× shaper) that
+drives the mids into the LEDs harder — the cutting, mid-forward lead voice; (2)
+**two cascaded hard-clip stages** instead of the V1's one (stage-1 gain +14..+64
+dB → LED clamp → 150 Hz interstage tighten → fixed +11 dB → second clamp), so it
+reaches genuine **distortion** with a dirty floor (drive 1 already breaks up where
+the V1 is clean), plus a 7.5 kHz post fizz LP. **V1 untouched** (append-only, so
+old presets/plugin ids are stable). Character pinned: `angry_charlie_v2_
+distorts_harder_than_the_v1` (≈2.4× the V1's residual at drive 3),
+`angry_charlie_v2_lifts_the_mids_over_the_v1` (700/250 tilt 2.8× vs the V1's 1.06),
+`mid_boost_peaks_in_the_600_800_band` (filter response), + the family suites cover
+index 13. Append-only: `DRIVE_PEDALS`/`MODEL_COUNT` 13→14, **no preset schema
+bump**, plugin auto-expands `drive_angry-charlie-v2_*` via `from_families` (pre-v0.1
+additive id break — re-run clap-validator), theme gained a deep blood-red livery
+(distinct-livery pin). `MAKEUP` 0.09 for unity at defaults. ~12.7 µs/block
+(memoryless-family cost, ~0.95 % deadline; the biquad + second clip add ~1.7 µs
+over the V1). No PRD/ADR (a routine append-only pedal on existing building blocks,
+like red-charlie/monster5150 — not architectural). Full suite **438 green**;
+fmt/clippy clean. Pending user verification **by ear**: the 700 Hz cut/focus and
+the distortion-level gain vs the V1; re-run clap-validator.
+
+**Deep water #2 — WDF feedback-topology overdrive + asymmetric clipping — code
+landed (uncommitted).** Specced in PRD 021, recorded as **ADR 029**; the **v2**
+PRD 020 / ADR 028 explicitly deferred (real feedback topology + asymmetric
+diodes). Substrate (`lh_dsp::blocks::wdf`) grew two RT-safe primitives:
+**`AsymDiode`** (`m` fwd / `k` rev series diodes, `i=Is·(exp(v/(m·nVt))−
+exp(−v/(k·nVt)))`, reduces to `DiodePair`'s `2·Is·sinh` at `m=k=1`; same
+warm-started damped `f64` Newton, step cap `10·min(m,k)·nVt`, 16-iter, exp-clamp →
+bounded/finite/alloc-free) and **`parallel_root_with_source`** (parallel root
+with a current injection `a=(ΣGₖaₖ+I)/ΣGₖ`; `parallel_root` untouched → `screamer`
+bit-identical). First application = new **drive pedal `sd1` "Super Drive"** (key
+`sd1`, index 12): a Boss SD-1 op-amp overdrive with the **diodes in the feedback
+loop** and **asymmetric** clip (2 diodes one way, 1 the other), the op-amp reduced
+by the **ideal-op-amp virtual short** (not a general Werner R-type nullor): the
+gain leg's forced current `I_g` (`R_gain`=4.7 kΩ+100 kΩ drive pot series `C_g`
+0.047 µF, a direct bilinear RC in the pedal) is driven into `[R_f 120 kΩ ‖ C_f
+51 pF ‖ AsymDiode]`, solve `V_fb`, `Vout=Vin+V_fb`. Two TS traits now fall out of
+the topology (screamer faked them): **dry always passes** (`+Vin`, gain ≥ 1, never
+a fuzz) and the **mid-hump is intrinsic** (`C_g` rolls loop gain to 1 below its
+drive-dependent corner — no 720 Hz input HP); `C_f` rounds the hardest highs.
+`shape()` one WDF sample per **4× OS** frame; `post()` = shared `ts9`/`screamer`
+tone tilt + makeup (`MAKEUP` 0.26 for unity) + DC block (also kills the
+asymmetric-clip offset). **`ts9`/`screamer` untouched** → three A/B points
+(memoryless symmetric curve / WDF shunt matched / WDF feedback asymmetric).
+Append-only: `DRIVE_PEDALS`/`MODEL_COUNT` 12→13, **no preset schema bump**, plugin
+auto-expands `drive_sd1_*` via `from_families` (**pre-v0.1 additive id break** —
+re-run clap-validator), theme gained an SD-1 canary-yellow livery under the
+distinct-livery pin. Deltas from PRD (ADR 029): `R_f` 120 kΩ is calibration (a
+hotter op-amp gain than a stock ~47 kΩ SD-1 — our signal is sample units vs the
+diodes' ~0.6/1.2 V drops; the value that clips at guitar level yet keeps the
+drive-6 mid-hump); bench **≈70.9 µs/block** (x86 sandbox, on par with `screamer`
+— asymmetric root's two `exp` ≈ symmetric `sinh`); white-box discriminator is the
+**gain leg lifting mids** (dual of the screamer's shunt cap softening highs).
+13 tests (5 `blocks::wdf`: asym=matched@1/1, asym-solves-eq, asymmetric,
+±1e6-bounded, current-injection; 3 sd1 core: freq-dependent clip, asymmetric-DC,
+silence→silence; 2 sd1 character: even-harmonics-vs-screamer, mid-hump; + family
+suites/registry/unity/theme pins cover index 12). Full suite 435 green;
+fmt/clippy clean. **Engine/session/plugin: zero code changes.** `blocks::wdf` is
+now ready for deep water #3 (diode-ladder tone stack, triode stage). Pending user
+verification: `sd1` vs `screamer` vs `ts9` **by ear** (asymmetric texture / even
+harmonics, mid-hump, drive/tone, roll-back cleanup), `assert_no_alloc` on the Mac
+(sandbox has no audio device), re-run clap-validator (`drive_sd1_*` appeared).
+
+**Deep water #1 — WDF Tube Screamer clipping stage — committed (`9a6de75`,
+merged `40f1fb8`).** Specced in PRD 020, recorded as **ADR 028**; the first
+white-box circuit model (white paper §6's named first topic). New reusable
+**`lh_dsp::blocks::wdf`**:
 `Capacitor` (bilinear one-port, `R=T/2C`, `b[n]=a[n−1]`), `DiodePair`
 (antiparallel `i=2·Is·sinh(v/nVt)` nonlinear root, solved by **warm-started
 damped Newton** in `f64` — step capped at `10·nVt`, 16-iter ceiling, exp-clamped
