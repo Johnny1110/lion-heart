@@ -59,28 +59,10 @@ study of `/mnt/BYOD` (Build-Your-Own-Distortion, ChowDSP, **GPL-3**) and
    overdrives + fuzz/transistor) — "I want all the drives."
 3. **Make `blocks::wdf` a platform for the user's own pedal R&D.**
 
-**Phase map** (each = a `phase/NN-*.md` with concrete work + acceptance):
-
-1. **Wright Omega** closed-form diode solver — **LANDED (PRD 022, 2026-07-27)**.
-   `blocks::wdf::omega`; `DiodePair::solve` is now closed-form with the damped
-   Newton kept as `solve_newton`, the permanent accuracy oracle. `screamer`
-   72.3 → **30.5 µs**; root alone 12.7×; worst node error 30 µV. The guess
-   polynomial is **fitted here**, not ported — it beats the reference's
-   two-correction accuracy at one-correction cost. `sd1`/`AsymDiode` stay
-   Newton by design.
-2. **Tone-stack framework** — analytic coupled FMV/Baxandall transfer function
-   (cheap, exact, linear); fixes the headline complaint. **New ADR 030.**
-3. **WDF composable adaptor framework** — Series/Parallel + **R-Type** adaptor +
-   op-amp model (the substrate for the whole op-amp family). **New ADR 031.**
-4. **op-amp overdrive family** — TS (faithful) / ZenDrive / King of Tone /
-   MXR Distortion+ / RAT + selectable diodes.
-5. **fuzz / transistor / booster** — Big Muff / Fuzz Face / Rangemaster.
-6. **waveshaper bank + ADAA** anti-aliasing (also de-fizzes existing memoryless
-   drives).
-7. **neural / tube** (Centaur / GuitarML / triode) — heaviest, **optional/
-   deferred** (model-weight licensing).
-8. **self-R&D platform** — netlist → R-Solver → codegen, SPICE-fit workflow,
-   "add-a-WDF-pedal" cookbook.
+**Phase 01 landed** (Wright Omega closed-form diode root — PRD 022, 2026-07-27);
+**Phase 02, the tone-stack framework, is next**. The full phase map, the revised
+execution order, and each phase's acceptance criteria live in the docs linked
+above — read them there, not here.
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`
@@ -105,10 +87,6 @@ audio hardware; the ALSA "null" device (usually index 0) exercises the stream pi
 ### Commands
 
 ```sh
-cargo build                                    # debug build
-cargo fmt --check                              # formatting gate
-cargo clippy --all-targets -- -D warnings      # lint gate
-cargo test                                     # all tests run offline, no device needed
 cargo bench -p lh-dsp --bench effects          # per-block DSP cost (criterion)
 cargo run -p lion-heart --release              # the GUI (no subcommand)
 cargo run -p lion-heart -- devices             # list devices
@@ -125,15 +103,12 @@ Plugin bundling: `cargo xtask bundle lion-heart-plugin --release` →
 The GUI spike workspace has its own gates (run from `spikes/`):
 `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.
 
-CI (`.github/workflows/ci.yml`) runs fmt/clippy/test/build on macOS and Ubuntu
-(root workspace only; `spikes/` is excluded).
-
 ## Workspace layout
 
 | Crate            | Responsibility                                                    | May depend on |
 | ---------------- | ----------------------------------------------------------------- | ------------- |
 | `lh-core`        | Param IDs & ranges, chain model, preset schema. No I/O, no threads | —             |
-| `lh-dsp`         | Effects, one module per family (dynamics, filter, drive, power, eq, modulation, time, cab, pitch, looper, acoustic) over shared `blocks/`; plus non-slot modules `practice` (aux monitor: metronome/drums/song), `loudness` (LUFS), `tuner`. Offline-testable, RT-safe | `lh-core`     |
+| `lh-dsp`         | Effects, one module per family over shared `blocks/`; plus non-slot modules `practice` (aux monitor), `loudness`, `tuner`. Offline-testable, RT-safe | `lh-core`     |
 | `lh-engine`      | RT graph runner, node lifecycle, lock-free plumbing               | core, dsp     |
 | `lh-nam`         | `NamAmp` effect + `.nam` loading/validation (nam-rs seam)         | core, dsp     |
 | `lh-io`          | cpal device management, duplex runner, latency measurement        | core          |
