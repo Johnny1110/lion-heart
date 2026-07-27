@@ -59,10 +59,24 @@ study of `/mnt/BYOD` (Build-Your-Own-Distortion, ChowDSP, **GPL-3**) and
    overdrives + fuzz/transistor) — "I want all the drives."
 3. **Make `blocks::wdf` a platform for the user's own pedal R&D.**
 
-**Phase 01 landed** (Wright Omega closed-form diode root — PRD 022, 2026-07-27);
-**Phase 02, the tone-stack framework, is next**. The full phase map, the revised
-execution order, and each phase's acceptance criteria live in the docs linked
-above — read them there, not here.
+**Phases 01, 02 and 06 landed** (2026-07-27) — the three quick wins of the
+revised order:
+
+- **01** Wright Omega closed-form diode root (PRD 022).
+- **02** Tone-stack framework (PRD 023 / **ADR 030**): `eq::tonestack` turns a
+  netlist into a state space and Tustin-discretises it at block rate;
+  `bassman`/`jcm800`/`big-muff` models; the five FMV-voiced drives migrated off
+  the old additive 3-band (**voicing change**, character tests re-pinned); a
+  standalone `tonestack` pedal appended to the `eq` family.
+- **06** Waveshaper + ADAA (PRD 024 / **ADR 031**): `blocks::waveshaper` gives
+  first/second-order antiderivative anti-aliasing plus a 12-curve bank; **every
+  memoryless clipper in the drive family** now runs through it (alias floor −29
+  → −38…−87 dB, character pins unchanged); new `waveshaper` drive pedal.
+  Drive family is now **15 pedals**.
+
+**Phase 03 (WDF composable adaptors + R-Type) is next** per the revised order —
+the architectural one, and the gate for the op-amp drive family. The full phase
+map and each phase's acceptance criteria live in the docs linked above.
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`

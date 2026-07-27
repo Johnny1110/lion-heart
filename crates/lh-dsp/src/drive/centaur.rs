@@ -12,6 +12,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::Adaa1;
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 3] = [
@@ -36,6 +38,10 @@ const MAKEUP: f32 = 0.65;
 const LOW_TILT: f32 = -0.5;
 
 pub(super) struct Centaur {
+    /// Anti-aliased clipping (PRD 024). The clean path it sums against is
+    /// undelayed; at 4× that combs by under 0.1 dB below 10 kHz (see
+    /// `blocks::waveshaper`).
+    clip: Adaa1,
     low_lp: OnePole,
     hp250: OnePole,
     treble_hp: OnePole,
@@ -49,6 +55,7 @@ pub(super) struct Centaur {
 impl Centaur {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             low_lp: OnePole::default(),
             hp250: OnePole::default(),
             treble_hp: OnePole::default(),
@@ -63,9 +70,19 @@ impl Centaur {
     /// Germanium pair: even softer knee than silicon — `u/(1+|u|)` instead
     /// of `tanh`, scaled to the diode drop.
     #[inline]
-    fn germanium(v: f32) -> f32 {
-        let u = v / KNEE;
-        KNEE * (u / (1.0 + u.abs()))
+    fn germanium(v: f64) -> f64 {
+        let u = v / KNEE as f64;
+        KNEE as f64 * (u / (1.0 + u.abs()))
+    }
+
+    /// `germanium`'s antiderivative, normalised to `F₁(0) = 0` (PRD 024).
+    /// `∫ u/(1+|u|) du = |u| − ln(1+|u|)`, and the curve is odd so this is
+    /// even — one branch covers both.
+    #[inline]
+    fn germanium_f1(v: f64) -> f64 {
+        let k = KNEE as f64;
+        let a = (v / k).abs();
+        k * k * (a - a.ln_1p())
     }
 }
 
@@ -79,6 +96,7 @@ impl Circuit for Centaur {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.low_lp.reset();
         self.hp250.reset();
         self.treble_hp.reset();
@@ -97,7 +115,9 @@ impl Circuit for Centaur {
             // Clean path, low-shelf-tightened: the mid-forward Klon boost.
             let clean = x + LOW_TILT * self.low_lp.lp(x, self.c_low);
             let dirty_in = x - self.hp250.lp(x, self.c250);
-            let dirty = Self::germanium(gain.tick() * dirty_in);
+            let dirty =
+                self.clip
+                    .process(gain.tick() * dirty_in, Self::germanium, Self::germanium_f1);
             *s = (1.2 + 0.8 * b) * clean + b * b * dirty;
         }
     }

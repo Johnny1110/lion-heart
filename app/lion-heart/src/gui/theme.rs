@@ -58,6 +58,10 @@ const POWER: Color = Color::from_rgb(0.93, 0.52, 0.20);
 const EQ: Color = Color::from_rgb(0.36, 0.77, 0.72);
 /// The parametric pedal wears analyzer ice; the 3-band keeps the family teal.
 const PARAMETRIC: Color = Color::from_rgb(0.58, 0.86, 0.98);
+/// Lacquered tweed brown — the tone stack pedal is an *amp's* tone network
+/// (PRD 023), not another EQ, so it steps out of the family's cool palette
+/// entirely. Darker than the cab's mic'd-wood and the acoustic's spruce.
+const TONESTACK: Color = Color::from_rgb(0.62, 0.44, 0.22);
 const MODULATION: Color = Color::from_rgb(0.67, 0.53, 0.93);
 const DELAY: Color = Color::from_rgb(0.35, 0.69, 0.90);
 const REVERB: Color = Color::from_rgb(0.58, 0.63, 0.93);
@@ -102,6 +106,10 @@ const SCREAMER: Color = Color::from_rgb(0.22, 0.64, 0.52);
 /// bright yellow that no other drive box (the centaur/jan-ray golds, the
 /// tremolo/chorale ambers) comes near.
 const SD1: Color = Color::from_rgb(0.96, 0.82, 0.22);
+/// Cold laboratory cyan — the waveshaper is the one drive that models no
+/// circuit at all (PRD 024), just twelve functions, so it wears the only
+/// non-enclosure colour in a family of painted boxes.
+const WAVESHAPER: Color = Color::from_rgb(0.30, 0.84, 0.86);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -177,6 +185,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "overdrive" => OVERDRIVE,
             "screamer" => SCREAMER,
             "sd1" => SD1,
+            "waveshaper" => WAVESHAPER,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {
@@ -190,6 +199,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
         },
         "eq" => match pedal_key {
             "parametric" => PARAMETRIC,
+            "tonestack" => TONESTACK,
             _ => EQ, // the 3-band tone pedal wears the family teal
         },
         "mod" => match pedal_key {

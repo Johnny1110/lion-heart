@@ -16,6 +16,8 @@
 
 use lh_core::{EffectDesc, ParamDesc};
 
+use crate::blocks::waveshaper::Adaa1;
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 3] = [
@@ -53,17 +55,37 @@ fn soft_limit(x: f32) -> f32 {
 
 /// stmlib soft-clip: `soft_limit` inside ±3, hard ±1 beyond.
 #[inline]
-fn soft_clip(x: f32) -> f32 {
+fn soft_clip(x: f64) -> f64 {
     if x < -3.0 {
         -1.0
     } else if x > 3.0 {
         1.0
     } else {
-        soft_limit(x)
+        soft_limit(x as f32) as f64
+    }
+}
+
+/// `soft_clip`'s antiderivative, normalised to `F₁(0) = 0` (PRD 024).
+///
+/// Inside ±3 the rational limiter integrates exactly: dividing out gives
+/// `x/9 + 24x/(9x² + 27)`, whose integral is `x²/18 + (4/3)·ln(9x² + 27)`.
+/// Beyond ±3 the curve is flat, so `F₁` continues as a straight line.
+#[inline]
+fn soft_clip_f1(x: f64) -> f64 {
+    const K: f64 = 4.0 / 3.0;
+    let inner = |u: f64| u * u / 18.0 + K * ((9.0 * u * u + 27.0).ln() - 27f64.ln());
+    if x > 3.0 {
+        inner(3.0) + (x - 3.0)
+    } else if x < -3.0 {
+        inner(-3.0) - (x + 3.0)
+    } else {
+        inner(x)
     }
 }
 
 pub(super) struct Overdrive {
+    /// Anti-aliased clipping (PRD 024).
+    clip: Adaa1,
     tone_lp: OnePole,
     dc: OnePole,
     c_tone: f32,
@@ -73,6 +95,7 @@ pub(super) struct Overdrive {
 impl Overdrive {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             tone_lp: OnePole::default(),
             dc: OnePole::default(),
             c_tone: 0.0,
@@ -102,7 +125,7 @@ impl Overdrive {
         let d = 2.0 * (pos * 0.1).min(DRIVE_CEILING);
         let squashed = d * (2.0 - d);
         let pre = Self::pre_gain(pos);
-        1.0 / soft_clip(0.33 + squashed * (pre - 0.33))
+        1.0 / soft_clip(f64::from(0.33 + squashed * (pre - 0.33))) as f32
     }
 }
 
@@ -114,6 +137,7 @@ impl Circuit for Overdrive {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.tone_lp.reset();
         self.dc.reset();
     }
@@ -125,7 +149,7 @@ impl Circuit for Overdrive {
         let mut pre = Ramp::over(drive, Self::pre_gain);
         let mut post = Ramp::over(drive, Self::post_gain);
         for s in block.iter_mut() {
-            *s = soft_clip(pre.tick() * *s) * post.tick();
+            *s = self.clip.process(pre.tick() * *s, soft_clip, soft_clip_f1) * post.tick();
         }
     }
 

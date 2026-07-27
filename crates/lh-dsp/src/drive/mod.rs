@@ -44,8 +44,9 @@ mod red_charlie;
 mod screamer;
 mod sd1;
 mod ts9;
+mod waveshaper;
 
-use lh_core::{FamilyDesc, ParamDesc, Range, db_to_lin, drive_law};
+use lh_core::{FamilyDesc, ParamDesc, Range, drive_law};
 
 use crate::Effect;
 use crate::blocks::oversample::{CHUNK, Oversampler4x};
@@ -86,10 +87,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &screamer::DESC,
         &sd1::DESC,
         &angry_charlie_v2::DESC,
+        &waveshaper::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 14;
+pub const MODEL_COUNT: usize = 15;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -100,6 +102,10 @@ enum Ctl {
     Low,
     Mid,
     High,
+    /// A stepped selector routed straight to the circuit rather than through a
+    /// smoother — the `waveshaper`'s curve. Private to `lh-dsp`, so adding it
+    /// costs no preset or plugin schema change.
+    Shape,
 }
 
 /// One entry in the drive pedal registry: the faceplate, the param→control
@@ -182,6 +188,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
         build: || Box::new(angry_charlie_v2::AngryCharlieV2::new()),
     },
+    ModelDef {
+        desc: &waveshaper::DESC,
+        controls: &[Ctl::Drive, Ctl::Shape, Ctl::Tone, Ctl::Level],
+        build: || Box::new(waveshaper::Waveshaper::new()),
+    },
 ];
 
 /// One channel of one drive model. Built off the audio thread
@@ -200,6 +211,11 @@ pub trait Circuit: Send {
     /// per-band controls. `low[i]` / `mid[i]` / `high[i]` are the smoothed
     /// knob positions (0..10) for `block[i]`.
     fn eq(&mut self, _block: &mut [f32], _low: &[f32], _mid: &[f32], _high: &[f32]) {}
+    /// A stepped selector reached the faceplate. Default no-op; only the
+    /// `waveshaper` has one. Called off the per-sample path, on whichever
+    /// thread applies params — so it must stay allocation-free, but it may do
+    /// real work (it resets filter state).
+    fn set_shape(&mut self, _index: usize) {}
 }
 
 // --- shared building blocks ---
@@ -254,75 +270,57 @@ impl Ramp {
     }
 }
 
-/// Shared 3-band tone stack for pedals with Low/Mid/High faceplates:
-/// one-pole shelves plus a cascaded-one-pole mid bandpass (LP at f·1.4 minus
-/// a second LP at f/1.4). Knob 5 = flat (0 dB), 0/10 = full cut/boost —
-/// low/high reach ±12 dB, mid ±10 dB. Each pedal keeps only its voicing
-/// (the corner frequencies); the filter math and the dB knob laws live
-/// here, once.
+/// Shared tone stack for pedals with Low/Mid/High faceplates — the **real
+/// passive amp network** (PRD 023), not three independent bands.
+///
+/// Until PRD 023 this was `x + lo·low + mid·band + hi·high`: three orthogonal
+/// filters summed, flat at noon. That is a graphic EQ, and it is why the
+/// amp-in-a-box drives sounded like one. A Marshall or Fender tone stack is a
+/// single coupled RC network whose three pots load the same nodes, so the
+/// knobs interact and noon carries the amp's own mid scoop.
+///
+/// Each pedal now names the amp it is voiced after ([`crate::eq::tonestack::kind`])
+/// instead of three corner frequencies; the network, its component values and
+/// its makeup gain live in [`crate::eq::tonestack`].
 struct ToneStack {
-    low_hz: f32,
-    mid_hz: f32,
-    high_hz: f32,
-    lo: OnePole,
-    mid_lp: OnePole,
-    mid_hp: OnePole,
-    hi: OnePole,
-    c_lo: f32,
-    c_mid_wide: f32,
-    c_mid_narrow: f32,
-    c_hi: f32,
+    core: crate::eq::tonestack::ToneStack,
 }
 
 impl ToneStack {
-    fn new(low_hz: f32, mid_hz: f32, high_hz: f32) -> Self {
+    fn new(kind: usize) -> Self {
         Self {
-            low_hz,
-            mid_hz,
-            high_hz,
-            lo: OnePole::default(),
-            mid_lp: OnePole::default(),
-            mid_hp: OnePole::default(),
-            hi: OnePole::default(),
-            c_lo: 0.0,
-            c_mid_wide: 0.0,
-            c_mid_narrow: 0.0,
-            c_hi: 0.0,
+            core: crate::eq::tonestack::ToneStack::new(kind),
         }
     }
 
     fn prepare(&mut self, base_rate: f32) {
-        self.c_lo = lp_coeff(self.low_hz, base_rate);
-        self.c_mid_wide = lp_coeff(self.mid_hz * 1.4, base_rate);
-        self.c_mid_narrow = lp_coeff(self.mid_hz / 1.4, base_rate);
-        self.c_hi = lp_coeff(self.high_hz, base_rate);
-        self.reset();
+        self.core.prepare(base_rate);
     }
 
     fn reset(&mut self) {
-        self.lo.reset();
-        self.mid_lp.reset();
-        self.mid_hp.reset();
-        self.hi.reset();
+        self.core.reset();
     }
 
-    /// Apply the stack in place. Band gains are mapped from the smoothed
-    /// knob trajectories with the shared [`Ramp`] — two `powf` per band per
-    /// chunk instead of three per sample.
+    /// Apply the stack in place. [`Drive`] has already smoothed the knobs into
+    /// these trajectories, so the network's coefficients are rebuilt once per
+    /// chunk from where they land rather than per sample — and because the
+    /// filter state *is* the capacitor voltages, it carries across the rebuild
+    /// unchanged, which is what keeps a knob sweep continuous.
     fn process(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        let mut lo_gain = Ramp::over(low, |l| db_to_lin(-12.0 + 2.4 * l) - 1.0);
-        let mut mid_gain = Ramp::over(mid, |m| db_to_lin(-10.0 + 2.0 * m) - 1.0);
-        let mut hi_gain = Ramp::over(high, |h| db_to_lin(-12.0 + 2.4 * h) - 1.0);
-        for s in block.iter_mut() {
-            let x = *s;
-            let lo = self.lo.lp(x, self.c_lo);
-            let hi = x - self.hi.lp(x, self.c_hi);
-            let bp_raw = self.mid_lp.lp(x, self.c_mid_wide);
-            let bp = bp_raw - self.mid_hp.lp(bp_raw, self.c_mid_narrow);
-            *s = x + lo_gain.tick() * lo + mid_gain.tick() * bp + hi_gain.tick() * hi;
+        for (i, sub) in block.chunks_mut(EQ_REBUILD).enumerate() {
+            let at = ((i + 1) * EQ_REBUILD).min(low.len()) - 1;
+            self.core.set_knobs([low[at], mid[at], high[at]]);
+            self.core.process_mono(sub);
         }
     }
 }
+
+/// Samples between tone-stack coefficient rebuilds. [`CHUNK`] is 256 — 5.3 ms
+/// at 48 kHz, coarse enough that a fast knob turn would step the response
+/// audibly — so the stack subdivides it. At 64 samples the rebuild rate is
+/// 750 Hz, the same figure [`crate::eq::chain`] settled on, and a settled knob
+/// costs a three-float comparison per sub-block.
+const EQ_REBUILD: usize = 64;
 
 // --- the effect ---
 
@@ -444,6 +442,13 @@ impl Effect for Drive {
             Ctl::Low => self.low_s.set_target(real),
             Ctl::Mid => self.mid_s.set_target(real),
             Ctl::High => self.high_s.set_target(real),
+            // Not smoothed: it selects a curve, it does not sweep one. Both
+            // channels must agree, so it goes to the pair.
+            Ctl::Shape => {
+                for circuit in &mut self.circuits[self.model] {
+                    circuit.set_shape(real as usize);
+                }
+            }
         }
     }
 
@@ -568,6 +573,185 @@ mod tests {
         let fund_rms = tone_at(y, f0) / 2f64.sqrt();
         let total_rms = f64::from(rms(tail));
         (total_rms.powi(2) - fund_rms.powi(2)).max(0.0).sqrt() / total_rms
+    }
+
+    /// What the shared amp tone stack contributes at `freq` with its knobs at
+    /// noon. Since PRD 023 that is emphatically *not* 0 dB — a passive stack
+    /// has its own scoop and insertion loss — so a test that wants to say
+    /// something about a pedal's **clipper** or its **pre-gain voicing**
+    /// divides the stack back out instead of measuring the two together.
+    fn stack_gain(kind: usize, freq: f32) -> f64 {
+        let mut ts = crate::eq::tonestack::ToneStack::new(kind);
+        ts.prepare(SR as f32);
+        ts.set_knobs([5.0; crate::eq::tonestack::MAX_KNOBS]);
+        let x = sine(SR, freq, SR as usize / 2);
+        let mut y = x.clone();
+        for b in y.chunks_mut(256) {
+            ts.process_mono(b);
+        }
+        f64::from(rms(&y[y.len() / 2..]) / rms(&x[x.len() / 2..]))
+    }
+
+    /// The stack's noon tilt between two probe frequencies, as a multiplier on
+    /// a `high / low` ratio.
+    fn stack_tilt(kind: usize, low: f32, high: f32) -> f64 {
+        stack_gain(kind, high) / stack_gain(kind, low)
+    }
+
+    /// The anti-aliasing pin (PRD 024). Every memoryless clipper in the family
+    /// now runs through ADAA on top of the 4× oversampler, and this is the
+    /// number that proves it: inharmonic energy relative to the fundamental,
+    /// per pedal, with the drive well up.
+    ///
+    /// Before the retrofit six pedals sat between −28 and −30 dB — that floor
+    /// *is* the "fizzy up the neck" complaint. The bounds below are the
+    /// measured values with a few dB of slack, so a regression that quietly
+    /// drops ADAA from a stage shows up here rather than in someone's ears.
+    ///
+    /// Note the split: a single clipper fed a bandlimited signal gains 25–50
+    /// dB, while `monster5150` (three cascaded clamps), `angry-charlie-v2`
+    /// (two) and `red-charlie` (two) gain 8–13 dB. That is inherent — ADAA
+    /// assumes its input is linear between samples, which is true of the
+    /// signal entering the *first* clipper and false of an already-squared
+    /// wave entering the second.
+    #[test]
+    fn every_memoryless_clipper_is_anti_aliased() {
+        // (pedal key, bound in dB). `screamer` and `sd1` are WDF: their
+        // nonlinearity is a solved equation, not an explicit curve, so ADAA
+        // does not apply and their rows are here as unchanged references.
+        let bounds: [(&str, f64); MODEL_COUNT] = [
+            ("ts9", -80.0),
+            ("bd2", -52.0),
+            ("classic", -58.0),
+            ("centaur", -73.0),
+            ("evva", -54.0),
+            ("red-charlie", -35.0),
+            ("monster5150", -33.0),
+            ("angry-charlie", -73.0),
+            ("jan-ray", -63.0),
+            ("fuzz-face", -48.0),
+            ("overdrive", -50.0),
+            ("screamer", -39.0),
+            ("sd1", -45.0),
+            ("angry-charlie-v2", -38.0),
+            ("waveshaper", -70.0),
+        ];
+        for (i, (key, bound)) in bounds.iter().enumerate() {
+            assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
+            let floor = alias_floor_db(i, 8.0);
+            assert!(
+                floor < *bound,
+                "{key}: alias floor {floor:.2} dB has risen above its \
+                 {bound:.0} dB pin — did a stage lose its ADAA?"
+            );
+        }
+    }
+
+    /// Diagnostic: print the whole table. Run with
+    /// `cargo test -p lh-dsp alias_floor_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn alias_floor_survey() {
+        for (i, def) in MODELS.iter().enumerate() {
+            let floor = alias_floor_db(i, 8.0);
+            println!("{:>18}  alias floor {floor:7.2} dB", def.desc.key);
+        }
+    }
+
+    /// Energy at frequencies that are *not* harmonics of the 5 kHz probe,
+    /// relative to the fundamental, in dB. Anything a memoryless shaper puts
+    /// there arrived by folding over Nyquist.
+    fn alias_floor_db(model: usize, drive_pos: f32) -> f64 {
+        const F0: f32 = 5_000.0;
+        // The 5th to 9th harmonics fold back onto these; none is a multiple
+        // of 5 kHz, so nothing legitimate lands on them.
+        const ALIASES: [f32; 4] = [3_000.0, 8_000.0, 13_000.0, 18_000.0];
+        let x = sine(SR, F0, SR as usize);
+        let mut d = prepared(model);
+        set_pos(&mut d, 0, drive_pos);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let tail = &y[y.len() / 2..];
+        let fund = tone_at(tail, F0);
+        let alias = ALIASES
+            .iter()
+            .map(|f| tone_at(tail, *f).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        20.0 * (alias / fund.max(1e-12)).log10()
+    }
+
+    /// Every curve must reach the audio and change it — the Shape knob is not
+    /// twelve labels over one sound.
+    ///
+    /// Stated as "differs from the default curve", not "differs from every
+    /// other curve": `Soft` and `Diode` really are near-identical shapes (one
+    /// is cheaper, the other has the second antiderivative ADAA2 needs), and
+    /// wound up far enough every symmetric curve converges on a square wave.
+    /// Distinctness as *functions* is pinned exactly, without audio, over in
+    /// `blocks::waveshaper`.
+    ///
+    /// Probed with a **sustained** unit sine rather than the usual decaying
+    /// pluck: `tone_at` and friends read the second half of the buffer, where
+    /// a pluck has decayed below every curve's knee — and inside their knees
+    /// half this bank *is* the identity function.
+    #[test]
+    fn waveshaper_every_curve_reaches_the_audio() {
+        use crate::blocks::waveshaper::CURVE_COUNT;
+        let model = MODEL_COUNT - 1;
+        assert_eq!(MODELS[model].desc.key, "waveshaper");
+        let x = sine(SR, 220.0, SR as usize);
+        let render = |curve: usize| -> Vec<f32> {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, 3.0);
+            d.set_param(1, MODELS[model].desc.params[1].range.to_norm(curve as f32));
+            process_in_blocks(&mut d, &x, 256)
+        };
+        let base = render(0);
+        for curve in 0..CURVE_COUNT {
+            let y = render(curve);
+            assert_finite(&format!("waveshaper curve {curve}"), &y);
+            assert!(peak(&y) < 4.0, "curve {curve} peaked {}", peak(&y));
+            if curve == 0 {
+                continue;
+            }
+            let half = y.len() / 2;
+            let diff: Vec<f32> = y[half..]
+                .iter()
+                .zip(&base[half..])
+                .map(|(a, b)| a - b)
+                .collect();
+            let change = f64::from(rms(&diff) / rms(&base[half..]));
+            assert!(
+                change > 0.005,
+                "curve {curve} renders within {:.4}% of the default curve — \
+                 the Shape knob is not reaching it",
+                change * 100.0
+            );
+        }
+    }
+
+    /// The Shape selector is stepped and routed outside the smoothers, so it
+    /// must not click when it lands mid-note, and both channels must follow.
+    #[test]
+    fn waveshaper_shape_switch_is_bounded_and_stereo_locked() {
+        let model = MODEL_COUNT - 1;
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(model);
+        set_pos(&mut d, 0, 7.0);
+        let mut l = x.clone();
+        let mut r = x.clone();
+        let desc = MODELS[model].desc;
+        for (i, (cl, cr)) in l.chunks_mut(256).zip(r.chunks_mut(256)).enumerate() {
+            if i % 8 == 0 {
+                let curve = (i / 8) % crate::blocks::waveshaper::CURVE_COUNT;
+                d.set_param(1, desc.params[1].range.to_norm(curve as f32));
+            }
+            d.process(cl, cr);
+        }
+        assert_finite("waveshaper shape sweep L", &l);
+        assert_finite("waveshaper shape sweep R", &r);
+        assert_eq!(l, r, "both channels must select the same curve");
+        assert!(peak(&l) < 4.0);
     }
 
     #[test]
@@ -1049,6 +1233,13 @@ mod tests {
     fn evva_eq_bands_work() {
         // Verify each EQ band actually shapes the spectrum, probing with
         // tones the input actually contains (see `tones`).
+        //
+        // Re-pinned for PRD 023's real passive network: a passive stack cuts
+        // rather than boosts, and noon already sits near the top of the bass
+        // and treble travel — so each control is measured across its **full
+        // sweep** (0 → 10) instead of 5 → 10. Mid at 0 is the scooped preset,
+        // which is now the baseline of the mid assertion rather than a
+        // separate one.
         let x = tones(&[80.0, 200.0, 500.0, 750.0, 3_000.0, 6_100.0], SR as usize);
         let measure = |low: f32, mid: f32, high: f32, freq: f32| -> f64 {
             let mut d = prepared(4);
@@ -1060,35 +1251,28 @@ mod tests {
             tone_at(&y, freq)
         };
 
-        // Low shelf: boosting low should lift 80 Hz relative to 3 kHz.
-        let flat_lo = measure(5.0, 5.0, 5.0, 80.0) / measure(5.0, 5.0, 5.0, 3_000.0);
-        let boosted_lo = measure(10.0, 5.0, 5.0, 80.0) / measure(10.0, 5.0, 5.0, 3_000.0);
-        assert!(
-            boosted_lo > 1.3 * flat_lo,
-            "low shelf boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
-        );
-
-        // Mid band: boosting mid should lift 750 Hz relative to 200 Hz.
-        let flat_mid = measure(5.0, 5.0, 5.0, 750.0) / measure(5.0, 5.0, 5.0, 200.0);
-        let boosted_mid = measure(5.0, 10.0, 5.0, 750.0) / measure(5.0, 10.0, 5.0, 200.0);
-        assert!(
-            boosted_mid > 1.5 * flat_mid,
-            "mid boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
-        );
-
-        // High shelf: boosting high should lift 6.1 kHz relative to 500 Hz.
-        let flat_hi = measure(5.0, 5.0, 5.0, 6_100.0) / measure(5.0, 5.0, 5.0, 500.0);
-        let boosted_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 500.0);
-        assert!(
-            boosted_hi > 1.5 * flat_hi,
-            "high shelf boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
-        );
-
-        // Cut: low at 0 should reduce 80 Hz.
+        // Low: 80 Hz against 3 kHz, across the pot's travel.
         let cut_lo = measure(0.0, 5.0, 5.0, 80.0) / measure(0.0, 5.0, 5.0, 3_000.0);
+        let full_lo = measure(10.0, 5.0, 5.0, 80.0) / measure(10.0, 5.0, 5.0, 3_000.0);
         assert!(
-            cut_lo < 0.7 * flat_lo,
-            "low shelf cut: {cut_lo:.3} vs flat {flat_lo:.3}"
+            full_lo > 2.5 * cut_lo,
+            "bass travel: {full_lo:.3} at 10 vs {cut_lo:.3} at 0"
+        );
+
+        // Mid: 750 Hz against 200 Hz, across the pot's travel.
+        let cut_mid = measure(5.0, 0.0, 5.0, 750.0) / measure(5.0, 0.0, 5.0, 200.0);
+        let full_mid = measure(5.0, 10.0, 5.0, 750.0) / measure(5.0, 10.0, 5.0, 200.0);
+        assert!(
+            full_mid > 1.8 * cut_mid,
+            "middle travel: {full_mid:.3} at 10 vs {cut_mid:.3} at 0"
+        );
+
+        // High: 6.1 kHz against 500 Hz, across the pot's travel.
+        let cut_hi = measure(5.0, 5.0, 0.0, 6_100.0) / measure(5.0, 5.0, 0.0, 500.0);
+        let full_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 500.0);
+        assert!(
+            full_hi > 2.5 * cut_hi,
+            "treble travel: {full_hi:.3} at 10 vs {cut_hi:.3} at 0"
         );
     }
 
@@ -1097,13 +1281,20 @@ mod tests {
         // A distortion, not an overdrive: the cascaded stages leave far less
         // of the fundamental intact than the dry-summing TS9 at the same
         // knob position.
-        let x = guitar(220.0, SR as usize);
+        //
+        // Probed at 330 Hz rather than 220: `harmonic_residual` weighs the
+        // whole harmonic series against the fundamental, and since PRD 023 the
+        // JCM800 stack sits ~4 dB lower at 440 Hz than at 220 Hz — measuring
+        // an A would read the stack's scoop as "less distortion". At 330 Hz
+        // the stack is within 2 dB across the first four harmonics, so the
+        // number is the clipper's.
+        let x = guitar(330.0, SR as usize);
         let mut jcm = prepared(5);
         set_pos(&mut jcm, 0, 6.0);
-        let jcm_res = harmonic_residual(&process_in_blocks(&mut jcm, &x, 256), 220.0);
+        let jcm_res = harmonic_residual(&process_in_blocks(&mut jcm, &x, 256), 330.0);
         let mut ts9 = prepared(0);
         set_pos(&mut ts9, 0, 6.0);
-        let ts9_res = harmonic_residual(&process_in_blocks(&mut ts9, &x, 256), 220.0);
+        let ts9_res = harmonic_residual(&process_in_blocks(&mut ts9, &x, 256), 330.0);
         assert!(
             jcm_res > 1.5 * ts9_res,
             "red-charlie cascade must out-distort the ts9: {jcm_res:.3} vs {ts9_res:.3}"
@@ -1113,13 +1304,20 @@ mod tests {
     #[test]
     fn red_charlie_cold_clipper_makes_even_harmonics() {
         // The cold-biased second stage shears one polarity early — a strong
-        // 2nd harmonic is the fingerprint.
+        // 2nd harmonic is the fingerprint. The JCM800 stack sits ~4 dB lower
+        // at 440 Hz than at 220 Hz, so the ratio is read against the stack's
+        // own noon tilt: the claim is about the clipper (PRD 023).
         let x = guitar(220.0, SR as usize);
         let mut d = prepared(5);
         set_pos(&mut d, 0, 6.0);
         let y = process_in_blocks(&mut d, &x, 256);
+        let stack = stack_tilt(crate::eq::tonestack::kind::JCM800, 220.0, 440.0);
         let h2 = tone_at(&y, 440.0) / tone_at(&y, 220.0);
-        assert!(h2 > 0.03, "red-charlie even harmonics: h2/f0 = {h2:.4}");
+        assert!(
+            h2 > 0.03 * stack,
+            "red-charlie even harmonics: h2/f0 = {h2:.4} against a stack tilt \
+             of {stack:.3}"
+        );
     }
 
     #[test]
@@ -1128,15 +1326,22 @@ mod tests {
         // interstage coupling pull ~8 dB out of a 110 Hz note relative to
         // the mids *before* the hot stage. Measured at low gain where the
         // voicing is linear.
+        //
+        // The claim is about what reaches the clipper, so the JCM800 stack's
+        // own noon tilt is divided back out (PRD 023) — downstream of the
+        // gain it tilts the *other* way, and measuring the two together would
+        // say nothing about either.
         let x = tones(&[110.0, 650.0], SR as usize);
         let mut d = prepared(5);
         set_pos(&mut d, 0, 1.0);
         let y = process_in_blocks(&mut d, &x, 256);
+        let stack = stack_tilt(crate::eq::tonestack::kind::JCM800, 110.0, 650.0);
         let tilt_in = tone_at(&x, 650.0) / tone_at(&x, 110.0);
         let tilt_out = tone_at(&y, 650.0) / tone_at(&y, 110.0);
         assert!(
-            tilt_out > 1.8 * tilt_in,
-            "red-charlie must thin lows against mids: out {tilt_out:.3} vs in {tilt_in:.3}"
+            tilt_out > 1.8 * tilt_in * stack,
+            "red-charlie must thin lows against mids ahead of the gain: out \
+             {tilt_out:.3} vs in {tilt_in:.3} × stack {stack:.3}"
         );
     }
 
@@ -1163,6 +1368,13 @@ mod tests {
         // probe tones are in the input, and between measurements only EQ
         // knobs change — the pre-EQ signal is identical, so ratios read the
         // stack's true response even though the cascade clips upstream.
+        //
+        // Re-pinned for PRD 023's real passive network: a passive stack cuts
+        // rather than boosts, and noon already sits near the top of the bass
+        // and treble travel — so each control is measured across its **full
+        // sweep** (0 → 10) instead of 5 → 10. Mid at 0 is the scooped preset,
+        // which is now the baseline of the mid assertion rather than a
+        // separate one.
         let x = tones(&[70.0, 150.0, 400.0, 650.0, 3_000.0, 6_100.0], SR as usize);
         let measure = |bass: f32, middle: f32, treble: f32, freq: f32| -> f64 {
             let mut d = prepared(5);
@@ -1174,35 +1386,40 @@ mod tests {
             tone_at(&y, freq)
         };
 
-        // Bass shelf: boosting bass should lift 70 Hz relative to 3 kHz.
-        let flat_lo = measure(5.0, 5.0, 5.0, 70.0) / measure(5.0, 5.0, 5.0, 3_000.0);
-        let boosted_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 3_000.0);
+        // Bass: 70 Hz against 3 kHz, across the pot's travel.
+        let cut_lo = measure(0.0, 5.0, 5.0, 70.0) / measure(0.0, 5.0, 5.0, 3_000.0);
+        let full_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 3_000.0);
         assert!(
-            boosted_lo > 1.3 * flat_lo,
-            "bass boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+            full_lo > 2.5 * cut_lo,
+            "bass travel: {full_lo:.3} at 10 vs {cut_lo:.3} at 0"
         );
 
-        // Middle: boosting should lift 650 Hz relative to 150 Hz.
-        let flat_mid = measure(5.0, 5.0, 5.0, 650.0) / measure(5.0, 5.0, 5.0, 150.0);
-        let boosted_mid = measure(5.0, 10.0, 5.0, 650.0) / measure(5.0, 10.0, 5.0, 150.0);
-        assert!(
-            boosted_mid > 1.5 * flat_mid,
-            "middle boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
-        );
-
-        // Treble shelf: boosting should lift 6.1 kHz relative to 400 Hz.
-        let flat_hi = measure(5.0, 5.0, 5.0, 6_100.0) / measure(5.0, 5.0, 5.0, 400.0);
-        let boosted_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 400.0);
-        assert!(
-            boosted_hi > 1.5 * flat_hi,
-            "treble boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
-        );
-
-        // Cut: middle at 0 should scoop 650 Hz — the metal preset.
+        // Middle: 650 Hz against 150 Hz — at 0 this is the metal scoop.
         let cut_mid = measure(5.0, 0.0, 5.0, 650.0) / measure(5.0, 0.0, 5.0, 150.0);
+        let full_mid = measure(5.0, 10.0, 5.0, 650.0) / measure(5.0, 10.0, 5.0, 150.0);
         assert!(
-            cut_mid < 0.7 * flat_mid,
-            "middle scoop: {cut_mid:.3} vs flat {flat_mid:.3}"
+            full_mid > 1.8 * cut_mid,
+            "middle travel: {full_mid:.3} at 10 vs {cut_mid:.3} at 0"
+        );
+
+        // Treble: 6.1 kHz against 400 Hz, across the pot's travel.
+        let cut_hi = measure(5.0, 5.0, 0.0, 6_100.0) / measure(5.0, 5.0, 0.0, 400.0);
+        let full_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 400.0);
+        assert!(
+            full_hi > 2.5 * cut_hi,
+            "treble travel: {full_hi:.3} at 10 vs {cut_hi:.3} at 0"
+        );
+
+        // Coupling — the property the old additive 3-band could not have. All
+        // three pots load the same nodes, so Middle moves the *treble* band
+        // with Bass and Treble untouched. On a meter this is what "sounds like
+        // an amp, not a graphic EQ" reduces to (PRD 023).
+        let mid_down = measure(5.0, 0.0, 5.0, 6_100.0) / measure(5.0, 0.0, 5.0, 150.0);
+        let mid_up = measure(5.0, 10.0, 5.0, 6_100.0) / measure(5.0, 10.0, 5.0, 150.0);
+        assert!(
+            mid_up > 1.15 * mid_down,
+            "the Middle knob must move the treble band too: {mid_up:.3} at 10 \
+             vs {mid_down:.3} at 0 — the network is not coupled"
         );
     }
 
@@ -1260,11 +1477,15 @@ mod tests {
         let mut d = prepared(6);
         set_pos(&mut d, 0, 0.0);
         let y = process_in_blocks(&mut d, &x, 256);
+        // As with the red-charlie: the pre-gain claim is measured with the
+        // post-gain JCM800 stack's own noon tilt divided back out (PRD 023).
+        let stack = stack_tilt(crate::eq::tonestack::kind::JCM800, 110.0, 550.0);
         let tilt_in = tone_at(&x, 550.0) / tone_at(&x, 110.0);
         let tilt_out = tone_at(&y, 550.0) / tone_at(&y, 110.0);
         assert!(
-            tilt_out > 1.8 * tilt_in,
-            "monster5150 must thin lows against mids: out {tilt_out:.3} vs in {tilt_in:.3}"
+            tilt_out > 1.8 * tilt_in * stack,
+            "monster5150 must thin lows against mids ahead of the gain: out \
+             {tilt_out:.3} vs in {tilt_in:.3} × stack {stack:.3}"
         );
     }
 
@@ -1273,6 +1494,13 @@ mod tests {
         // Same identity trick as the red-charlie's EQ test: only EQ knobs
         // change between measurements, so ratios read the post-distortion
         // stack's true response.
+        //
+        // Re-pinned for PRD 023's real passive network: a passive stack cuts
+        // rather than boosts, and noon already sits near the top of the bass
+        // and treble travel — so each control is measured across its **full
+        // sweep** (0 → 10) instead of 5 → 10. Mid at 0 is the scooped preset,
+        // which is now the baseline of the mid assertion rather than a
+        // separate one.
         let x = tones(&[70.0, 150.0, 420.0, 550.0, 3_000.0, 6_100.0], SR as usize);
         let measure = |low: f32, mid: f32, high: f32, freq: f32| -> f64 {
             let mut d = prepared(6);
@@ -1284,36 +1512,29 @@ mod tests {
             tone_at(&y, freq)
         };
 
-        // Low shelf: boosting low should lift 70 Hz relative to 3 kHz —
-        // the resonance-style thickness dialed in after the clipping.
-        let flat_lo = measure(5.0, 5.0, 5.0, 70.0) / measure(5.0, 5.0, 5.0, 3_000.0);
-        let boosted_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 3_000.0);
+        // Low: 70 Hz against 3 kHz — the resonance-style thickness the
+        // amp's own control dials in after the clipping.
+        let cut_lo = measure(0.0, 5.0, 5.0, 70.0) / measure(0.0, 5.0, 5.0, 3_000.0);
+        let full_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 3_000.0);
         assert!(
-            boosted_lo > 1.3 * flat_lo,
-            "low boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+            full_lo > 2.5 * cut_lo,
+            "bass travel: {full_lo:.3} at 10 vs {cut_lo:.3} at 0"
         );
 
-        // Mid: boosting should lift 550 Hz relative to 150 Hz.
-        let flat_mid = measure(5.0, 5.0, 5.0, 550.0) / measure(5.0, 5.0, 5.0, 150.0);
-        let boosted_mid = measure(5.0, 10.0, 5.0, 550.0) / measure(5.0, 10.0, 5.0, 150.0);
-        assert!(
-            boosted_mid > 1.5 * flat_mid,
-            "mid boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
-        );
-
-        // High shelf: boosting should lift 6.1 kHz relative to 420 Hz.
-        let flat_hi = measure(5.0, 5.0, 5.0, 6_100.0) / measure(5.0, 5.0, 5.0, 420.0);
-        let boosted_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 420.0);
-        assert!(
-            boosted_hi > 1.5 * flat_hi,
-            "high boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
-        );
-
-        // Cut: mid at 0 is the scooped-wall preset.
+        // Mid: 550 Hz against 150 Hz — at 0 this is the scooped wall.
         let cut_mid = measure(5.0, 0.0, 5.0, 550.0) / measure(5.0, 0.0, 5.0, 150.0);
+        let full_mid = measure(5.0, 10.0, 5.0, 550.0) / measure(5.0, 10.0, 5.0, 150.0);
         assert!(
-            cut_mid < 0.7 * flat_mid,
-            "mid scoop: {cut_mid:.3} vs flat {flat_mid:.3}"
+            full_mid > 1.8 * cut_mid,
+            "middle travel: {full_mid:.3} at 10 vs {cut_mid:.3} at 0"
+        );
+
+        // High: 6.1 kHz against 420 Hz, across the pot's travel.
+        let cut_hi = measure(5.0, 5.0, 0.0, 6_100.0) / measure(5.0, 5.0, 0.0, 420.0);
+        let full_hi = measure(5.0, 5.0, 10.0, 6_100.0) / measure(5.0, 5.0, 10.0, 420.0);
+        assert!(
+            full_hi > 2.5 * cut_hi,
+            "treble travel: {full_hi:.3} at 10 vs {cut_hi:.3} at 0"
         );
     }
 
@@ -1426,6 +1647,13 @@ mod tests {
     fn angry_charlie_eq_bands_work() {
         // Same identity trick as the other post-distortion stacks: only EQ
         // knobs change between measurements.
+        //
+        // Re-pinned for PRD 023's real passive network: a passive stack cuts
+        // rather than boosts, and noon already sits near the top of the bass
+        // and treble travel — so each control is measured across its **full
+        // sweep** (0 → 10) instead of 5 → 10. Mid at 0 is the scooped preset,
+        // which is now the baseline of the mid assertion rather than a
+        // separate one.
         let x = tones(&[70.0, 150.0, 350.0, 550.0, 2_800.0, 6_000.0], SR as usize);
         let measure = |bass: f32, middle: f32, treble: f32, freq: f32| -> f64 {
             let mut d = prepared(7);
@@ -1437,57 +1665,58 @@ mod tests {
             tone_at(&y, freq)
         };
 
-        // Bass shelf: boosting bass should lift 70 Hz relative to 2.8 kHz.
-        let flat_lo = measure(5.0, 5.0, 5.0, 70.0) / measure(5.0, 5.0, 5.0, 2_800.0);
-        let boosted_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 2_800.0);
+        // Bass: 70 Hz against 2.8 kHz, across the pot's travel.
+        let cut_lo = measure(0.0, 5.0, 5.0, 70.0) / measure(0.0, 5.0, 5.0, 2_800.0);
+        let full_lo = measure(10.0, 5.0, 5.0, 70.0) / measure(10.0, 5.0, 5.0, 2_800.0);
         assert!(
-            boosted_lo > 1.3 * flat_lo,
-            "bass boost: {boosted_lo:.3} vs flat {flat_lo:.3}"
+            full_lo > 2.5 * cut_lo,
+            "bass travel: {full_lo:.3} at 10 vs {cut_lo:.3} at 0"
         );
 
-        // Middle: boosting should lift 550 Hz relative to 150 Hz.
-        let flat_mid = measure(5.0, 5.0, 5.0, 550.0) / measure(5.0, 5.0, 5.0, 150.0);
-        let boosted_mid = measure(5.0, 10.0, 5.0, 550.0) / measure(5.0, 10.0, 5.0, 150.0);
-        assert!(
-            boosted_mid > 1.5 * flat_mid,
-            "middle boost: {boosted_mid:.3} vs flat {flat_mid:.3}"
-        );
-
-        // Treble shelf: boosting should lift 6 kHz relative to 350 Hz.
-        let flat_hi = measure(5.0, 5.0, 5.0, 6_000.0) / measure(5.0, 5.0, 5.0, 350.0);
-        let boosted_hi = measure(5.0, 5.0, 10.0, 6_000.0) / measure(5.0, 5.0, 10.0, 350.0);
-        assert!(
-            boosted_hi > 1.5 * flat_hi,
-            "treble boost: {boosted_hi:.3} vs flat {flat_hi:.3}"
-        );
-
-        // Cut: middle at 0 should scoop 550 Hz.
+        // Middle: 550 Hz against 150 Hz — at 0 this is the metal scoop.
         let cut_mid = measure(5.0, 0.0, 5.0, 550.0) / measure(5.0, 0.0, 5.0, 150.0);
+        let full_mid = measure(5.0, 10.0, 5.0, 550.0) / measure(5.0, 10.0, 5.0, 150.0);
         assert!(
-            cut_mid < 0.7 * flat_mid,
-            "middle scoop: {cut_mid:.3} vs flat {flat_mid:.3}"
+            full_mid > 1.8 * cut_mid,
+            "middle travel: {full_mid:.3} at 10 vs {cut_mid:.3} at 0"
+        );
+
+        // Treble: 6 kHz against 350 Hz, across the pot's travel.
+        let cut_hi = measure(5.0, 5.0, 0.0, 6_000.0) / measure(5.0, 5.0, 0.0, 350.0);
+        let full_hi = measure(5.0, 5.0, 10.0, 6_000.0) / measure(5.0, 5.0, 10.0, 350.0);
+        assert!(
+            full_hi > 2.5 * cut_hi,
+            "treble travel: {full_hi:.3} at 10 vs {cut_hi:.3} at 0"
         );
     }
 
     #[test]
-    fn evva_eq_is_flat_at_defaults() {
-        // With every EQ knob at 5 the stack contributes 0 dB per band: the
-        // output must match a run with the EQ hook skipped, bit for bit
-        // aside from float noise. (The stack's flat gains are exactly
-        // db_to_lin(0) − 1 = 0, so its adds vanish.)
+    fn evva_noon_carries_the_bassman_scoop() {
+        // Before PRD 023 this test was `evva_eq_is_flat_at_defaults`: the old
+        // additive stack contributed exactly 0 dB per band at noon, so the
+        // pedal came through flat. The evva now runs a real Bassman network —
+        // the one Fender voice in the family — and noon is *deliberately* not
+        // flat: it carries the amp's own mid scoop. That inversion is the
+        // whole point of the migration, so it is pinned here.
         let x = tones(&[80.0, 220.0, 750.0, 3_000.0], SR as usize / 2);
         let mut d = prepared(4);
         set_pos(&mut d, 0, 2.0);
         let flat = process_in_blocks(&mut d, &x, 256);
+        let at = |freq: f32| tone_at(&flat, freq) / tone_at(&x, freq).max(1e-12);
         for freq in [80.0, 220.0, 750.0, 3_000.0] {
-            let ratio = tone_at(&flat, freq) / tone_at(&x, freq).max(1e-12);
-            // Near-clean gain 2 through makeup and level: each probe tone
-            // must come through at a sane, roughly uniform level.
+            // Still a usable level everywhere — the makeup gain sees to that.
+            let ratio = at(freq);
             assert!(
                 (0.2..5.0).contains(&ratio),
-                "flat evva EQ must pass {freq} Hz cleanly, ratio {ratio:.3}"
+                "evva must pass {freq} Hz at a sane level, ratio {ratio:.3}"
             );
         }
+        let scoop = at(80.0).min(at(3_000.0)) / at(750.0);
+        assert!(
+            scoop > 1.5,
+            "evva at noon must carry the Bassman scoop: 750 Hz sits only \
+             {scoop:.2}× below its shoulders"
+        );
     }
 
     #[test]

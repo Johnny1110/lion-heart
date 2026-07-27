@@ -7,6 +7,95 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-27 (Tone Revolution phase 06: ADAA) — Linux dev container (relative)
+
+**Read the machine speed first.** `drive_screamer` is untouched by this phase and
+came in at **54.7 µs** here against the **30.5 µs** recorded in the phase-01
+section above — the same binary shape on a container running roughly 1.8× slower
+today. Absolute microsecond figures do not compare across sessions in this
+environment; only same-run comparisons do.
+
+So the authoritative cost of ADAA is the isolated group, where the *only*
+difference between rows is the anti-aliasing (same curve, same 4× oversampler,
+same buffer):
+
+| Bench                        | Median   | vs plain |
+| ---------------------------- | -------- | -------- |
+| waveshaper_hard_plain        | ~4.2 µs  | —        |
+| waveshaper_hard_adaa1        | ~4.5 µs  | **+7 %** |
+| waveshaper_hard_adaa2        | ~5.4 µs  | **+28 %**|
+
+Medians over four runs; the run-to-run spread on this container is comparable to
+the ADAA1 difference, so treat +7 % as "small" rather than as three digits.
+
+A whole pedal costs more than its shaper stage suggests, for two reasons worth
+recording: `tanh`'s antiderivative `ln cosh` is a pair of **`f64`** transcendentals
+per oversampled sample (ADR 031 explains why `f64` is not negotiable here), and
+the cascade pedals run two or three ADAA stages. Same-run figures after the
+retrofit:
+
+| Bench                             | Median    | % deadline |
+| --------------------------------- | --------- | ---------- |
+| drive_red-charlie (2× ADAA1)      | ~32.5 µs  | 2.4 %      |
+| drive_monster5150 (3× ADAA2)      | ~28.2 µs  | 2.1 %      |
+| drive_angry-charlie-v2 (2× ADAA2) | ~22.7 µs  | 1.7 %      |
+| drive_ts9 (ADAA2 + dry sum)       | ~18.1 µs  | 1.4 %      |
+| drive_waveshaper (new pedal)      | ~17.2 µs  | 1.3 %      |
+| drive_overdrive (ADAA1)           | ~10.6 µs  | 0.8 %      |
+| drive_screamer (WDF, unchanged)   | ~54.7 µs  | 4.1 %      |
+| drive_sd1 (WDF, unchanged)        | ~69.8 µs  | 5.2 %      |
+
+One optimisation **kept**: `tanh_f1` returns `|x| − ln 2` directly past
+`|x| = 20`. The correction term is smaller than one `f64` ulp of `|x|` there, so
+this is exact rather than an approximation, and at these gains most samples take
+it — `drive_jan-ray` went 23.0 → 17.8 µs on it.
+
+One optimisation **benched and rejected**: rewriting ADAA2's two halves through a
+reciprocal (trading two `f64` divisions for multiplies) made no measurable
+difference, so the code keeps the form that reads like the derivation.
+
+## 2026-07-27 (Tone Revolution phase 02: real tone stack) — Linux dev container (relative)
+
+The shared 3-band becomes a real passive amp network (PRD 023 / ADR 030): each
+model is a **netlist**, solved numerically into a continuous state space and
+Tustin-discretised at the block boundary, then run as a ≤4-state filter.
+
+The two `eq_tonestack` rows are the ones to read — they measure the engine
+directly and were stable across runs:
+
+- **Settled** (knobs still) is the steady-state cost: only the state space runs,
+  and it lands on top of `eq_parametric_4band`.
+- **Knob moving** re-solves the netlist *and* re-discretises it every 64 samples
+  — the worst case the drive family can ask for. It costs **+20 %**, i.e. one
+  full rebuild is ~300 ns. That number is what justified choosing a numeric
+  netlist solve over hand-derived closed-form coefficients (ADR 030): the thing
+  the closed form would have bought is 0.3 µs per knob-moving block.
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| eq_tonestack_settled               | ~1.52 µs    | 0.11 %                 |
+| eq_tonestack_knob_moving           | ~1.91 µs    | 0.14 % (worst case)    |
+| eq_parametric_4band (ref)          | ~1.49 µs    | 0.11 %                 |
+| eq_3band (ref, the old additive)   | ~0.75 µs    | 0.06 %                 |
+
+The five migrated drives, before (worktree at `5fa0f9e`) and after, both on this
+container. **The container is noisy** — `drive_evva` alone read 12.9 µs and
+15.4 µs on two runs of the *same* binary, and the unchanged `drive_ts9`
+reference drifted 11.4→11.8 µs — so read the deltas as "about a microsecond",
+which is what the engine rows above predict (one mono stack per channel).
+
+| Bench                              | Before   | After    | Δ        |
+| ---------------------------------- | -------- | -------- | -------- |
+| drive_ts9 (ref, **unchanged**)     | ~11.36 µs| ~11.77 µs| drift    |
+| drive_evva                         | ~12.44 µs| ~12.86 µs| +0.4 µs  |
+| drive_red-charlie                  | ~17.93 µs| ~18.65 µs| +0.7 µs  |
+| drive_monster5150                  | ~11.99 µs| ~13.93 µs| +1.9 µs  |
+| drive_angry-charlie                | ~11.39 µs| ~11.91 µs| +0.5 µs  |
+| drive_angry-charlie-v2             | ~12.52 µs| ~13.14 µs| +0.6 µs  |
+
+All five stay near the 4× oversampler floor that `drive_ts9` marks; the tone
+stack is not what any of them costs.
+
 ## 2026-07-27 (Tone Revolution phase 01: Wright Omega root) — Linux dev container (relative)
 
 The WDF diode root stops iterating (PRD 022). `DiodePair::solve` is now a

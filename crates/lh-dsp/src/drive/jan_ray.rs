@@ -30,6 +30,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa1, asym_tanh, asym_tanh_f1};
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 4] = [
@@ -67,6 +69,8 @@ const BASS_HZ: f32 = 120.0;
 const TREBLE_HZ: f32 = 2_800.0;
 
 pub(super) struct JanRay {
+    /// Anti-aliased clipping (PRD 024).
+    clip: Adaa1,
     hp70: OnePole,
     bright: OnePole,
     dc_os: OnePole,
@@ -82,6 +86,7 @@ pub(super) struct JanRay {
 impl JanRay {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             hp70: OnePole::default(),
             bright: OnePole::default(),
             dc_os: OnePole::default(),
@@ -109,6 +114,7 @@ impl Circuit for JanRay {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp70.reset();
         self.bright.reset();
         self.dc_os.reset();
@@ -132,11 +138,11 @@ impl Circuit for JanRay {
             // Series-diode soft clip: tall, mildly asymmetric knees. The tall
             // threshold is the headroom that keeps it dynamic; the small
             // asymmetry is the bias-trim warmth.
-            let clipped = if v >= 0.0 {
-                KNEE_POS * (v / KNEE_POS).tanh()
-            } else {
-                KNEE_NEG * (v / KNEE_NEG).tanh()
-            };
+            let clipped = self.clip.process(
+                v,
+                |u| asym_tanh(u, KNEE_POS as f64, KNEE_NEG as f64),
+                |u| asym_tanh_f1(u, KNEE_POS as f64, KNEE_NEG as f64),
+            );
             *s = clipped - self.dc_os.lp(clipped, self.c12);
         }
     }

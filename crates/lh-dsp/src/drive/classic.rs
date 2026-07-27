@@ -4,6 +4,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin, drive_law};
 
+use crate::blocks::waveshaper::{Adaa1, tanh_f1};
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 3] = [
@@ -27,6 +29,10 @@ const BIAS_TANH: f32 = 0.197_375_32;
 const DC_R: f32 = 0.995;
 
 pub(super) struct Classic {
+    /// Anti-aliased clipping (PRD 024): first-order ADAA over the biased
+    /// `tanh`. `tanh` has no elementary second antiderivative, so first order
+    /// is the whole of it.
+    clip: Adaa1,
     dc_x1: f32,
     dc_y1: f32,
     lp: OnePole,
@@ -37,6 +43,7 @@ pub(super) struct Classic {
 impl Classic {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             dc_x1: 0.0,
             dc_y1: 0.0,
             lp: OnePole::default(),
@@ -54,6 +61,7 @@ impl Circuit for Classic {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
         self.lp.reset();
@@ -63,7 +71,13 @@ impl Circuit for Classic {
         let mut gain = Ramp::over(drive, |d| db_to_lin(drive_law::classic_drive_db(d)));
         for s in block.iter_mut() {
             // Subtracting tanh(BIAS) recenters the idle point at zero.
-            *s = (*s * gain.tick() + BIAS).tanh() - BIAS_TANH;
+            // The curve is the biased tanh, recentred; its antiderivative
+            // carries the same two corrections so F₁(0) stays 0.
+            *s = self.clip.process(
+                *s * gain.tick(),
+                |u| (u + BIAS as f64).tanh() - BIAS_TANH as f64,
+                |u| tanh_f1(u + BIAS as f64) - tanh_f1(BIAS as f64) - BIAS_TANH as f64 * u,
+            );
         }
     }
 

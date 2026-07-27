@@ -6,11 +6,15 @@
 //! pot keeps low-gain settings cutting (its emphasis fades as the pot
 //! rises and shorts it out); the first stage's cathode network and the
 //! interstage coupling both thin the lows *before* the hot stage, which is
-//! why palm mutes stay tight instead of flubbing out. Bass/Middle/Treble
-//! are the passive stack's reach voiced at 100 Hz / 650 Hz / 3.3 kHz;
-//! Master is the output pot.
+//! why palm mutes stay tight instead of flubbing out. Bass/Middle/Treble run
+//! the amp's own **JCM800 passive tone stack** (PRD 023) — 33k slope, 470 pF
+//! treble cap, 220k/1M/22k pots — so the three knobs interact and noon keeps
+//! the Marshall mid scoop instead of sitting flat; Master is the output pot.
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
+
+use crate::blocks::waveshaper::{Adaa1, asym_tanh, asym_tanh_f1};
+use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
@@ -47,12 +51,12 @@ const LOW_TRIM: f32 = 0.6;
 /// (re-trimmed after the solo-pot gain extension made noon hotter).
 const MAKEUP: f32 = 0.18;
 
-/// 3-band tone stack corner frequencies (FMV-inspired).
-const BASS_HZ: f32 = 100.0;
-const MID_HZ: f32 = 650.0;
-const TREBLE_HZ: f32 = 3_300.0;
-
+/// Anti-aliased clipping (PRD 024). A `tanh` knee aliases far less than a hard
+/// corner, but at high gain it approaches one — first-order ADAA, since
+/// `tanh`'s second antiderivative is not elementary.
 pub(super) struct RedCharlie {
+    stage1: Adaa1,
+    stage2: Adaa1,
     hp_in: OnePole,
     lf_trim: OnePole,
     bright: OnePole,
@@ -69,12 +73,14 @@ pub(super) struct RedCharlie {
 impl RedCharlie {
     pub(super) fn new() -> Self {
         Self {
+            stage1: Adaa1::new(),
+            stage2: Adaa1::new(),
             hp_in: OnePole::default(),
             lf_trim: OnePole::default(),
             bright: OnePole::default(),
             couple: OnePole::default(),
             dc_os: OnePole::default(),
-            stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
+            stack: ToneStack::new(kind::JCM800),
             c35: 0.0,
             c100: 0.0,
             c1600: 0.0,
@@ -83,14 +89,15 @@ impl RedCharlie {
         }
     }
 
-    /// Asymmetric tanh clipper with independent knees per polarity.
+    /// Asymmetric tanh clipper with independent knees per polarity, run
+    /// through the given stage's ADAA state.
     #[inline]
-    fn clip(v: f32, knee_pos: f32, knee_neg: f32) -> f32 {
-        if v >= 0.0 {
-            knee_pos * (v / knee_pos).tanh()
-        } else {
-            knee_neg * (v / knee_neg).tanh()
-        }
+    fn clip(adaa: &mut Adaa1, v: f32, knee_pos: f32, knee_neg: f32) -> f32 {
+        adaa.process(
+            v,
+            |u| asym_tanh(u, knee_pos as f64, knee_neg as f64),
+            |u| asym_tanh_f1(u, knee_pos as f64, knee_neg as f64),
+        )
     }
 }
 
@@ -106,6 +113,8 @@ impl Circuit for RedCharlie {
     }
 
     fn reset(&mut self) {
+        self.stage1.reset();
+        self.stage2.reset();
         self.hp_in.reset();
         self.lf_trim.reset();
         self.bright.reset();
@@ -130,12 +139,22 @@ impl Circuit for RedCharlie {
             let bright = BRIGHT_MAX * (1.0 - d * 0.1);
             let x = x + bright * (x - self.bright.lp(x, self.c1600));
             // Stage 1: warm asymmetric soft clip.
-            let s1 = Self::clip(gain.tick() * x, STAGE1_KNEE_POS, STAGE1_KNEE_NEG);
+            let s1 = Self::clip(
+                &mut self.stage1,
+                gain.tick() * x,
+                STAGE1_KNEE_POS,
+                STAGE1_KNEE_NEG,
+            );
             // Interstage coupling thins the lows into the hot stage.
             let s1 = s1 - self.couple.lp(s1, self.c120);
             // Stage 2: the cold clipper (the real stage inverts; opposite
             // knee polarity models the flip).
-            let s2 = Self::clip(STAGE2_GAIN * s1, STAGE2_KNEE_POS, STAGE2_KNEE_NEG);
+            let s2 = Self::clip(
+                &mut self.stage2,
+                STAGE2_GAIN * s1,
+                STAGE2_KNEE_POS,
+                STAGE2_KNEE_NEG,
+            );
             *s = s2 - self.dc_os.lp(s2, self.c12);
         }
     }
@@ -149,7 +168,7 @@ impl Circuit for RedCharlie {
     }
 
     fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        // Shared 3-band stack, FMV-voiced at 100 Hz / 650 Hz / 3.3 kHz.
+        // The 2203's own passive stack.
         self.stack.process(block, low, mid, high);
     }
 }

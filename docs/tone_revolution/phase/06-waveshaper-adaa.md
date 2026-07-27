@@ -1,5 +1,27 @@
 # Phase 06 — Memoryless Waveshaper bank + ADAA 抗鋸齒
 
+> **已實作（2026-07-27）— PRD 024 / ADR 031。** 計畫與實際交付的差異記在這裡，
+> 計畫本身不改：
+>
+> 1. **§2.1 二階 ADAA 改為自行從定義推導。** 計畫引 Parker 等人的發表形式；實作
+>    對三角核直接分部積分，得到兩半對稱、**各自獨立退化**的形式，退化分支是單次
+>    `f` 求值而非巢狀 case。正確性以「線性 `f` 還原 `(x₀+4x₁+x₂)/6`」＋「對照定義
+>    積分的數值求解」雙重 pin，不靠推導背書。
+> 2. **§2.3 的 dry-sum 對齊：三套補償方案一套都不需要。** 計畫把它列為「最容易踩
+>    的坑」，但那是假設 ADAA 在基頻。實際 ADAA 跑在 **4× 率**上，折算基頻只有
+>    0.125 sample——最壞漣漪 10 kHz 0.09 dB、16 kHz 0.22 dB。**既有 character pin
+>    一條都沒改、全部通過**，包含 level-norm。（若過取樣倍率下修，這個結論要重驗，
+>    測試裡有註記。）
+> 3. **改造範圍擴大到全部 12 顆 memoryless 踏板**（計畫點名 8 顆）。`centaur`、
+>    `jan-ray`、`fuzz-face` 一併做了——量測顯示它們同樣受益 23–27 dB。
+>    `screamer`/`sd1` 是 WDF，沒有顯式曲線可談，不接。
+> 4. **§2.2 shape bank 交付 12 條**（計畫列了約 15 條的清單）：Soft/Hard/Asym/
+>    Diode/Sine/Fold/Digital/Cheby2–5/Fuzz。`zamsat`、`westfold`、trig 組未做——
+>    bank 是 append-only 的資料，補起來不動引擎。
+>
+> 完整數字（每顆的地板前後、ADAA 的隔離成本）見 PRD 024 §3 與 `docs/benchmarks.md`。
+
+
 命中目標：#2（memoryless 創意波形整形）＋ 全家族**品質**（去毛躁）
 依賴：無（memoryless，不依賴 WDF 框架；可與任一 Phase 平行）
 關聯 ADR：若 ADAA 成為家族級抗鋸齒策略 → **新開 ADR 033（ADAA 抗鋸齒）**

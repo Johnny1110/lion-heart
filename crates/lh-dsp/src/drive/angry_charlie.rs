@@ -15,6 +15,9 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa2, clip, clip_f1, clip_f2};
+use crate::eq::tonestack::kind;
+
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 5] = [
@@ -42,12 +45,12 @@ const BRIGHT: f32 = 0.35;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.09;
 
-/// Marshall-style Baxandall corners.
-const BASS_HZ: f32 = 90.0;
-const MID_HZ: f32 = 500.0;
-const TREBLE_HZ: f32 = 2_800.0;
-
+/// Anti-aliased clipping (PRD 024): a flat-topped clamp generates harmonics
+/// that fall off far too slowly for 4× oversampling alone, and what comes back
+/// over Nyquist is the fizz. Second-order ADAA — the clamp's second
+/// antiderivative is a piecewise cubic, so it costs almost nothing.
 pub(super) struct AngryCharlie {
+    clip: Adaa2,
     hp_in: OnePole,
     bright: OnePole,
     dc_os: OnePole,
@@ -60,10 +63,11 @@ pub(super) struct AngryCharlie {
 impl AngryCharlie {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa2::new(),
             hp_in: OnePole::default(),
             bright: OnePole::default(),
             dc_os: OnePole::default(),
-            stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
+            stack: ToneStack::new(kind::JCM800),
             c_hp: 0.0,
             c1800: 0.0,
             c12: 0.0,
@@ -81,6 +85,7 @@ impl Circuit for AngryCharlie {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp_in.reset();
         self.bright.reset();
         self.dc_os.reset();
@@ -102,7 +107,13 @@ impl Circuit for AngryCharlie {
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1800));
             // The two clean gain stages, then a genuine hard clip to ground
             // — flat-topped, not a tanh curve, symmetric both polarities.
-            let clipped = (gain.tick() * x).clamp(-KNEE, KNEE);
+            let v = gain.tick() * x;
+            let clipped = self.clip.process(
+                v,
+                |u| clip(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f1(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f2(u, -KNEE as f64, KNEE as f64),
+            );
             *s = clipped - self.dc_os.lp(clipped, self.c12);
         }
     }
@@ -116,7 +127,7 @@ impl Circuit for AngryCharlie {
     }
 
     fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        // Shared 3-band Baxandall stack, voiced at 90 Hz / 500 Hz / 2.8 kHz.
+        // The JCM800 stack the pedal is a clone of.
         self.stack.process(block, low, mid, high);
     }
 }
