@@ -20,11 +20,14 @@
 //! # What lives here
 //!
 //! The genuinely reusable, non-trivial pieces: the bilinear [`Capacitor`]
-//! one-port, the antiparallel [`DiodePair`] root with its RT-safe Newton
-//! solver, and the [`parallel_root`] adaptor helper. A specific circuit (e.g.
-//! the Screamer's shunt clipper in `drive/screamer.rs`) composes them into
-//! straight-line per-sample code — no boxed tree, no dynamic dispatch, no
-//! allocation on the audio thread.
+//! one-port, the antiparallel [`DiodePair`] root, the asymmetric [`AsymDiode`]
+//! root, the [`parallel_root`] adaptor helpers, and the [`omega`] module — the
+//! Wright omega approximation that lets `DiodePair` be evaluated in closed form
+//! instead of iterated. A specific circuit (e.g. the Screamer's shunt clipper
+//! in `drive/screamer.rs`) composes them into straight-line per-sample code —
+//! no boxed tree, no dynamic dispatch, no allocation on the audio thread.
+
+pub mod omega;
 
 /// Bilinear-transform (trapezoidal) capacitor as a WDF one-port.
 ///
@@ -87,14 +90,45 @@ impl Capacitor {
 /// resistance `R` it sees, [`solve`](Self::solve) returns the diode voltage `v`
 /// (which is also the clipping node's voltage — the useful output) and the
 /// reflected wave `b = 2v − a`.
+///
+/// # How it is solved
+///
+/// Two paths, both RT-safe, both always compiled:
+///
+/// - [`solve`](Self::solve) — **closed form**, no iteration. Werner et al.
+///   rearrange the root equation into two evaluations of Wright's `ω`
+///   ([`omega`]), by treating the pair as "whichever diode conducts, plus a
+///   negligible correction from the other". That last step makes it a very
+///   accurate *approximation*, not an identity, which is why the Newton path
+///   stays.
+/// - [`solve_newton`](Self::solve_newton) — the **oracle**: the damped `f64`
+///   Newton iteration this replaced. It solves the true equation to `1e-10`, so
+///   the tests can measure exactly what the closed form costs in accuracy
+///   (worst case ~30 µV on the node, harmonics within 0.001 dB) instead of
+///   taking the port on faith.
+///
+/// # Reference
+///
+/// K. Werner et al., *"An Improved and Generalized Diode Clipper Model for Wave
+/// Digital Filters"*, DAFx-16 — eqn (39), the antiparallel-pair form. Structure
+/// follows `chowdsp_wdf`'s `wdft_nonlinearities.h` (BSD-3).
 pub struct DiodePair {
-    /// Reverse saturation current `Is`.
-    is: f64,
-    /// The thermal scale `n·Vt` (ideality × thermal voltage).
-    vt_n: f64,
-    /// Warm start: the diode voltage solved last sample. Audio is continuous,
-    /// so this is almost always 1–3 Newton steps from the new root.
-    v: f64,
+    /// Reverse saturation current `Is` (A).
+    is: f32,
+    /// The thermal scale `n·Vt` (ideality × thermal voltage), in volts.
+    vt_n: f32,
+    /// `1 / (n·Vt)`, precomputed for the hot path.
+    one_over_vt: f32,
+    /// `ln(R·Is / (n·Vt))` — the *only* term of the closed form that depends on
+    /// the port resistance.
+    log_r_is_over_vt: f32,
+    /// The port resistance `log_r_is_over_vt` was computed for. Starts `NaN`,
+    /// which compares unequal to everything, so the first solve always fills it.
+    r_cached: f32,
+    /// Warm start for [`solve_newton`](Self::solve_newton): the voltage it
+    /// solved last sample. Audio is continuous, so that is almost always 1–3
+    /// steps from the new root. Unused by the closed form, which is stateless.
+    v_newton: f64,
 }
 
 /// Newton iteration ceiling. Warm-started real audio needs 1–3; a cold start
@@ -107,34 +141,74 @@ impl DiodePair {
     /// `is` = saturation current (A), `n` = ideality factor, `vt` = thermal
     /// voltage (V). 1N4148 ≈ `is 2.52e-9, n 1.75, vt 25.85e-3`.
     pub fn new(is: f32, n: f32, vt: f32) -> Self {
+        let vt_n = n * vt;
         Self {
-            is: is as f64,
-            vt_n: (n * vt) as f64,
-            v: 0.0,
+            is,
+            vt_n,
+            one_over_vt: 1.0 / vt_n,
+            log_r_is_over_vt: 0.0,
+            r_cached: f32::NAN,
+            v_newton: 0.0,
         }
     }
 
     pub fn reset(&mut self) {
-        self.v = 0.0;
+        self.v_newton = 0.0;
     }
 
     /// Solve the root for incident wave `a` at port resistance `r`. Returns
     /// `(v, b)`: the diode/node voltage and the reflected wave `2v − a`.
     ///
-    /// **RT-safe:** fixed iteration ceiling, no allocation, `f64` internally so
-    /// the tiny `Is` keeps its precision. The Newton step is *damped* (capped
-    /// at `10·n·Vt` per iteration) so a cold, slammed input cannot overshoot
-    /// into the stiff exponential and stall — real convergence near the root is
-    /// undamped and quadratic.
+    /// **RT-safe:** no allocation, no iteration, no `std::exp`/`std::log` on
+    /// the hot path — a fixed handful of polynomial evaluations and two
+    /// divides. The `f64` `ln` fires only when `r` *changes*; for a fixed
+    /// circuit (`screamer`) that is once, at `prepare`.
     #[inline]
     pub fn solve(&mut self, a: f32, r: f32) -> (f32, f32) {
-        let a = a as f64;
-        let r = r as f64;
-        let two_is = 2.0 * self.is;
-        let vt_n = self.vt_n;
+        if r != self.r_cached {
+            self.r_cached = r;
+            // `R·Is/Vt` is ~1e-4 and its log lands directly in a voltage, so the
+            // budget term is derived in `f64` and stored down — precision where
+            // it is cheap (RT-safe: libm, no allocation, no lock).
+            self.log_r_is_over_vt =
+                ((f64::from(r) * f64::from(self.is)) / f64::from(self.vt_n)).ln() as f32;
+        }
+
+        // Werner eqn (39). With `λ = sign(a)`, `ω(L + λa/Vt)` is the conducting
+        // branch and `ω(L − λa/Vt)` the reverse one (tiny, but it is what makes
+        // the crossover region smooth rather than kinked). `copysign` is the
+        // branchless way to spell `sign`; `a = ±0` lands on `la = ±0`, where the
+        // two branches cancel and `v = a` either way.
+        let lambda = 1.0f32.copysign(a);
+        let la = lambda * a * self.one_over_vt;
+        let l = self.log_r_is_over_vt;
+        let v = a - self.vt_n * lambda * (omega::omega(l + la) - omega::omega(l - la));
+        let v = if v.abs() < 1e-25 { 0.0 } else { v };
+        (v, 2.0 * v - a)
+    }
+
+    /// The **reference** solve: warm-started, damped `f64` Newton on
+    /// `f(v) = v + R·i(v) − a`, converged to [`TOL`].
+    ///
+    /// Kept permanently, not as legacy: [`solve`](Self::solve) is a closed-form
+    /// *approximation*, and this is the ground truth its golden tests and
+    /// benchmarks measure against. Production code should call
+    /// [`solve`](Self::solve) — this is ~13× the cost back to back, and ~2.4×
+    /// the whole pedal once the rest of the circuit is counted.
+    ///
+    /// **RT-safe** as well: fixed iteration ceiling, no allocation. The Newton
+    /// step is *damped* (capped at `10·n·Vt` per iteration) so a cold, slammed
+    /// input cannot overshoot into the stiff exponential and stall — real
+    /// convergence near the root is undamped and quadratic.
+    #[inline]
+    pub fn solve_newton(&mut self, a: f32, r: f32) -> (f32, f32) {
+        let a = f64::from(a);
+        let r = f64::from(r);
+        let two_is = 2.0 * f64::from(self.is);
+        let vt_n = f64::from(self.vt_n);
         let dv_max = 10.0 * vt_n;
 
-        let mut v = self.v;
+        let mut v = self.v_newton;
         for _ in 0..MAX_ITERS {
             // `u` stays sane thanks to damping; the clamp is pure overflow
             // paranoia for a pathological caller.
@@ -156,7 +230,7 @@ impl DiodePair {
             }
         }
 
-        self.v = v;
+        self.v_newton = v;
         let vf = v as f32;
         let vf = if vf.abs() < 1e-25 { 0.0 } else { vf };
         (vf, 2.0 * vf - a as f32)
@@ -293,14 +367,21 @@ mod tests {
         DiodePair::new(2.52e-9, 1.75, 25.85e-3)
     }
 
-    /// The returned root must actually satisfy the diode equation
-    /// `a = v + R·i(v)` and the wave identity `b = 2v − a`.
+    /// The **oracle's** contract: it really does solve `a = v + R·i(v)`, and
+    /// obeys the wave identity `b = 2v − a`. Everything else about the root's
+    /// accuracy is measured relative to this.
+    ///
+    /// Note the residual is checked on `solve_newton`, not `solve`: the closed
+    /// form is an approximation, and near the knee `R·di/dv` is ~130, so a
+    /// 40 µV voltage error shows up as a ~5 mV residual. Voltage is the
+    /// meaningful unit here (it is what the circuit outputs), so the closed
+    /// form is judged in volts by `solve_matches_the_newton_oracle`.
     #[test]
-    fn solve_satisfies_the_diode_equation() {
+    fn newton_oracle_satisfies_the_diode_equation() {
         let r = 2200.0f32;
         for &a in &[-40.0, -5.0, -0.5, -0.01, 0.0, 0.01, 0.5, 5.0, 40.0] {
             let mut d = diode();
-            let (v, b) = d.solve(a, r);
+            let (v, b) = d.solve_newton(a, r);
             assert!(v.is_finite() && b.is_finite());
             // Residual of a = v + R·i(v), computed in f64.
             let vt_n = 1.75 * 25.85e-3f64;
@@ -308,6 +389,86 @@ mod tests {
             let residual = v as f64 + r as f64 * i - a as f64;
             assert!(residual.abs() < 1e-4, "a={a}: residual {residual}");
             assert!((b - (2.0 * v - a)).abs() < 1e-4, "b identity a={a}");
+        }
+    }
+
+    /// **The golden**: the closed form must be an equivalent replacement for
+    /// the oracle, not a new sound. Measured across the incident waves a
+    /// slammed drive stage actually produces and across the port resistances
+    /// the family's clipper networks present.
+    ///
+    /// The bound is pinned from measurement — the error is bounded by
+    /// construction (eqn (39)'s crossover approximation plus [`omega`]'s
+    /// polynomial ladder), so a regression in either shows up as a widening
+    /// here rather than as a mystery in someone's ears.
+    #[test]
+    fn solve_matches_the_newton_oracle() {
+        /// Pinned worst-case node-voltage disagreement, in volts.
+        const MAX_DV: f32 = 5e-5;
+
+        let mut worst = (0.0f32, 0.0f32, 0.0f32);
+        for &r in &[1_000.0f32, 2_200.0, 4_700.0, 47_000.0] {
+            // Dense through the knee (±1.5 V, where the curve bends), sparse
+            // out to the levels a slammed op-amp stage delivers.
+            let grid = (0..3_001)
+                .map(|k| -1.5 + k as f32 * 3.0 / 3_000.0)
+                .chain((0..2_001).map(|k| -50.0 + k as f32 * 100.0 / 2_000.0));
+            for a in grid {
+                let (v_omega, _) = diode().solve(a, r);
+                let (v_newton, _) = diode().solve_newton(a, r);
+                let dv = (v_omega - v_newton).abs();
+                if dv > worst.0 {
+                    worst = (dv, a, r);
+                }
+            }
+        }
+        assert!(
+            worst.0 < MAX_DV,
+            "worst |Δv| = {:.3e} V at a = {:.4}, R = {} (bound {MAX_DV:e})",
+            worst.0,
+            worst.1,
+            worst.2
+        );
+    }
+
+    /// The *audible* form of the golden. Voltage error is the engineering
+    /// measure; what actually has to be indistinguishable is the harmonic
+    /// series a clipped sine comes out with. Run at 192 kHz — the 4×
+    /// oversampled rate the root really runs at — over exactly 10 cycles of
+    /// 200 Hz so every harmonic lands on a DFT bin centre.
+    #[test]
+    fn solve_matches_the_newton_oracle_spectrally() {
+        const SR: f64 = 4.0 * 48_000.0;
+        const F: f64 = 200.0;
+        const N: usize = 9_600; // 10 whole cycles
+
+        /// Magnitude of harmonic `h` of `f`, by direct DFT at the bin centre.
+        fn harmonic(buf: &[f32], h: usize) -> f64 {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (i, s) in buf.iter().enumerate() {
+                let ph = std::f64::consts::TAU * F * h as f64 * i as f64 / SR;
+                re += f64::from(*s) * ph.cos();
+                im -= f64::from(*s) * ph.sin();
+            }
+            2.0 * re.hypot(im) / buf.len() as f64
+        }
+
+        let r = 2_200.0f32;
+        let (mut o, mut n) = (diode(), diode());
+        let (mut y_o, mut y_n) = (Vec::with_capacity(N), Vec::with_capacity(N));
+        for k in 0..N {
+            let a = 5.0 * (std::f64::consts::TAU * F * k as f64 / SR).sin() as f32;
+            y_o.push(o.solve(a, r).0);
+            y_n.push(n.solve_newton(a, r).0);
+        }
+
+        // A symmetric clipper puts nothing in the even harmonics, so their
+        // ratio is noise over noise; the floor (−120 dBc) makes the comparison
+        // "equal or both buried" instead of dividing two rounding errors.
+        let floor = 1e-6 * harmonic(&y_n, 1);
+        for h in 1..=10 {
+            let d = 20.0 * ((harmonic(&y_o, h) + floor) / (harmonic(&y_n, h) + floor)).log10();
+            assert!(d.abs() < 0.1, "harmonic {h}: {d:.4} dB apart");
         }
     }
 
@@ -336,17 +497,43 @@ mod tests {
         assert!(v_big < v_small * 20.0, "should compress hard");
     }
 
-    /// Warm-started continuity: solving a slowly moving `a` never blows up and
-    /// stays consistent with cold solves.
+    /// Warm-started continuity of the oracle: solving a slowly moving `a` never
+    /// blows up and stays consistent with cold solves. (The closed form is
+    /// stateless, so this can only bite the Newton path.)
     #[test]
-    fn warm_start_matches_cold() {
+    fn newton_warm_start_matches_cold() {
         let r = 2200.0f32;
         let mut warm = diode();
         for k in 0..200 {
             let a = 10.0 * (k as f32 * 0.03).sin();
-            let (vw, _) = warm.solve(a, r);
-            let (vc, _) = diode().solve(a, r); // fresh, cold
+            let (vw, _) = warm.solve_newton(a, r);
+            let (vc, _) = diode().solve_newton(a, r); // fresh, cold
             assert!((vw - vc).abs() < 1e-4, "k={k}: warm {vw} cold {vc}");
+        }
+    }
+
+    /// The closed form carries no state between samples, so a running solve and
+    /// a cold one agree *exactly* — which is also why it needs no reset.
+    #[test]
+    fn solve_is_stateless() {
+        let r = 4700.0f32;
+        let mut running = diode();
+        for k in 0..200 {
+            let a = 10.0 * (k as f32 * 0.03).sin();
+            assert_eq!(running.solve(a, r).0, diode().solve(a, r).0, "k={k}");
+        }
+    }
+
+    /// Changing the port resistance mid-stream must re-derive the closed form's
+    /// `R`-dependent term (an adaptor with a pot in it moves `R` while audio is
+    /// running), and must land where a fresh solver at that `R` lands.
+    #[test]
+    fn solve_tracks_a_changing_port_resistance() {
+        let mut d = diode();
+        for &r in &[2_200.0f32, 47_000.0, 1_000.0, 2_200.0, 220_000.0] {
+            for &a in &[-8.0f32, -0.4, 0.4, 8.0] {
+                assert_eq!(d.solve(a, r).0, diode().solve(a, r).0, "a={a} r={r}");
+            }
         }
     }
 
@@ -401,11 +588,16 @@ mod tests {
 
     /// The matched case `m = k = 1` must reproduce the antiparallel
     /// `DiodePair` (`2·Is·sinh`) — the asymmetric solver is a strict superset.
+    ///
+    /// This is a claim about the two *equations*, so it is checked against the
+    /// pair's Newton oracle: both sides then solve their equation exactly and
+    /// the tolerance can stay tight. (`DiodePair::solve`'s closed form is an
+    /// approximation and would only muddy the comparison with its own ~40 µV.)
     #[test]
     fn asym_diode_matches_diode_pair_when_symmetric() {
         let r = 2200.0f32;
         for &a in &[-30.0, -3.0, -0.3, 0.0, 0.3, 3.0, 30.0] {
-            let (vp, bp) = DiodePair::new(2.52e-9, 1.75, 25.85e-3).solve(a, r);
+            let (vp, bp) = DiodePair::new(2.52e-9, 1.75, 25.85e-3).solve_newton(a, r);
             let (va, ba) = asym(1.0, 1.0).solve(a, r);
             assert!((vp - va).abs() < 1e-6, "a={a}: pair {vp} asym {va}");
             assert!((bp - ba).abs() < 1e-6, "a={a}: b pair {bp} asym {ba}");

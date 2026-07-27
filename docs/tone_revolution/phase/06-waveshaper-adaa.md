@@ -16,7 +16,8 @@
    硬切。硬切/多項式 shaper 產生的高階諧波遠超 Nyquist，4× OS 未必壓得乾淨——
    聽感上就是高把位「毛躁、沙沙、數位感」。這**可能正是使用者「drive 不滿意」的
    一部分**（與 tone stack 並列）。BYOD 的 Surge waveshaper 用 **ADAA
-   （Antiderivative Anti-Aliasing，反導數抗鋸齒）+ 可變 OS（最高 16×）**。ADAA
+   （Antiderivative Anti-Aliasing，反導數抗鋸齒）**（已查核 `SurgeWaveshapers.cpp`
+   的 ADAA kernel；另有 BYOD 全域可變 oversampling 疊加）。ADAA
    對硬轉角特別有效：用波形函數的**一階/二階反導數**做差分，等效在每個 sample
    內做解析積分平均，把鋸齒壓得比純 OS 低很多。
 
@@ -39,6 +40,10 @@
   et al. 公式。硬轉角建議二階。
 - **與 4× OS 疊加**：ADAA 不取代 OS，是**加在 OS 之後**（BYOD 也是 ADAA + OS）；
   兩者疊加對硬切最有效。是否降 OS 倍率換 ADAA（省 CPU）由 bench 決定。
+- **群延遲（v2 新增，重要）**：一階 ADAA 天生帶 **~0.5 sample**（OS rate）延遲、
+  二階 ~1 sample——「相鄰兩點的解析平均」的代價。單獨一條非線性路徑無感；
+  **與未延遲的 dry 路徑相加就有感**（高頻梳狀/相位偏移）——這正是 `ts9` 的
+  `x + clipped` 結構。對策見 §2.3。
 - **RT 安全**：純函數 + 少量狀態，無配置；denormal flush；`x` 相等的退化分支
   branchless 或有界。
 
@@ -55,12 +60,21 @@
 
 Faceplate：Drive / Shape（stepped，選形狀）/ Level。tone 可選加一個 post LP。
 
-### 2.3 既有 drive 抗鋸齒改造（品質，voicing 不變）
+### 2.3 既有 drive 抗鋸齒改造（品質，voicing 幾乎不變）
 
 把 `ts9`/`bd2`/`classic`/`overdrive`/`red-charlie`/`monster5150`/`angry-charlie*`
-等 memoryless 的硬切/多項式級接上 ADAA。**目標：同一 voicing、更乾淨的高把位**
-（character pin 不動，另加抗鋸齒地板測試）。這是對「drive 不滿意」的通用去毛躁，
-不必逐顆改電路。
+等 memoryless 的硬切/多項式級接上 ADAA。**目標：同一 voicing、更乾淨的高把位**。
+這是對「drive 不滿意」的通用去毛躁，不必逐顆改電路。
+
+**v2 修正——「character pin 一字不動」不保證成立**，因為 ADAA 的 ~0.5 sample
+群延遲會讓「dry + wet 相加」結構（如 `ts9` 的 `x + clipped`）在高頻產生梳狀
+偏移。逐顆處理，三選一並記錄：
+1. **dry 路徑補等量半 sample 延遲**（OS rate 上一個一階 allpass/線性內插——
+   便宜），相加對齊 → voicing 真正不變；
+2. 無 dry-sum 的踏板（純串接 shaper）直接上，pin 預期不動；
+3. 若補償不划算且頻譜差可聞測（>0.5 dB @ >5 kHz），重新 pin 並在 ADR 註記
+   「ADAA 改造的微幅 voicing 變動」。
+測試面：character pin 對照時把 dry/wet 對齊納入 harness（見 §4.1）。
 
 ## 3. 非目標
 
@@ -78,7 +92,8 @@ Faceplate：Drive / Shape（stepped，選形狀）/ Level。tone 可選加一個
   純 4×OS（量測非諧波地板，dB 差記錄）。
 - **shape bank**：每形狀有界、silence→silence；Chebyshev N 階生第 N 諧波
   （Goertzel 驗證）；wavefolder 摺疊次數隨 drive 增加。
-- **既有 drive 改造**：character pin **不變**（voicing 保持）+ 新增抗鋸齒地板測試通過。
+- **既有 drive 改造**：character pin 依 §2.3 對策逐顆處理——補償者 pin 不變、
+  重 pin 者頻譜差在記錄容差內；全數新增抗鋸齒地板測試通過。
 - 多 rate/block。
 
 ### 4.2 `cargo bench`
@@ -100,13 +115,15 @@ Faceplate：Drive / Shape（stepped，選形狀）/ Level。tone 可選加一個
 - `crates/lh-dsp/src/drive/waveshaper.rs`：新踏板。
 - 既有 memoryless drive 的硬切級接 ADAA。
 - registry 追加、livery、plugin id；character 保持 + 抗鋸齒地板測試；bench。
-- **ADR 033**（ADAA 抗鋸齒策略；是否家族級預設）。
-- **PRD 026**（正式版，若進主序列）。
+- **ADR**（暫定 033，ADAA 抗鋸齒策略；是否家族級預設；dry-sum 對齊策略）。
+- **PRD**：落地時於主序列取號。
 
 ## 6. 風險與備註
 
 - **ADAA 在低增益/小訊號**：`x[n]≈x[n−1]` 頻繁，退化分支要穩且不引入 DC。
-- **二階 ADAA 的延遲/暫態**：二階用到前兩 sample，暫態響應略軟；硬切用二階、
-  軟飽和用一階即可。
-- **這是最能獨立、且對「所有既有 drive」通用受益的一步**——可早做，立刻去毛躁。
+- **二階 ADAA 的延遲/暫態**：二階用到前兩 sample（~1 sample 延遲），暫態響應
+  略軟；硬切用二階、軟飽和用一階即可。dry-sum 交互見 §2.1/§2.3——這是本 Phase
+  最容易踩的坑，測試 harness 先行。
+- **這是最能獨立、且對「所有既有 drive」通用受益的一步**——v2 已把它提前到
+  Phase 03 之前（見 overview §6）。
 </content>

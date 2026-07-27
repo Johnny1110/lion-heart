@@ -61,8 +61,13 @@ study of `/mnt/BYOD` (Build-Your-Own-Distortion, ChowDSP, **GPL-3**) and
 
 **Phase map** (each = a `phase/NN-*.md` with concrete work + acceptance):
 
-1. **Wright Omega** closed-form diode solver — replaces the f64 Newton
-   (~68 µs → ~10 µs). Highest-ROI, most-independent step; **do first**.
+1. **Wright Omega** closed-form diode solver — **LANDED (PRD 022, 2026-07-27)**.
+   `blocks::wdf::omega`; `DiodePair::solve` is now closed-form with the damped
+   Newton kept as `solve_newton`, the permanent accuracy oracle. `screamer`
+   72.3 → **30.5 µs**; root alone 12.7×; worst node error 30 µV. The guess
+   polynomial is **fitted here**, not ported — it beats the reference's
+   two-correction accuracy at one-correction cost. `sd1`/`AsymDiode` stay
+   Newton by design.
 2. **Tone-stack framework** — analytic coupled FMV/Baxandall transfer function
    (cheap, exact, linear); fixes the headline complaint. **New ADR 030.**
 3. **WDF composable adaptor framework** — Series/Parallel + **R-Type** adaptor +

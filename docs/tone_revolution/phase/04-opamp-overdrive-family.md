@@ -21,32 +21,52 @@ BYOD 已證明 TS/ZenDrive/MXR/RAT 是「同核心換零件」。本 Phase 把�
 搬進 lion-heart registry，每顆 append-only（`MODELS`/`DRIVE_PEDALS` 追加、
 `ModelDef` = desc + `Ctl` routing + build fn、plugin 自動展開）。
 
-**拍板**：交付 ≥6 顆 op-amp 白箱 overdrive + **可選二極體 UX**。每顆＝(a) 從公開
-schematic 建 netlist、(b) R-Solver 產散射矩陣、(c) 在 `blocks::wdf` 拼樹、(d) 設
-二極體/元件參數、(e) `shape()` 每 4× OS sample 解一次 WDF、`post()` 走 tone tilt +
-makeup + DC block。
+**拍板**：交付 ≥6 顆 op-amp 白箱 overdrive + **可選二極體 UX**。每顆的移植協定
+（v2 補完）＝(a) 從公開 schematic 建 netlist、(b) R-Solver 產散射矩陣、(c) **隨機
+阻抗數值對照驗證矩陣**（Phase 03 §2.5 管道）、(d) 在 `blocks::wdf` 拼樹、(e) 二極
+體/元件參數以 SPICE 代表值或自行擬合起步、**耳朵校準後 pin——BYOD 的擬合值只當
+起點，不當真值**（§2.2 ZenDrive 案例）、(f) `shape()` 每 4× OS sample 解一次
+WDF、`post()` 走 tone tilt + makeup + DC block（bias 電源者出口 DC block 必備）。
 
 ## 2. 規格：踏板清單與設計參數
 
 > 元件值主要佐證自 BYOD 對應檔（＝schematic 事實）。散射矩陣**不抄**，用 R-Solver
 > 從同一 netlist 重產。二極體 `Is/n/Vt` 為 SPICE 代表值，聽感校準後 pin。
 
-### 2.1 Tube Screamer（忠實回授拓撲）— 升級 `screamer`/`sd1` 或新增 `ts-wdf`
+### 2.1 Tube Screamer（忠實回授拓撲）— 新增 `ts-wdf`（新 key；既有兩顆不動）
 BYOD `drive/tube_screamer`：op-amp（Ag=100, Ri=1e9, Ro=0.1）回授迴路內削波。
 - 回授：`R6=51k` 串 `Pot1=500k`（drive），並聯 `C4=51pF`（drive 轉大變暗）。
-- 輸入級：`C2=1µF`、`R5=10k`；`R4=4.7k` 串 `C3=0.047µF`（RC 塑形）。
-- 二極體：1N4148，`Is≈4.35e-9, nVt≈1.906×Vt`（BYOD 擬合的非整數二極體數）。
-- 負載 `RL=1M`。輸入 −6 dB、輸出 −6 dB（BYOD 的 headroom trim）。
+  結構註記：這個回授 RC‖pot 是 R-Type **之外**的 one-port（`P3 = R6P1C4 ‖
+  R-node`，二極體坐在 P3 上）——所以 **drive 旋鈕不觸發 S 重算**，只重算該
+  one-port 阻抗 + 二極體 `logR_Is_overVt`，很便宜（Phase 03 §2.3）。
+- 輸入級：`C2=1µF`（CapacitiveVoltageSource）、`R5=10k`；`R4=4.7k` 串
+  `C3=0.047µF`（RC 塑形）。R-node 為 4×4（up + P1/R4C3/RL）。
+- 二極體：1N4148，`Is≈4.35e-9, nVt≈1.906×Vt`（BYOD 擬合的非整數二極體數；
+  此顆拓撲正確、擬合值可信度高，仍過一次耳朵）。
+- 負載 `RL=1M`。輸入 −6 dB、輸出 −6 dB（BYOD 的 headroom trim；我們對應
+  MAKEUP/level-norm 慣例自行標定）。
 > 相對 lion-heart 現有 `screamer`（shunt）/`sd1`（理想虛短）：這是**有限增益 op-amp
-> 回授**的忠實版，三者可 A/B（memoryless `ts9` / shunt / 理想虛短 / 有限增益回授）。
+> 回授**的忠實版，四者可 A/B（memoryless `ts9` / shunt / 理想虛短 / 有限增益回授）。
+> 同理若想要「忠實版 SD-1」，即本核心換 SD-1 零件與非對稱二極體，另立新 key。
 
 ### 2.2 Zen Drive（Hermida Zendrive）— 新增 `zendrive`
-BYOD `drive/zen_drive`：**與 TS 同一散射矩陣**（op-amp R-Type），差在零件與二極體。
-- 輸入 `C3=470nF`、`R4=470k`；voice 級 `R5=1k + R6=10k`（voice 鈕）串 `C5=100nF`。
+BYOD `drive/zen_drive`：**與 TS 同一散射矩陣**（op-amp R-Type，連 R-Solver 命令
+的註解都寫著 `tube_screamer.txt`），差在零件與二極體。
+- 輸入 `C3=470nF`、`R4=470k`（**e=4.5V bias**）；voice 級 `R5=1k + R6=10k`
+  （voice 鈕）串 `C5=100nF`（**e=4.5V**）。voice pot 在 R-Type port 內 →
+  動 voice 要重算 S（block-rate，Phase 03 §2.3）。
 - gain 級 `R9=500k×gain` 並聯 `C4=100pF`；`RL=1M`。
-- 二極體：**擬合的 MOSFET-as-diode**，`Is≈5.241e-10, nVt≈0.0787`（BYOD 由 SPICE
-  暫態擬合——見 `sim/ZenDrive/`）。這是「Timmy 同族、透明動態」音色，roll back
-  吉他音量清乾淨；你已有 `jan-ray`(Timmy) 會喜歡這味。
+- ⚠️ **移植陷阱（v2 查核發現）**：BYOD 把二極體宣告成 `DiodePairT<...,
+  decltype(P1)> diodes { P1, ... }`——阻抗參考掛在 **P1**（輸入級）——但波交換
+  卻對 **P3**（`Rv9_C4 ‖ R-node`）做；對照 TS 的 `dp { P3, ... }`，這幾乎可以
+  肯定是複製貼上 bug。後果：二極體方程用了錯的 `R`，而 BYOD 的擬合參數
+  `Is≈5.241e-10, nVt≈0.0787`（物理 `Vt` 的 ~3 倍——擬合在補償什麼，這就是
+  證據）是**繞著這個 bug 擬合出來的**。
+  **我們的做法**：按正確拓撲建模（二極體面對 P3），二極體參數**不抄 BYOD**——
+  以 MOSFET-as-diode 的 SPICE 擬合（Phase 08 流程）或耳朵校準重新定參；
+  BYOD 的聲音只當參考聽感之一，不當 golden。
+- 音色定位：「Timmy 同族、透明動態」，roll back 吉他音量清乾淨；你已有
+  `jan-ray`(Timmy) 會喜歡這味。
 - Faceplate：Gain / Voice / (Tone) / Level。
 
 ### 2.3 King of Tone（Analog Man）— 新增 `king-of-tone`
@@ -75,12 +95,19 @@ BYOD `drive/diode_circuits`：可組態 WDF 二極體 clipper（對稱/整流、
 
 ### 2.7 可選二極體 UX（給 TS 系）
 BYOD `DiodeParameter.h`：一顆 TS 可切二極體型 + 二極體數，低成本高感知價值。
-- 型別（`Is`）：`GZ34 2.52n` / `1N34(germanium) 200p` / `1N4148(silicon) 2.64n`。
-- 數量：連續 `#diodes 0.3–3.0`（非整數＝emissivity 微調）。
-- 實作：`DiodePair`/`AsymDiode` 已吃 `is/n/vt`；加一個 stepped「diode」param + 一個
-  「count」knob，routing 進 `Ctl`（可能需擴 `Ctl` enum 或走 per-pedal ctl 表，
-  照 delay/reverb 的 `Ctl` 表前例）。**若需新參數語彙 → 評估是否 schema bump**
-  （傾向 append-only param、無 bump）。
+- 型別（`Is`）：`GZ34 2.52n` / `1N34(germanium) 200p` / `1N4148(silicon) 2.64n`
+  （已對照 BYOD 原始碼確認）。
+- 數量：連續 `#diodes 0.3–3.0`（非整數＝emissivity 微調）。切型別/數量時經
+  平滑（`nVt`/`Is` 是連續參數，平滑不炸）；重算 `logR_Is_overVt` 在 block 邊界。
+- 實作（v2 定案，查核過 lh-core/lh-dsp）：
+  - `Ctl` 是 `lh-dsp` **內部私有 enum**，不進 preset/plugin schema——擴充
+    `Ctl::Voice`/`Ctl::Sel` 之類 + 對應的 smoother/軌跡（`Drive` struct 加欄位、
+    `Circuit` trait 加預設 no-op hook）是**純內部改動，零 schema 影響**。
+  - 新 pedal 帶新 param key（stepped「diode」+「count」knob）＝ append-only，
+    不 bump（preset 對未知 key 本來就跳過；stepped param 家族前例遍地：wah/
+    comp/reverb/delay）。
+  - **不對既有踏板加參數**（那才會動到既有 faceplate/plugin id 語意）——可選
+    二極體只上新 key 踏板（`ts-wdf`、`diode-clipper`）。
 
 ## 3. 非目標
 
@@ -116,20 +143,24 @@ BYOD `DiodeParameter.h`：一顆 TS 可切二極體型 + 二極體數，低成�
 
 ## 5. 產出清單
 
-- `crates/lh-dsp/src/drive/{zendrive,king_of_tone,mxr_dist,rat,diode_clipper}.rs`
-  + 忠實版 TS（升級或新 key）。
-- 每顆的 netlist（進 `sim/` 或 `tools/netlists/`，供 R-Solver 重產矩陣）。
+- `crates/lh-dsp/src/drive/{ts_wdf,zendrive,king_of_tone,mxr_dist,rat,diode_clipper}.rs`
+  （既有 `ts9`/`screamer`/`sd1` 不動，忠實版一律新 key）。
+- 每顆的 netlist（進 `tools/netlists/`，供 R-Solver 重產矩陣）。
 - registry 追加（`MODELS`/`DRIVE_PEDALS`/`MODEL_COUNT`）、theme livery（distinct-
-  livery pin）、plugin id 展開（**pre-v0.1 additive，重跑 clap-validator**）。
-- 可選二極體 param + UI。
+  livery pin）、plugin id 展開（additive；重跑 clap-validator）。
+- 可選二極體 param + UI（僅新 key 踏板）。
 - character/bench 測試；更新 `docs/benchmarks.md`。
-- **PRD 024**（正式版，若進主序列）。
+- **PRD**：落地時於主序列取號。
 
 ## 6. 風險與備註
 
-- **元件值來源**：優先用公開 schematic；BYOD 值當佐證/交叉驗證，不當唯一來源。
-- **可選二極體的 param routing**：`Ctl` enum 目前是固定六種；擴充要照既有 per-pedal
-  ctl 表前例，別破壞 append-only。
-- **一次一顆 PR**：先做 ZenDrive（你最可能喜歡、且與 TS 同矩陣＝最省），驗證流程
-  順了再鋪其餘。
+- **元件值來源**：優先用公開 schematic；BYOD 值當佐證/交叉驗證，不當唯一來源
+  （tone stack 的 Bassman R3 案、ZenDrive 的二極體案都是教訓）。
+- **BYOD 擬合參數不可盲抄**：凡 BYOD 有 `sim/` 擬合的非物理參數（ZenDrive
+  MOSFET、TS 非整數二極體數），先確認其模型拓撲無 quirk，再決定沿用或重擬。
+- **一次一顆 PR，順序建議 `ts-wdf` 先行**：矩陣與參數已逐行查核、且有三個既有
+  版本（ts9/screamer/sd1）當 A/B 基準——流程順了再做 ZenDrive（需重擬參數）
+  與其餘。
+- KoT 是兩級 WDF（overdrive R-Type + clipper 簡單樹）+ 模式切換，工作量約
+  兩顆一般踏板；排最後。
 </content>

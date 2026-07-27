@@ -46,16 +46,35 @@ diode-ladder tone stack 留待 Phase 03 R-Type 落地後再議。
 
 ### 2.1 `eq::tonestack` 引擎（新，`crates/lh-dsp/src/eq/tonestack.rs`）
 
-- **拓撲通式**：FMV/TMB 網路的三階 `H(s)`。以 Yeh 的推導，分子/分母各為 `s` 的
-  三次多項式，係數 `b1..b3, a1..a3` 是 `(l, m, t, R1..R4, C1..C3)` 的封閉式。
-  提供一個 `struct ToneStackModel { r1..r4, c1..c3 }` 持有元件值，一個
-  `coeffs(l, m, t) -> ([b0..b3],[a0..a3])` 算類比係數。
-- **離散化**：對 `H(s)` 做 bilinear（`s → 2fs·(1−z⁻¹)/(1+z⁻¹)`），得三階數位
-  IIR（或兩級聯：一 biquad + 一 one-pole，數值較穩）。旋鈕移動時於 block-rate
-  重算並交叉淡入（沿用 lion-heart `eq::global` 的 settled-skip：旋鈕不動就跳過
-  係數重建）。
+- **每種拓撲一組封閉式**（v2 修正：不是單一通式吃所有機型）：
+  - **FMV/TMB 通式**（三階）：以 Yeh 的推導，分子/分母各為 `s` 的三次多項式，
+    係數是 `(l, m, t, R1..R4, C1..C3)` 的封閉式。涵蓋 Bassman/JCM800/AC30
+    Top Boost（AC30 為同拓撲、mid 電阻固定值）。
+  - **Baxandall**（bass/treble 兩旋鈕，二階×2 或三階，自己的封閉式）。
+  - **Big Muff tone**（單旋鈕 LP/HP blend，一階×2 的簡式）。
+  - **James/passive**（兩旋鈕，自己的式子）。
+  `ToneStackModel` = 拓撲 tag + 該拓撲的元件值；`coeffs(knobs) -> 類比係數`
+  按拓撲分派。
+- **pot taper（v2 新增，聽感關鍵）**：真機的 bass/treble 多為 audio taper、
+  mid 為 linear——旋鈕位置 0..10 → pot 分數的映射要按 kind 帶 taper 法則，
+  否則「noon」對不上真機的 noon（招牌凹陷會偏位）。taper 進 `coeffs` 之前的
+  knob-map 層，per-kind 標定。
+- **離散化**：對 `H(s)` 做 bilinear（`s → 2fs·(1−z⁻¹)/(1+z⁻¹)`），得**三階直接式
+  IIR（transposed DF2）**。係數推導與 bilinear 代換全程 **f64**、落地前下轉
+  f32（三次多項式係數對元件值的組合在 f32 會損位）。
+  - v2 修正：初稿的「兩級聯（biquad + one-pole）數值較穩」**代價沒講**——級聯
+    需要在每次旋鈕動時對分子/分母**解三次實根**再配對，block-rate 做 Cardano/
+    Newton 不是不行，但先不背這個複雜度；tone stack 極點都在中低頻、Q 低，
+    f64 推導 + TDF2 直接式在 44.1–96k 預期穩定，**以 §4.1 的極點半徑測試守住**；
+    真的出數值問題再升級成級聯（記 ADR）。
+- 旋鈕移動時於 block-rate 重算 + 係數平滑（沿用 `eq::chain`（global EQ 同箱）的
+  settled-skip：旋鈕不動就跳過重建）。
 - **RT 安全**：係數重算在控制/block 邊界，不在 audio 熱迴圈逐 sample；狀態
   denormal flush；係數變動經平滑，避免 zipper。
+- **插入損與 makeup（v2 新增）**：真實被動 stack 在 noon 有實打實的插入損
+  （依機型 −6 到 −20 dB）——per-kind 帶一個固定 makeup 增益，讓遷移後的 drive
+  過既有 level-norm pin（`modelled_pedals_sit_near_unity_at_default_knobs`），
+  獨立踏板版預設也近 unity。
 
 ### 2.2 機型註冊表 `ToneStackKind`
 
@@ -63,15 +82,16 @@ diode-ladder tone stack 留待 Phase 03 R-Type 落地後再議。
 
 | Kind | 原型 | 特徵 | 元件值來源 |
 |---|---|---|---|
-| `Bassman` | Fender 5F6-A / Twin | 標準 FMV，中頻凹陷深 | BYOD Bassman：R1 250k, R2 1M, R3 25k, R4 56k, C1 250pF, C2/C3 20nF |
-| `JCM800` | Marshall 2203/2204 | 亮、mid 較前 | Marshall schematic（公開） |
-| `AC30` | Vox AC30「cut/tone」 | 不同拓撲（Vox 較簡） | Vox schematic |
+| `Bassman` | Fender 5F6-A / Twin | 標準 FMV，中頻凹陷深 | **原機 5F6-A schematic**：treble 250k(audio), bass 1M(audio), mid 25k(linear), slope 56k, C1 250pF, C2/C3 20nF。⚠️ v2 查核：BYOD 的 `R3=96k` 是**它自己改的**（原始碼註解 `modified from 25e3`）——我們以原機為準，BYOD 值只當「他們的 voicing 選擇」參考 |
+| `JCM800` | Marshall 2203/2204 | 亮、mid 較前 | Marshall schematic（公開）：slope 33k, C1 470pF, C2/C3 22nF, treble 220k, bass 1M, mid 22k（型號有差，取代表值） |
+| `AC30` | Vox AC30 Top Boost | 同 FMV 拓撲、**mid 固定**（無 mid 旋鈕），值不同 | Vox Top Boost schematic |
 | `Baxandall` | Hi-Fi bass/treble | 對稱、無 scoop、平坦可調 | 標準 Baxandall |
-| `BigMuffTone` | EHX Big Muff | 中頻凹陷「wah 反相」 | Big Muff schematic |
+| `BigMuffTone` | EHX Big Muff | 中頻凹陷「wah 反相」 | Big Muff schematic（39k/22nF ‖ 100k/10nF 系，版本眾多取代表值） |
 | `James`/`Passive` | 通用被動 | 簡單兩旋鈕 | 標準 |
 
-> `Bassman`/`JCM800`/`AC30` 同屬 FMV 通式、只差元件值與（AC30）少數拓撲支路——
-> 佐證了「一個引擎、換零件＝多機型」。
+> `Bassman`/`JCM800`/`AC30` 同屬 FMV 通式、只差元件值（AC30 的 mid 為定值）——
+> 佐證了「一個引擎、換零件＝多機型」。所有元件值都是可查 schematic 的事實；
+> **BYOD 只做交叉驗證，不做唯一來源**（Bassman R3 一案正是教訓）。
 
 ### 2.3 與既有 drive 的整合（voicing 改動，使用者要的）
 
@@ -82,12 +102,17 @@ diode-ladder tone stack 留待 Phase 03 R-Type 落地後再議。
   `ToneStackKind`（`red-charlie`/`monster5150`→`JCM800`；`angry-charlie`系→
   Baxandall/JCM800；`evva`→其設計對應機型）。**這會改變它們的聲音**——正是
   使用者想要的改善。每顆的 character 測試（EQ-band、tilt、scoop）須**更新並重新
-  pin**；ADR 記錄「voicing 改動，pre-v0.1，非 append-only 相容」。
+  pin**；ADR 記錄「voicing 改動，非 append-only 相容」。
 - **(ii) 新增變體**：保留舊 drive，另以新 key 追加「real-stack 版」。保 preset
   穩定但 registry 膨脹。
 
-> 建議 (i)——使用者明確要更好的音色，且 pre-v0.1 正是改 voicing 的時機。以測試
-> 重新 pin 新特徵、ADR 交代清楚即可。若使用者想保舊聲音再走 (ii)。
+> 建議 (i)——使用者明確要更好的音色；v0.1.0 雖已釋出，但目前單人使用、preset
+> 都在本機，voicing 改動以「ADR 交代 + 測試重新 pin」處理即可，不需相容性包袱。
+> 若某顆的舊聲音真想留再走 (ii)。
+>
+> 實作備註：既有 `Circuit::eq()` 收的是逐 sample 旋鈕軌跡（`low/mid/high:
+> &[f32]`）；解析 stack 的係數重算在 block 邊界取軌跡端點即可（係數再平滑），
+> 不必逐 sample 重算——與 `eq::chain` 的既有慣例一致。
 
 ### 2.4 獨立 tone 踏板（可選，複用引擎）
 
@@ -106,17 +131,23 @@ lion-heart `eq` 家族已有 `chain`(3-band) 與 `parametric`。可再追加一�
 ## 4. 驗收標準
 
 ### 4.1 `cargo test`
+- **係數正確性 golden（v2 提升為驗收，這是最容易寫錯的地方）**：ngspice 對每個
+  kind 跑 AC 掃描（幾組代表旋鈕點：noon、全開、全關、混合），輸出存成 repo
+  fixtures；我們的 `H(s)` 幅度響應對照 fixtures 在容差內（bilinear 預畸後音訊帶
+  內）。封閉式係數「一次寫對」靠這個，不靠肉眼。
 - **旋鈕互動**（白箱判別）：固定 Bass/Treble，掃 Mid，量測 Treble 頻段響應**有
   變化**（證明耦合）；對照現行 `ToneStack` 此測試不成立。
-- **中頻凹陷**：`Bassman`/`JCM800` 在 noon（l=m=t=0.5）於 ~400–800 Hz 有可量測
-  凹陷（相對 100 Hz/3 kHz）；`Baxandall` noon 近平坦（對照組）。
+- **中頻凹陷**：`Bassman`/`JCM800` 在 noon（taper 映射後的真 noon）於
+  ~400–800 Hz 有可量測凹陷（相對 100 Hz/3 kHz）；`Baxandall` noon 近平坦
+  （對照組）。
 - **傳輸函數對照**：數位 `H(z)` 的頻率響應對照解析 `H(s)`（bilinear 預畸校正後）
   在音訊帶內容差內。
-- **極端旋鈕穩定**：三旋鈕全掃（0/0/0 到 1/1/1）係數有界、濾波器穩定（極點在
-  單位圓內）、無 NaN、無 zipper（平滑後）。
+- **極端旋鈕穩定**：三旋鈕全掃（0/0/0 到 1/1/1）係數有界、濾波器穩定（**極點
+  半徑 < 1，44.1/48/96k 各驗**）、無 NaN、無 zipper（平滑後）。
 - **多 rate/block**（44.1/48/96 kHz、block 32–1024）、bypass/flat 行為明確、
   silence→silence。
-- **遷移對照**（若採 2.3(i)）：被重調 drive 的新 character pin 全綠。
+- **遷移對照**（若採 2.3(i)）：被重調 drive 的新 character pin 全綠，**且既有
+  level-norm pin 全綠**（插入損由 per-kind makeup 補償，見 §2.1）。
 
 ### 4.2 `cargo bench`
 - `tonestack_fmv` 每 64-frame block 成本（預期 ~biquad 級，遠低於 WDF）；settled-
@@ -137,16 +168,21 @@ lion-heart `eq` 家族已有 `chain`(3-band) 與 `parametric`。可再追加一�
 - （2.3）遷移 `evva`/`red-charlie`/`monster5150`/`angry-charlie*` 的 tone 級 +
   更新 character 測試。
 - （2.4 可選）`eq` 家族追加 `tonestack` 踏板 + livery + plugin id 展開。
-- **ADR 030**：tone stack 引擎（路線 A 解析傳輸函數 vs 路線 B WDF；遷移決策；
-  非線性留 Phase 03）。
-- **PRD 022**（本檔的正式 PRD 版，若要進 `docs/PRD/` 主序列）。
+- **ADR**（暫定 030）：tone stack 引擎（路線 A 解析傳輸函數 vs 路線 B WDF；
+  遷移決策；非線性留 Phase 03）。
+- **PRD**：落地時於主序列取號。
+- ngspice AC 掃描 fixtures（`sim/tonestack/` 或測試 fixtures 目錄）＋產生腳本。
 - 更新 `docs/benchmarks.md`。
 
 ## 6. 風險與備註
 
 - **三階 IIR 在低取樣率的數值穩定**：bilinear 在 Nyquist 附近有頻率壓縮；tone
   stack 轉角多在中低頻，影響小；必要時對關鍵轉角做 bilinear 預畸（prewarp）。
-- **係數封閉式冗長**：Yeh 的 Bassman 係數式很長但一次寫對即可；建議附一支離線
-  測試，用符號/數值 SPICE 對照一組旋鈕點驗證係數正確。
+  係數推導全程 f64（見 §2.1）；若 f32 狀態在 96k 出現精度問題，單顆濾波器升
+  f64 狀態的成本可忽略（每 slot 只有一個 stack）。
+- **係數封閉式冗長**：Yeh 的 Bassman 係數式很長——正確性交給 §4.1 的 ngspice
+  fixtures golden，不靠肉眼比對。
+- **taper 與凹陷位置互相牽動**：若 noon 凹陷聽起來偏位，先查 taper 映射再懷疑
+  元件值。
 - **這是使用者最有感的一步**，且不依賴大框架——建議緊接 Phase 01 之後、或平行做。
 </content>
