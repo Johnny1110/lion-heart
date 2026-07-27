@@ -30,14 +30,23 @@ BYOD 的高效率來自兩套外圍工具（lion-heart 現在沒有）：
 
 ### 2.1 netlist → 散射矩陣 codegen（`tools/wdf_codegen/`）
 
-- **netlist 格式**：定義一個簡單的電路描述（節點、R/C、電位器、op-amp、二極體、
-  非線性 root port）。可直接用 R-Solver 的 netlist 格式（`tools/netlists/*.txt`）。
+> v2 註：**最小雛形已提前到 Phase 03 §2.5**（跑通 R-Solver + TS 矩陣 + 數值
+> 驗證管道）——本節是把雛形打磨成「使用者級」工具。
+
+- **netlist 格式**：直接用 R-Solver 的 netlist 格式（`tools/netlists/*.txt`），
+  不自創格式。
 - **跑 R-Solver**：腳本呼叫 R-Solver 產生散射矩陣（符號式，以 port 阻抗為變數）。
-- **codegen 成 Rust**：把散射矩陣輸出成 Phase 03 框架吃的 Rust
-  （`fn s_matrix(impedances) -> [[f32; N]; N]`）——貼進踏板檔即可。這對應 Phase 03
-  「組法 (b) 扁平陣列」最友善（codegen 產索引 + 矩陣）。
+  先確認其 CAS 後端相依與授權（Phase 03 §2.5 已驗）。
+- **codegen 成 Rust**：把散射矩陣輸出成 Phase 03 框架吃的 Rust——
+  `fn s_matrix(...) -> [[f32; N]; N]` + 一段**泛型樹組裝骨架**（對應 Phase 03
+  組法 (a)；codegen 產的是 Rust 原始碼文字，泛型樹與陣列一樣好產）——人再補
+  faceplate/校準。
+- **驗證內建**：codegen 順手產「隨機阻抗數值對照」測試（Phase 03 §2.5 的管道
+  模板化），每顆新矩陣自帶正確性測試。
 - **產物入庫**：每顆踏板的 netlist 進 repo（`tools/netlists/`），散射矩陣是
   **可重生的產物**（授權乾淨：netlist 是事實、矩陣是自產數學）。
+- **後備**（若 R-Solver 長期不可用）：Werner 系數值 S 構造（Phase 03 §2.5），
+  代價是 runtime 多一份 junction 描述 + 小矩陣求逆。
 
 ### 2.2 SPICE → 參數擬合流程（`sim/`，仿 BYOD）
 
@@ -90,10 +99,12 @@ BYOD 每顆把每個 R/C 都暴露成可調（`CircuitQuantity` + schematic SVG�
 
 ## 4. 驗收標準
 
-- **codegen**：對一個已知電路（如 TS 3-port），`wdf_codegen` 產的散射矩陣對照
-  離線參考解一致；產出的 Rust 能編譯並通過該踏板測試。
-- **SPICE 擬合**：對 ZenDrive（已知 BYOD 擬合值）重跑擬合，得到相近參數（驗證
-  流程正確）。
+- **codegen**：對一個已知電路（TS 的 4×4 R-node），`wdf_codegen` 產的散射矩陣
+  對照隨機阻抗數值參考解一致；產出的 Rust 能編譯並通過該踏板測試。
+- **SPICE 擬合**：對 ZenDrive 的 MOSFET-diode 重跑擬合——**驗收對象是「擬合後
+  的 WDF 靜態/暫態曲線貼合 SPICE 真值」**，不是「重現 BYOD 的參數數字」
+  （v2：BYOD 的 Zen 參數繞著其實作 bug 擬合，見 Phase 04 §2.2——複現它的數字
+  反而是錯的）。
 - **驗證 harness**：至少一顆 Phase 04 踏板用 golden-vs-數值解通過。
 - **食譜**：**使用者（或另一位）能照食譜，從 netlist 到綠燈踏板走完**——這是目標
   #3 的實質驗收。
@@ -110,10 +121,11 @@ BYOD 每顆把每個 R/C 都暴露成可調（`CircuitQuantity` + schematic SVG�
 
 ## 6. 風險與備註
 
-- **R-Solver 相依**：確認其授權與可用性；若不便直接用，可自寫一個小型符號散射
-  矩陣產生器（成本較高但可控）。**這條要在 Phase 03/04 動手前就跑通**——否則 04
-  的散射矩陣會沒有乾淨來源。
-- **SPICE 工具鏈**：ngspice（開源）優於 LTSpice（授權/平台）作為 CI 可跑的擬合後端。
-- **這是「平台化」的收官**，但其中 §2.1 codegen 其實應**提早到 Phase 03/04 之間**
-  就 bootstrap（哪怕最小版），讓名踏板的矩陣一開始就走乾淨來源、不手抄 GPL。
+- **R-Solver 相依**：確認其 CAS 後端相依與授權（v2：已定為 **Phase 03 §2.5 的
+  硬前置**，不會拖到本 Phase 才發現問題）；後備＝數值 S 構造（§2.1）。
+- **SPICE 工具鏈**：ngspice（開源、可 script）優於 LTSpice（授權/平台）作為
+  CI 可跑的擬合後端；Phase 02 的 tone stack AC fixtures 已先用上 ngspice，
+  管線是現成的。
+- **這是「平台化」的收官**：codegen 雛形在 Phase 03、tone stack fixtures 在
+  Phase 02 先行——本 Phase 的增量是擬合流程、食譜、tweakable 層與自研範例踏板。
 </content>

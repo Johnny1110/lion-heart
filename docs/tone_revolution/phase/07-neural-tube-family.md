@@ -42,7 +42,10 @@ BYOD 有一批**類神經**與**真空管**drive，與純電路白箱不同：
 
 ### 2.1 Triode WDF root（路線 B，建議優先）
 - 在 `blocks::wdf` 加**三極管非線性 root**：以 Dempwolf-Zölzer（或 Koren）三極管
-  電流式，omega/Newton 解，接 R-Type（BYOD JuniorB 的 `ModifiedRType` 對應）。
+  電流式接 R-Type（BYOD JuniorB 的 `ModifiedRType` 對應）。
+- **v2 修正——求解不是標量**：三極管有柵/屏兩條電流路徑，root 是**二維**
+  （2×2 damped Newton，固定迭代上界、warm-start），omega 閉式**不適用**。
+  仍 RT-safe，但這是比二極體 root 高一級的數值工作——也是它排最後的原因之一。
 - 應用：一個**真空管前級 drive**（暖、偶次諧波、compression/sag），對接白皮書
   triode 深水題與 `power`（功率級）家族。Faceplate：Drive / Bias / Tone / Level。
 - **不需外部權重**——純電路白箱，授權乾淨。
@@ -86,9 +89,9 @@ BYOD 有一批**類神經**與**真空管**drive，與純電路白箱不同：
 
 - （B）`blocks::wdf` triode root + `drive/triode.rs`（或 `tube_preamp.rs`）。
 - （A，若做）神經推論模組 + 自訓權重 + 資料集產生腳本（依賴 Phase 08 render/SPICE）。
-- **ADR 034**（神經 drive 路徑：推論引擎、權重授權策略、與 nam-rs 的關係、triode
-  白箱 vs 神經的取捨）。
-- **PRD 027**（正式版，若進主序列）。
+- **ADR**（暫定 034，神經 drive 路徑：推論引擎、權重授權策略、與 nam-rs 的關係、
+  triode 白箱 vs 神經的取捨）。
+- **PRD**：落地時於主序列取號。
 
 ## 6. 風險與備註
 
