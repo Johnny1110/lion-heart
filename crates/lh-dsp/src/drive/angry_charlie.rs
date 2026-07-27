@@ -15,6 +15,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa2, clip, clip_f1, clip_f2};
 use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
@@ -44,7 +45,12 @@ const BRIGHT: f32 = 0.35;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.09;
 
+/// Anti-aliased clipping (PRD 024): a flat-topped clamp generates harmonics
+/// that fall off far too slowly for 4× oversampling alone, and what comes back
+/// over Nyquist is the fizz. Second-order ADAA — the clamp's second
+/// antiderivative is a piecewise cubic, so it costs almost nothing.
 pub(super) struct AngryCharlie {
+    clip: Adaa2,
     hp_in: OnePole,
     bright: OnePole,
     dc_os: OnePole,
@@ -57,6 +63,7 @@ pub(super) struct AngryCharlie {
 impl AngryCharlie {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa2::new(),
             hp_in: OnePole::default(),
             bright: OnePole::default(),
             dc_os: OnePole::default(),
@@ -78,6 +85,7 @@ impl Circuit for AngryCharlie {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp_in.reset();
         self.bright.reset();
         self.dc_os.reset();
@@ -99,7 +107,13 @@ impl Circuit for AngryCharlie {
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1800));
             // The two clean gain stages, then a genuine hard clip to ground
             // — flat-topped, not a tanh curve, symmetric both polarities.
-            let clipped = (gain.tick() * x).clamp(-KNEE, KNEE);
+            let v = gain.tick() * x;
+            let clipped = self.clip.process(
+                v,
+                |u| clip(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f1(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f2(u, -KNEE as f64, KNEE as f64),
+            );
             *s = clipped - self.dc_os.lp(clipped, self.c12);
         }
     }

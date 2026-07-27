@@ -1,7 +1,8 @@
 # Tone Revolution — 移植計畫藍圖（Overview）
 
-狀態：**執行中** — **Phase 01（PRD 022）與 Phase 02（PRD 023 / ADR 030）已實作
-（2026-07-27）**；Phase 06 起待排。
+狀態：**執行中** — **Phase 01（PRD 022）、02（PRD 023 / ADR 030）、06（PRD 024 /
+ADR 031）已實作（2026-07-27）**；建議順序的三個 quick win 全部完成，Phase 03
+（WDF adaptor + R-Type）起待排。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -19,12 +20,15 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | ----- | ---- | ---- |
 > | 01 快速非線性 root | ✅ **已實作** | PRD 022；`blocks::wdf::omega`；`screamer` 72.3 → **30.5 µs**、root 12.7×、誤差 30 µV |
 > | 02 Tone stack 框架 | ✅ **已實作** | PRD 023 / **ADR 030**；`eq::tonestack`（netlist → 狀態空間 → Tustin）；3 機型；5 顆 FMV 系 drive 遷移；獨立 `tonestack` 踏板 |
-> | 03–08 | 待排 | — |
+> | 06 Waveshaper + ADAA | ✅ **已實作** | PRD 024 / **ADR 031**；`blocks::waveshaper`（一/二階 ADAA + 12 曲線）；**全部 12 顆 memoryless drive 抗鋸齒**（地板 −29 → −38…−87 dB）；新踏板 `waveshaper` |
+> | 03–05、07–08 | 待排 | — |
 >
-> 兩個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
+> 三個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
 > 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
 > 形式由「手推封閉式 + 三階直接式 IIR」改為「netlist → 狀態空間」、六個機型只交付
-> 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle。
+> 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle；06 是二階
+> ADAA 自行從定義推導、dry-sum 補償實測後**完全不需要**（ADAA 在 4× 率上）、改造
+> 範圍由 8 顆擴大到全部 12 顆 memoryless 踏板。
 
 ---
 
@@ -37,10 +41,11 @@ EQ、（2）業界名踏板的既有設計參數能整批移植進來、（3）�
 
 ## 1. 願景與問題陳述
 
-lion-heart 的 drive 家族目前 14 顆（`ts9`、`bd2`、`classic`、`centaur`、`evva`、
+lion-heart 的 drive 家族目前 **15 顆**（`ts9`、`bd2`、`classic`、`centaur`、`evva`、
 `red-charlie`、`monster5150`、`angry-charlie`、`jan-ray`、`fuzz-face`、`overdrive`、
-`screamer`、`sd1`、`angry-charlie-v2`），其中僅 `screamer` / `sd1` 是 WDF 白箱，
-其餘皆 memoryless。使用者回報兩點不滿，兩者其實共根：
+`screamer`、`sd1`、`angry-charlie-v2`、`waveshaper`），其中僅 `screamer` / `sd1`
+是 WDF 白箱，其餘皆 memoryless（自 Phase 06 起全部走 ADAA 抗鋸齒）。使用者回報
+兩點不滿，兩者其實共根：
 
 - **Tone stack 聽起來像圖形 EQ，不像音箱。** 現行 `drive::ToneStack`
   （`crates/lh-dsp/src/drive/mod.rs`）是三個**獨立、相加、互不干擾**的濾波帶

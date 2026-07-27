@@ -19,6 +19,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa2, clip, clip_f1, clip_f2};
 use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
@@ -58,7 +59,12 @@ const FIZZ_HZ: f32 = 6_800.0;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.16;
 
+/// Anti-aliased clipping (PRD 024): a flat-topped clamp generates harmonics
+/// that fall off far too slowly for 4× oversampling alone, and what comes back
+/// over Nyquist is the fizz. Second-order ADAA — the clamp's second
+/// antiderivative is a piecewise cubic, so it costs almost nothing.
 pub(super) struct Monster5150 {
+    clips: [Adaa2; 3],
     hp_in: OnePole,
     lf_trim: OnePole,
     bright: OnePole,
@@ -79,6 +85,7 @@ pub(super) struct Monster5150 {
 impl Monster5150 {
     pub(super) fn new() -> Self {
         Self {
+            clips: [Adaa2::new(); 3],
             hp_in: OnePole::default(),
             lf_trim: OnePole::default(),
             bright: OnePole::default(),
@@ -100,8 +107,15 @@ impl Monster5150 {
     /// Symmetric hard clip — a genuine flat-topped clamp, not a tanh curve:
     /// the diode-to-ground character, both polarities alike.
     #[inline]
-    fn hard_clip(v: f32) -> f32 {
-        v.clamp(-KNEE, KNEE)
+    /// Anti-aliased clamp. `stage` selects which cascade position's ADAA
+    /// state to advance — each clip needs its own history.
+    fn hard_clip(&mut self, stage: usize, v: f32) -> f32 {
+        self.clips[stage].process(
+            v,
+            |u| clip(u, -KNEE as f64, KNEE as f64),
+            |u| clip_f1(u, -KNEE as f64, KNEE as f64),
+            |u| clip_f2(u, -KNEE as f64, KNEE as f64),
+        )
     }
 }
 
@@ -119,6 +133,9 @@ impl Circuit for Monster5150 {
     }
 
     fn reset(&mut self) {
+        for c in &mut self.clips {
+            c.reset();
+        }
         self.hp_in.reset();
         self.lf_trim.reset();
         self.bright.reset();
@@ -142,14 +159,14 @@ impl Circuit for Monster5150 {
             // Fixed bright pre-emphasis: the sizzle at every gain.
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1500));
             // Stage 1: symmetric hard clip to the shared ceiling.
-            let s1 = Self::hard_clip(gain.tick() * x);
+            let s1 = self.hard_clip(0, gain.tick() * x);
             let s1 = s1 - self.couple1.lp(s1, self.c_couple1);
             // Stage 2: re-amplify the already-clipped wave and clamp again.
-            let s2 = Self::hard_clip(STAGE2_GAIN * s1);
+            let s2 = self.hard_clip(1, STAGE2_GAIN * s1);
             // Tighter second coupling before the final stage.
             let s2 = s2 - self.couple2.lp(s2, self.c_couple2);
             // Stage 3: the last, tightest slam of the wall.
-            let s3 = Self::hard_clip(STAGE3_GAIN * s2);
+            let s3 = self.hard_clip(2, STAGE3_GAIN * s2);
             *s = s3 - self.dc_os.lp(s3, self.c12);
         }
     }

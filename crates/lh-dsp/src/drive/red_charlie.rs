@@ -13,6 +13,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa1, asym_tanh, asym_tanh_f1};
 use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
@@ -50,7 +51,12 @@ const LOW_TRIM: f32 = 0.6;
 /// (re-trimmed after the solo-pot gain extension made noon hotter).
 const MAKEUP: f32 = 0.18;
 
+/// Anti-aliased clipping (PRD 024). A `tanh` knee aliases far less than a hard
+/// corner, but at high gain it approaches one — first-order ADAA, since
+/// `tanh`'s second antiderivative is not elementary.
 pub(super) struct RedCharlie {
+    stage1: Adaa1,
+    stage2: Adaa1,
     hp_in: OnePole,
     lf_trim: OnePole,
     bright: OnePole,
@@ -67,6 +73,8 @@ pub(super) struct RedCharlie {
 impl RedCharlie {
     pub(super) fn new() -> Self {
         Self {
+            stage1: Adaa1::new(),
+            stage2: Adaa1::new(),
             hp_in: OnePole::default(),
             lf_trim: OnePole::default(),
             bright: OnePole::default(),
@@ -81,14 +89,15 @@ impl RedCharlie {
         }
     }
 
-    /// Asymmetric tanh clipper with independent knees per polarity.
+    /// Asymmetric tanh clipper with independent knees per polarity, run
+    /// through the given stage's ADAA state.
     #[inline]
-    fn clip(v: f32, knee_pos: f32, knee_neg: f32) -> f32 {
-        if v >= 0.0 {
-            knee_pos * (v / knee_pos).tanh()
-        } else {
-            knee_neg * (v / knee_neg).tanh()
-        }
+    fn clip(adaa: &mut Adaa1, v: f32, knee_pos: f32, knee_neg: f32) -> f32 {
+        adaa.process(
+            v,
+            |u| asym_tanh(u, knee_pos as f64, knee_neg as f64),
+            |u| asym_tanh_f1(u, knee_pos as f64, knee_neg as f64),
+        )
     }
 }
 
@@ -104,6 +113,8 @@ impl Circuit for RedCharlie {
     }
 
     fn reset(&mut self) {
+        self.stage1.reset();
+        self.stage2.reset();
         self.hp_in.reset();
         self.lf_trim.reset();
         self.bright.reset();
@@ -128,7 +139,9 @@ impl Circuit for RedCharlie {
             let bright = BRIGHT_MAX * (1.0 - d * 0.1);
             let x = x + bright * (x - self.bright.lp(x, self.c1600));
             // Stage 1: warm asymmetric soft clip.
-            let s1 = Self::clip(gain.tick() * x,
+            let s1 = Self::clip(
+                &mut self.stage1,
+                gain.tick() * x,
                 STAGE1_KNEE_POS,
                 STAGE1_KNEE_NEG,
             );
@@ -136,7 +149,9 @@ impl Circuit for RedCharlie {
             let s1 = s1 - self.couple.lp(s1, self.c120);
             // Stage 2: the cold clipper (the real stage inverts; opposite
             // knee polarity models the flip).
-            let s2 = Self::clip(STAGE2_GAIN * s1,
+            let s2 = Self::clip(
+                &mut self.stage2,
+                STAGE2_GAIN * s1,
                 STAGE2_KNEE_POS,
                 STAGE2_KNEE_NEG,
             );

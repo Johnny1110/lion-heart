@@ -21,6 +21,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa2, clip, clip_f1, clip_f2};
 use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
@@ -60,7 +61,13 @@ const FIZZ_HZ: f32 = 7_500.0;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.09;
 
+/// Anti-aliased clipping (PRD 024): a flat-topped clamp generates harmonics
+/// that fall off far too slowly for 4× oversampling alone, and what comes back
+/// over Nyquist is the fizz. Second-order ADAA — the clamp's second
+/// antiderivative is a piecewise cubic, so it costs almost nothing.
 pub(super) struct AngryCharlieV2 {
+    clip1: Adaa2,
+    clip2: Adaa2,
     hp_in: OnePole,
     mid_boost: Biquad,
     bright: OnePole,
@@ -78,6 +85,8 @@ pub(super) struct AngryCharlieV2 {
 impl AngryCharlieV2 {
     pub(super) fn new() -> Self {
         Self {
+            clip1: Adaa2::new(),
+            clip2: Adaa2::new(),
             hp_in: OnePole::default(),
             mid_boost: Biquad::default(),
             bright: OnePole::default(),
@@ -109,6 +118,8 @@ impl Circuit for AngryCharlieV2 {
     }
 
     fn reset(&mut self) {
+        self.clip1.reset();
+        self.clip2.reset();
         self.hp_in.reset();
         self.mid_boost.reset();
         self.bright.reset();
@@ -133,11 +144,21 @@ impl Circuit for AngryCharlieV2 {
             let x = self.mid_boost.process_sample(x);
             let x = x + BRIGHT * (x - self.bright.lp(x, self.c1800));
             // Stage 1: clean gain into a genuine LED hard clip.
-            let s1 = (gain.tick() * x).clamp(-KNEE, KNEE);
+            let s1 = self.clip1.process(
+                gain.tick() * x,
+                |u| clip(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f1(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f2(u, -KNEE as f64, KNEE as f64),
+            );
             // Tighten between stages so the cascade stays articulate under gain.
             let s1 = s1 - self.couple.lp(s1, self.c_couple);
             // Stage 2: re-amplify the clipped wave and slam the wall again.
-            let s2 = (STAGE2_GAIN * s1).clamp(-KNEE, KNEE);
+            let s2 = self.clip2.process(
+                STAGE2_GAIN * s1,
+                |u| clip(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f1(u, -KNEE as f64, KNEE as f64),
+                |u| clip_f2(u, -KNEE as f64, KNEE as f64),
+            );
             *s = s2 - self.dc_os.lp(s2, self.c12);
         }
     }

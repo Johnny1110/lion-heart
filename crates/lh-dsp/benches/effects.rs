@@ -289,6 +289,58 @@ fn bench_effects(c: &mut Criterion) {
 /// The full hand-written M5 pedalboard (everything but NAM) at the live
 /// 64-frame format and the M6 stage target of 32 frames, where per-block
 /// overhead weighs double.
+/// ADAA's own cost, isolated from everything else (PRD 024): the same curve
+/// through the same 4× oversampler, point-sampled versus first- and
+/// second-order anti-aliased. Everything else in the drive rows below is held
+/// constant, so the difference here is what the retrofit actually charges.
+fn bench_adaa(c: &mut Criterion) {
+    use lh_dsp::blocks::oversample::Oversampler4x;
+    use lh_dsp::blocks::waveshaper::{Adaa1, Adaa2, Curve};
+
+    let mut group = c.benchmark_group("block64_48k");
+    let mut buf = signal();
+    let curve = Curve::Hard;
+
+    let mut os = Oversampler4x::new();
+    group.bench_function("waveshaper_hard_plain", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            os.process(black_box(&mut buf), |blk| {
+                for s in blk.iter_mut() {
+                    *s = curve.f(f64::from(4.0 * *s)) as f32;
+                }
+            });
+        })
+    });
+
+    let mut os1 = Oversampler4x::new();
+    let mut a1 = Adaa1::new();
+    group.bench_function("waveshaper_hard_adaa1", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            os1.process(black_box(&mut buf), |blk| {
+                for s in blk.iter_mut() {
+                    *s = a1.process(4.0 * *s, |u| curve.f(u), |u| curve.f1(u));
+                }
+            });
+        })
+    });
+
+    let mut os2 = Oversampler4x::new();
+    let mut a2 = Adaa2::new();
+    group.bench_function("waveshaper_hard_adaa2", |b| {
+        b.iter(|| {
+            buf.copy_from_slice(&signal());
+            os2.process(black_box(&mut buf), |blk| {
+                for s in blk.iter_mut() {
+                    *s = a2.process(4.0 * *s, |u| curve.f(u), |u| curve.f1(u), |u| curve.f2(u));
+                }
+            });
+        })
+    });
+    group.finish();
+}
+
 fn bench_full_chain(c: &mut Criterion) {
     let mut group = c.benchmark_group("full_chain_no_nam");
     for block in [64usize, 32] {
@@ -372,5 +424,11 @@ fn bench_wdf_root(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_effects, bench_full_chain, bench_wdf_root);
+criterion_group!(
+    benches,
+    bench_effects,
+    bench_full_chain,
+    bench_wdf_root,
+    bench_adaa
+);
 criterion_main!(benches);

@@ -8,6 +8,8 @@
 
 use lh_core::{EffectDesc, ParamDesc};
 
+use crate::blocks::waveshaper::{Adaa2, algebraic, algebraic_f1, algebraic_f2};
+
 use super::{Circuit, OnePole, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 3] = [
@@ -30,6 +32,12 @@ const DIODE: f32 = 0.65;
 const MAKEUP: f32 = 0.22;
 
 pub(super) struct Ts9 {
+    /// Anti-aliased clipping (PRD 024): the algebraic diode curve has an
+    /// elementary second antiderivative, so this one gets second-order ADAA.
+    /// Its half-sample delay lands on the wet half of the `x + clipped` sum;
+    /// at 4× that combs by under 0.1 dB below 10 kHz (see
+    /// `blocks::waveshaper`).
+    clip: Adaa2,
     hp720: OnePole,
     fb_lp: OnePole,
     tone_lp: OnePole,
@@ -45,6 +53,7 @@ pub(super) struct Ts9 {
 impl Ts9 {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa2::new(),
             hp720: OnePole::default(),
             fb_lp: OnePole::default(),
             tone_lp: OnePole::default(),
@@ -77,6 +86,7 @@ impl Circuit for Ts9 {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp720.reset();
         self.fb_lp.reset();
         self.tone_lp.reset();
@@ -95,7 +105,7 @@ impl Circuit for Ts9 {
             let hp = x - self.hp720.lp(x, self.c720);
             let g = 1.0 + Self::feedback_ohms(*d) / 4_700.0;
             let v = g * hp / DIODE;
-            let clipped = DIODE * (v / (1.0 + v * v).sqrt());
+            let clipped = DIODE * self.clip.process(v, algebraic, algebraic_f1, algebraic_f2);
             // Unity dry plus the clipped mids: the screamer sum.
             *s = x + self.fb_lp.lp(clipped, self.fb_c);
         }

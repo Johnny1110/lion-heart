@@ -5,6 +5,7 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa1, asym_tanh, asym_tanh_f1};
 use crate::eq::tonestack::kind;
 
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
@@ -29,7 +30,11 @@ const KNEE_NEG: f32 = 0.5;
 /// Calibrated so the evva sits near unity at default knobs (level 6, gain 4).
 const MAKEUP: f32 = 0.28;
 
+/// Anti-aliased clipping (PRD 024). A `tanh` knee aliases far less than a hard
+/// corner, but at high gain it approaches one — first-order ADAA, since
+/// `tanh`'s second antiderivative is not elementary.
 pub(super) struct Evva {
+    clip: Adaa1,
     hp30: OnePole,
     dc_os: OnePole,
     stack: ToneStack,
@@ -40,6 +45,7 @@ pub(super) struct Evva {
 impl Evva {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             hp30: OnePole::default(),
             dc_os: OnePole::default(),
             stack: ToneStack::new(kind::BASSMAN),
@@ -58,6 +64,7 @@ impl Circuit for Evva {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp30.reset();
         self.dc_os.reset();
         self.stack.reset();
@@ -71,11 +78,11 @@ impl Circuit for Evva {
             // HP at 30 Hz — blocks subsonics, keeps the full guitar range.
             let x = x - self.hp30.lp(x, self.c30);
             let v = gain.tick() * x;
-            let clipped = if v >= 0.0 {
-                KNEE_POS * (v / KNEE_POS).tanh()
-            } else {
-                KNEE_NEG * (v / KNEE_NEG).tanh()
-            };
+            let clipped = self.clip.process(
+                v,
+                |u| asym_tanh(u, KNEE_POS as f64, KNEE_NEG as f64),
+                |u| asym_tanh_f1(u, KNEE_POS as f64, KNEE_NEG as f64),
+            );
             *s = clipped - self.dc_os.lp(clipped, self.c12);
         }
     }

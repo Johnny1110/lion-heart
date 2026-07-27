@@ -34,6 +34,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa1, tanh_f1};
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 2] = [
@@ -65,7 +67,38 @@ const GATE_FRAC: f32 = 0.25;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.13;
 
+/// The germanium pair's curve: mushy `tanh` saturation pushing up, a hard flat
+/// cutoff pulling down — the blocking-distortion asymmetry.
+#[inline]
+fn germ_clip(v: f64) -> f64 {
+    if v >= 0.0 {
+        KNEE_POS as f64 * (v / KNEE_POS as f64).tanh()
+    } else {
+        v.max(-(KNEE_NEG as f64))
+    }
+}
+
+/// Its antiderivative, normalised to `F₁(0) = 0` (PRD 024). Both branches
+/// vanish at the origin, so the halves join without a step.
+#[inline]
+fn germ_clip_f1(v: f64) -> f64 {
+    if v >= 0.0 {
+        let k = KNEE_POS as f64;
+        k * k * tanh_f1(v / k)
+    } else {
+        let n = KNEE_NEG as f64;
+        if v >= -n {
+            v * v / 2.0
+        } else {
+            -n * v - n * n / 2.0
+        }
+    }
+}
+
 pub(super) struct FuzzFace {
+    /// Anti-aliased clipping (PRD 024): the hard negative floor is exactly the
+    /// corner ADAA exists for.
+    clip: Adaa1,
     hp_in: OnePole,
     dark: OnePole,
     dc_os: OnePole,
@@ -85,6 +118,7 @@ pub(super) struct FuzzFace {
 impl FuzzFace {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             hp_in: OnePole::default(),
             dark: OnePole::default(),
             dc_os: OnePole::default(),
@@ -118,6 +152,7 @@ impl Circuit for FuzzFace {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp_in.reset();
         self.dark.reset();
         self.dc_os.reset();
@@ -163,11 +198,7 @@ impl Circuit for FuzzFace {
             let v = gain.tick() * (xd + PRE_BIAS);
             // Asymmetric clip: mushy soft saturation pushing up, a hard flat
             // cutoff pulling down.
-            let clipped = if v >= 0.0 {
-                KNEE_POS * (v / KNEE_POS).tanh()
-            } else {
-                v.max(-KNEE_NEG)
-            };
+            let clipped = self.clip.process(v, germ_clip, germ_clip_f1);
             *s = (clipped - self.dc_os.lp(clipped, self.c_dc)) * self.gate;
         }
     }

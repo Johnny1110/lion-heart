@@ -106,6 +106,10 @@ const SCREAMER: Color = Color::from_rgb(0.22, 0.64, 0.52);
 /// bright yellow that no other drive box (the centaur/jan-ray golds, the
 /// tremolo/chorale ambers) comes near.
 const SD1: Color = Color::from_rgb(0.96, 0.82, 0.22);
+/// Cold laboratory cyan — the waveshaper is the one drive that models no
+/// circuit at all (PRD 024), just twelve functions, so it wears the only
+/// non-enclosure colour in a family of painted boxes.
+const WAVESHAPER: Color = Color::from_rgb(0.30, 0.84, 0.86);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -181,6 +185,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "overdrive" => OVERDRIVE,
             "screamer" => SCREAMER,
             "sd1" => SD1,
+            "waveshaper" => WAVESHAPER,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

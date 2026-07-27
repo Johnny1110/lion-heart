@@ -44,6 +44,7 @@ mod red_charlie;
 mod screamer;
 mod sd1;
 mod ts9;
+mod waveshaper;
 
 use lh_core::{FamilyDesc, ParamDesc, Range, drive_law};
 
@@ -86,10 +87,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &screamer::DESC,
         &sd1::DESC,
         &angry_charlie_v2::DESC,
+        &waveshaper::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 14;
+pub const MODEL_COUNT: usize = 15;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -100,6 +102,10 @@ enum Ctl {
     Low,
     Mid,
     High,
+    /// A stepped selector routed straight to the circuit rather than through a
+    /// smoother — the `waveshaper`'s curve. Private to `lh-dsp`, so adding it
+    /// costs no preset or plugin schema change.
+    Shape,
 }
 
 /// One entry in the drive pedal registry: the faceplate, the param→control
@@ -182,6 +188,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         controls: &[Ctl::Drive, Ctl::Low, Ctl::Mid, Ctl::High, Ctl::Level],
         build: || Box::new(angry_charlie_v2::AngryCharlieV2::new()),
     },
+    ModelDef {
+        desc: &waveshaper::DESC,
+        controls: &[Ctl::Drive, Ctl::Shape, Ctl::Tone, Ctl::Level],
+        build: || Box::new(waveshaper::Waveshaper::new()),
+    },
 ];
 
 /// One channel of one drive model. Built off the audio thread
@@ -200,6 +211,11 @@ pub trait Circuit: Send {
     /// per-band controls. `low[i]` / `mid[i]` / `high[i]` are the smoothed
     /// knob positions (0..10) for `block[i]`.
     fn eq(&mut self, _block: &mut [f32], _low: &[f32], _mid: &[f32], _high: &[f32]) {}
+    /// A stepped selector reached the faceplate. Default no-op; only the
+    /// `waveshaper` has one. Called off the per-sample path, on whichever
+    /// thread applies params — so it must stay allocation-free, but it may do
+    /// real work (it resets filter state).
+    fn set_shape(&mut self, _index: usize) {}
 }
 
 // --- shared building blocks ---
@@ -426,6 +442,13 @@ impl Effect for Drive {
             Ctl::Low => self.low_s.set_target(real),
             Ctl::Mid => self.mid_s.set_target(real),
             Ctl::High => self.high_s.set_target(real),
+            // Not smoothed: it selects a curve, it does not sweep one. Both
+            // channels must agree, so it goes to the pair.
+            Ctl::Shape => {
+                for circuit in &mut self.circuits[self.model] {
+                    circuit.set_shape(real as usize);
+                }
+            }
         }
     }
 
@@ -573,6 +596,162 @@ mod tests {
     /// a `high / low` ratio.
     fn stack_tilt(kind: usize, low: f32, high: f32) -> f64 {
         stack_gain(kind, high) / stack_gain(kind, low)
+    }
+
+    /// The anti-aliasing pin (PRD 024). Every memoryless clipper in the family
+    /// now runs through ADAA on top of the 4× oversampler, and this is the
+    /// number that proves it: inharmonic energy relative to the fundamental,
+    /// per pedal, with the drive well up.
+    ///
+    /// Before the retrofit six pedals sat between −28 and −30 dB — that floor
+    /// *is* the "fizzy up the neck" complaint. The bounds below are the
+    /// measured values with a few dB of slack, so a regression that quietly
+    /// drops ADAA from a stage shows up here rather than in someone's ears.
+    ///
+    /// Note the split: a single clipper fed a bandlimited signal gains 25–50
+    /// dB, while `monster5150` (three cascaded clamps), `angry-charlie-v2`
+    /// (two) and `red-charlie` (two) gain 8–13 dB. That is inherent — ADAA
+    /// assumes its input is linear between samples, which is true of the
+    /// signal entering the *first* clipper and false of an already-squared
+    /// wave entering the second.
+    #[test]
+    fn every_memoryless_clipper_is_anti_aliased() {
+        // (pedal key, bound in dB). `screamer` and `sd1` are WDF: their
+        // nonlinearity is a solved equation, not an explicit curve, so ADAA
+        // does not apply and their rows are here as unchanged references.
+        let bounds: [(&str, f64); MODEL_COUNT] = [
+            ("ts9", -80.0),
+            ("bd2", -52.0),
+            ("classic", -58.0),
+            ("centaur", -73.0),
+            ("evva", -54.0),
+            ("red-charlie", -35.0),
+            ("monster5150", -33.0),
+            ("angry-charlie", -73.0),
+            ("jan-ray", -63.0),
+            ("fuzz-face", -48.0),
+            ("overdrive", -50.0),
+            ("screamer", -39.0),
+            ("sd1", -45.0),
+            ("angry-charlie-v2", -38.0),
+            ("waveshaper", -70.0),
+        ];
+        for (i, (key, bound)) in bounds.iter().enumerate() {
+            assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
+            let floor = alias_floor_db(i, 8.0);
+            assert!(
+                floor < *bound,
+                "{key}: alias floor {floor:.2} dB has risen above its \
+                 {bound:.0} dB pin — did a stage lose its ADAA?"
+            );
+        }
+    }
+
+    /// Diagnostic: print the whole table. Run with
+    /// `cargo test -p lh-dsp alias_floor_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn alias_floor_survey() {
+        for (i, def) in MODELS.iter().enumerate() {
+            let floor = alias_floor_db(i, 8.0);
+            println!("{:>18}  alias floor {floor:7.2} dB", def.desc.key);
+        }
+    }
+
+    /// Energy at frequencies that are *not* harmonics of the 5 kHz probe,
+    /// relative to the fundamental, in dB. Anything a memoryless shaper puts
+    /// there arrived by folding over Nyquist.
+    fn alias_floor_db(model: usize, drive_pos: f32) -> f64 {
+        const F0: f32 = 5_000.0;
+        // The 5th to 9th harmonics fold back onto these; none is a multiple
+        // of 5 kHz, so nothing legitimate lands on them.
+        const ALIASES: [f32; 4] = [3_000.0, 8_000.0, 13_000.0, 18_000.0];
+        let x = sine(SR, F0, SR as usize);
+        let mut d = prepared(model);
+        set_pos(&mut d, 0, drive_pos);
+        let y = process_in_blocks(&mut d, &x, 256);
+        let tail = &y[y.len() / 2..];
+        let fund = tone_at(tail, F0);
+        let alias = ALIASES
+            .iter()
+            .map(|f| tone_at(tail, *f).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        20.0 * (alias / fund.max(1e-12)).log10()
+    }
+
+    /// Every curve must reach the audio and change it — the Shape knob is not
+    /// twelve labels over one sound.
+    ///
+    /// Stated as "differs from the default curve", not "differs from every
+    /// other curve": `Soft` and `Diode` really are near-identical shapes (one
+    /// is cheaper, the other has the second antiderivative ADAA2 needs), and
+    /// wound up far enough every symmetric curve converges on a square wave.
+    /// Distinctness as *functions* is pinned exactly, without audio, over in
+    /// `blocks::waveshaper`.
+    ///
+    /// Probed with a **sustained** unit sine rather than the usual decaying
+    /// pluck: `tone_at` and friends read the second half of the buffer, where
+    /// a pluck has decayed below every curve's knee — and inside their knees
+    /// half this bank *is* the identity function.
+    #[test]
+    fn waveshaper_every_curve_reaches_the_audio() {
+        use crate::blocks::waveshaper::CURVE_COUNT;
+        let model = MODEL_COUNT - 1;
+        assert_eq!(MODELS[model].desc.key, "waveshaper");
+        let x = sine(SR, 220.0, SR as usize);
+        let render = |curve: usize| -> Vec<f32> {
+            let mut d = prepared(model);
+            set_pos(&mut d, 0, 3.0);
+            d.set_param(1, MODELS[model].desc.params[1].range.to_norm(curve as f32));
+            process_in_blocks(&mut d, &x, 256)
+        };
+        let base = render(0);
+        for curve in 0..CURVE_COUNT {
+            let y = render(curve);
+            assert_finite(&format!("waveshaper curve {curve}"), &y);
+            assert!(peak(&y) < 4.0, "curve {curve} peaked {}", peak(&y));
+            if curve == 0 {
+                continue;
+            }
+            let half = y.len() / 2;
+            let diff: Vec<f32> = y[half..]
+                .iter()
+                .zip(&base[half..])
+                .map(|(a, b)| a - b)
+                .collect();
+            let change = f64::from(rms(&diff) / rms(&base[half..]));
+            assert!(
+                change > 0.005,
+                "curve {curve} renders within {:.4}% of the default curve — \
+                 the Shape knob is not reaching it",
+                change * 100.0
+            );
+        }
+    }
+
+    /// The Shape selector is stepped and routed outside the smoothers, so it
+    /// must not click when it lands mid-note, and both channels must follow.
+    #[test]
+    fn waveshaper_shape_switch_is_bounded_and_stereo_locked() {
+        let model = MODEL_COUNT - 1;
+        let x = guitar(220.0, SR as usize);
+        let mut d = prepared(model);
+        set_pos(&mut d, 0, 7.0);
+        let mut l = x.clone();
+        let mut r = x.clone();
+        let desc = MODELS[model].desc;
+        for (i, (cl, cr)) in l.chunks_mut(256).zip(r.chunks_mut(256)).enumerate() {
+            if i % 8 == 0 {
+                let curve = (i / 8) % crate::blocks::waveshaper::CURVE_COUNT;
+                d.set_param(1, desc.params[1].range.to_norm(curve as f32));
+            }
+            d.process(cl, cr);
+        }
+        assert_finite("waveshaper shape sweep L", &l);
+        assert_finite("waveshaper shape sweep R", &r);
+        assert_eq!(l, r, "both channels must select the same curve");
+        assert!(peak(&l) < 4.0);
     }
 
     #[test]

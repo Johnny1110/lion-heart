@@ -5,6 +5,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::blocks::waveshaper::{Adaa1, asym_tanh, asym_tanh_f1};
+
 use super::{Circuit, OnePole, Ramp, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 3] = [
@@ -28,7 +30,11 @@ const BRIGHT: f32 = 0.7;
 /// Calibrated with `ts9_and_blues_driver_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.2;
 
+/// Anti-aliased clipping (PRD 024). A `tanh` knee aliases far less than a hard
+/// corner, but at high gain it approaches one — first-order ADAA, since
+/// `tanh`'s second antiderivative is not elementary.
 pub(super) struct BluesDriver {
+    clip: Adaa1,
     hp_in: OnePole,
     pre_hp: OnePole,
     dc_os: OnePole,
@@ -42,6 +48,7 @@ pub(super) struct BluesDriver {
 impl BluesDriver {
     pub(super) fn new() -> Self {
         Self {
+            clip: Adaa1::new(),
             hp_in: OnePole::default(),
             pre_hp: OnePole::default(),
             dc_os: OnePole::default(),
@@ -64,6 +71,7 @@ impl Circuit for BluesDriver {
     }
 
     fn reset(&mut self) {
+        self.clip.reset();
         self.hp_in.reset();
         self.pre_hp.reset();
         self.dc_os.reset();
@@ -79,11 +87,11 @@ impl Circuit for BluesDriver {
             let x = x - self.hp_in.lp(x, self.c28);
             let x = x + BRIGHT * (x - self.pre_hp.lp(x, self.c1500));
             let v = gain.tick() * x;
-            let clipped = if v >= 0.0 {
-                KNEE_POS * (v / KNEE_POS).tanh()
-            } else {
-                KNEE_NEG * (v / KNEE_NEG).tanh()
-            };
+            let clipped = self.clip.process(
+                v,
+                |u| asym_tanh(u, KNEE_POS as f64, KNEE_NEG as f64),
+                |u| asym_tanh_f1(u, KNEE_POS as f64, KNEE_NEG as f64),
+            );
             *s = clipped - self.dc_os.lp(clipped, self.c12);
         }
     }
