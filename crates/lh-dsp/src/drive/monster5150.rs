@@ -19,6 +19,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::eq::tonestack::kind;
+
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 5] = [
@@ -56,11 +58,6 @@ const FIZZ_HZ: f32 = 6_800.0;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.16;
 
-/// 3-band tone stack corner frequencies.
-const BASS_HZ: f32 = 80.0;
-const MID_HZ: f32 = 550.0;
-const TREBLE_HZ: f32 = 3_000.0;
-
 pub(super) struct Monster5150 {
     hp_in: OnePole,
     lf_trim: OnePole,
@@ -89,7 +86,7 @@ impl Monster5150 {
             couple2: OnePole::default(),
             dc_os: OnePole::default(),
             fizz: OnePole::default(),
-            stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
+            stack: ToneStack::new(kind::JCM800),
             c40: 0.0,
             c120: 0.0,
             c1500: 0.0,

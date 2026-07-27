@@ -1,6 +1,7 @@
 # Tone Revolution — 移植計畫藍圖（Overview）
 
-狀態：**執行中** — **Phase 01 已實作（PRD 022，2026-07-27）**；Phase 02 起待排。
+狀態：**執行中** — **Phase 01（PRD 022）與 Phase 02（PRD 023 / ADR 030）已實作
+（2026-07-27）**；Phase 06 起待排。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -17,10 +18,13 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | Phase | 狀態 | 產出 |
 > | ----- | ---- | ---- |
 > | 01 快速非線性 root | ✅ **已實作** | PRD 022；`blocks::wdf::omega`；`screamer` 72.3 → **30.5 µs**、root 12.7×、誤差 30 µV |
-> | 02–08 | 待排 | — |
+> | 02 Tone stack 框架 | ✅ **已實作** | PRD 023 / **ADR 030**；`eq::tonestack`（netlist → 狀態空間 → Tustin）；3 機型；5 顆 FMV 系 drive 遷移；獨立 `tonestack` 踏板 |
+> | 03–08 | 待排 | — |
 >
-> Phase 01 的實作落差（自行擬合的四次猜測、精度定性修正、latency vs throughput、
-> branchless 反而變慢）記在 `phase/01-fast-nonlinear-root.md` 頂端的方框裡。
+> 兩個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
+> 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
+> 形式由「手推封閉式 + 三階直接式 IIR」改為「netlist → 狀態空間」、六個機型只交付
+> 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle。
 
 ---
 

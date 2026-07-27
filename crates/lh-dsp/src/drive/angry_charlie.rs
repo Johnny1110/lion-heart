@@ -15,6 +15,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::eq::tonestack::kind;
+
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 5] = [
@@ -42,11 +44,6 @@ const BRIGHT: f32 = 0.35;
 /// Calibrated with `modelled_pedals_sit_near_unity_at_default_knobs`.
 const MAKEUP: f32 = 0.09;
 
-/// Marshall-style Baxandall corners.
-const BASS_HZ: f32 = 90.0;
-const MID_HZ: f32 = 500.0;
-const TREBLE_HZ: f32 = 2_800.0;
-
 pub(super) struct AngryCharlie {
     hp_in: OnePole,
     bright: OnePole,
@@ -63,7 +60,7 @@ impl AngryCharlie {
             hp_in: OnePole::default(),
             bright: OnePole::default(),
             dc_os: OnePole::default(),
-            stack: ToneStack::new(BASS_HZ, MID_HZ, TREBLE_HZ),
+            stack: ToneStack::new(kind::JCM800),
             c_hp: 0.0,
             c1800: 0.0,
             c12: 0.0,
@@ -116,7 +113,7 @@ impl Circuit for AngryCharlie {
     }
 
     fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        // Shared 3-band Baxandall stack, voiced at 90 Hz / 500 Hz / 2.8 kHz.
+        // The JCM800 stack the pedal is a clone of.
         self.stack.process(block, low, mid, high);
     }
 }

@@ -7,6 +7,48 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-27 (Tone Revolution phase 02: real tone stack) — Linux dev container (relative)
+
+The shared 3-band becomes a real passive amp network (PRD 023 / ADR 030): each
+model is a **netlist**, solved numerically into a continuous state space and
+Tustin-discretised at the block boundary, then run as a ≤4-state filter.
+
+The two `eq_tonestack` rows are the ones to read — they measure the engine
+directly and were stable across runs:
+
+- **Settled** (knobs still) is the steady-state cost: only the state space runs,
+  and it lands on top of `eq_parametric_4band`.
+- **Knob moving** re-solves the netlist *and* re-discretises it every 64 samples
+  — the worst case the drive family can ask for. It costs **+20 %**, i.e. one
+  full rebuild is ~300 ns. That number is what justified choosing a numeric
+  netlist solve over hand-derived closed-form coefficients (ADR 030): the thing
+  the closed form would have bought is 0.3 µs per knob-moving block.
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| eq_tonestack_settled               | ~1.52 µs    | 0.11 %                 |
+| eq_tonestack_knob_moving           | ~1.91 µs    | 0.14 % (worst case)    |
+| eq_parametric_4band (ref)          | ~1.49 µs    | 0.11 %                 |
+| eq_3band (ref, the old additive)   | ~0.75 µs    | 0.06 %                 |
+
+The five migrated drives, before (worktree at `5fa0f9e`) and after, both on this
+container. **The container is noisy** — `drive_evva` alone read 12.9 µs and
+15.4 µs on two runs of the *same* binary, and the unchanged `drive_ts9`
+reference drifted 11.4→11.8 µs — so read the deltas as "about a microsecond",
+which is what the engine rows above predict (one mono stack per channel).
+
+| Bench                              | Before   | After    | Δ        |
+| ---------------------------------- | -------- | -------- | -------- |
+| drive_ts9 (ref, **unchanged**)     | ~11.36 µs| ~11.77 µs| drift    |
+| drive_evva                         | ~12.44 µs| ~12.86 µs| +0.4 µs  |
+| drive_red-charlie                  | ~17.93 µs| ~18.65 µs| +0.7 µs  |
+| drive_monster5150                  | ~11.99 µs| ~13.93 µs| +1.9 µs  |
+| drive_angry-charlie                | ~11.39 µs| ~11.91 µs| +0.5 µs  |
+| drive_angry-charlie-v2             | ~12.52 µs| ~13.14 µs| +0.6 µs  |
+
+All five stay near the 4× oversampler floor that `drive_ts9` marks; the tone
+stack is not what any of them costs.
+
 ## 2026-07-27 (Tone Revolution phase 01: Wright Omega root) — Linux dev container (relative)
 
 The WDF diode root stops iterating (PRD 022). `DiodePair::solve` is now a

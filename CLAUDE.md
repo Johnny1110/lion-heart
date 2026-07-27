@@ -59,10 +59,14 @@ study of `/mnt/BYOD` (Build-Your-Own-Distortion, ChowDSP, **GPL-3**) and
    overdrives + fuzz/transistor) — "I want all the drives."
 3. **Make `blocks::wdf` a platform for the user's own pedal R&D.**
 
-**Phase 01 landed** (Wright Omega closed-form diode root — PRD 022, 2026-07-27);
-**Phase 02, the tone-stack framework, is next**. The full phase map, the revised
-execution order, and each phase's acceptance criteria live in the docs linked
-above — read them there, not here.
+**Phases 01–02 landed** (2026-07-27): Wright Omega closed-form diode root
+(PRD 022), and the tone-stack framework (PRD 023 / **ADR 030**) — `eq::tonestack`
+turns a netlist into a state space and Tustin-discretises it at block rate;
+`bassman`/`jcm800`/`big-muff` models; the five FMV-voiced drives migrated off the
+old additive 3-band (**voicing change**, character tests re-pinned); a standalone
+`tonestack` pedal appended to the `eq` family. **Phase 06 (waveshaper + ADAA) is
+next** per the revised order. The full phase map and each phase's acceptance
+criteria live in the docs linked above — read them there, not here.
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`

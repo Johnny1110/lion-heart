@@ -166,6 +166,29 @@ fn bench_effects(c: &mut Criterion) {
     }
     bench_stereo!(group, "eq_parametric_4band", para, buf, buf_r);
 
+    // The tone stack pedal (PRD 023) in its two states: settled knobs run only
+    // the state space, while a moving knob re-solves the netlist and
+    // re-discretises it once per 64-sample sub-block — the worst case.
+    let mut stack = Eq::new();
+    stack.prepare(SR);
+    stack.select_pedal(2);
+    bench_stereo!(group, "eq_tonestack_settled", stack, buf, buf_r);
+
+    let mut sweeping = Eq::new();
+    sweeping.prepare(SR);
+    sweeping.select_pedal(2);
+    let bass = lh_dsp::eq::FAMILY.pedals[2].param_index("bass").unwrap();
+    let mut pos = 0.0f32;
+    group.bench_function("eq_tonestack_knob_moving", |b| {
+        b.iter(|| {
+            pos = if pos > 0.9 { 0.0 } else { pos + 0.05 };
+            sweeping.set_param(bass, pos);
+            buf.copy_from_slice(&signal());
+            buf_r.copy_from_slice(&signal());
+            sweeping.process(black_box(&mut buf), black_box(&mut buf_r));
+        })
+    });
+
     for (index, pedal) in lh_dsp::modulation::FAMILY.pedals.iter().enumerate() {
         let mut modulation = Modulation::new();
         modulation.prepare(SR);

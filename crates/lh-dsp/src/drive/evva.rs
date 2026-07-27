@@ -5,6 +5,8 @@
 
 use lh_core::{EffectDesc, ParamDesc, db_to_lin};
 
+use crate::eq::tonestack::kind;
+
 use super::{Circuit, OnePole, Ramp, ToneStack, knob, lp_coeff};
 
 static PARAMS: [ParamDesc; 5] = [
@@ -27,11 +29,6 @@ const KNEE_NEG: f32 = 0.5;
 /// Calibrated so the evva sits near unity at default knobs (level 6, gain 4).
 const MAKEUP: f32 = 0.28;
 
-/// 3-band EQ corner frequencies.
-const LO_HZ: f32 = 120.0;
-const MID_HZ: f32 = 750.0;
-const HI_HZ: f32 = 4_000.0;
-
 pub(super) struct Evva {
     hp30: OnePole,
     dc_os: OnePole,
@@ -45,7 +42,7 @@ impl Evva {
         Self {
             hp30: OnePole::default(),
             dc_os: OnePole::default(),
-            stack: ToneStack::new(LO_HZ, MID_HZ, HI_HZ),
+            stack: ToneStack::new(kind::BASSMAN),
             c30: 0.0,
             c12: 0.0,
         }
@@ -92,7 +89,7 @@ impl Circuit for Evva {
     }
 
     fn eq(&mut self, block: &mut [f32], low: &[f32], mid: &[f32], high: &[f32]) {
-        // Shared 3-band stack, voiced at 120 Hz / 750 Hz / 4 kHz.
+        // A real Bassman tone stack: the one Fender voice in the family.
         self.stack.process(block, low, mid, high);
     }
 }

@@ -1,20 +1,24 @@
 //! Equalizers: the in-chain `eq` pedal family and the 8-band parametric EQ
 //! that lives on the engine's fixed output stage ([`global`], PRD 003).
 //!
-//! The chain family has two pedals (PRD 011):
+//! The chain family has three pedals (PRD 011, PRD 023):
 //!
 //! - [`chain`] — the 3-band tone pedal (low/mid/high, sweepable mid): fast
 //!   tone shaping, four knobs.
 //! - [`parametric`] — the global EQ's 8-band engine as a pedal: the same
 //!   visual editor, anywhere in the chain, as many instances as slots allow.
+//! - [`tonestack`] — a real amp tone network (Bassman / JCM800 / Big Muff):
+//!   coupled, interactive, and never flat at noon. Its engine is also what
+//!   the FMV-voiced drives run in their `eq()` stage.
 //!
-//! Both cores are preallocated side by side in [`Eq`]; `select_pedal` is an
-//! index move plus a state reset of the incoming pedal (PRD 001 — values are
-//! re-sent by the control side from its per-pedal shadow).
+//! All three cores are preallocated side by side in [`Eq`]; `select_pedal` is
+//! an index move plus a state reset of the incoming pedal (PRD 001 — values
+//! are re-sent by the control side from its per-pedal shadow).
 
 pub mod chain;
 pub mod global;
 pub mod parametric;
+pub mod tonestack;
 
 use lh_core::{EffectDesc, FamilyDesc};
 
@@ -26,16 +30,17 @@ pub use global::GlobalEq;
 pub static FAMILY: FamilyDesc = FamilyDesc {
     key: "eq",
     name: "EQ",
-    pedals: &[&chain::DESC, &parametric::DESC],
+    pedals: &[&chain::DESC, &parametric::DESC, &tonestack::DESC],
 };
 
-pub const PEDAL_COUNT: usize = 2;
+pub const PEDAL_COUNT: usize = 3;
 
-/// The `eq` chain slot: both pedals preallocated, dispatch by index.
+/// The `eq` chain slot: every pedal preallocated, dispatch by index.
 pub struct Eq {
     pedal: usize,
     tone: chain::Tone,
     para: parametric::Parametric,
+    stack: tonestack::Stack,
 }
 
 impl Default for Eq {
@@ -50,6 +55,7 @@ impl Eq {
             pedal: 0,
             tone: chain::Tone::new(),
             para: parametric::Parametric::new(),
+            stack: tonestack::Stack::new(),
         }
     }
 }
@@ -72,7 +78,8 @@ impl Effect for Eq {
         // re-sends its knob values from the shadow (PRD 001).
         match pedal {
             0 => self.tone.reset(),
-            _ => self.para.reset(),
+            1 => self.para.reset(),
+            _ => self.stack.reset(),
         }
     }
 
@@ -83,24 +90,28 @@ impl Effect for Eq {
     fn prepare(&mut self, sample_rate: u32) {
         self.tone.prepare(sample_rate);
         self.para.prepare(sample_rate);
+        self.stack.prepare(sample_rate);
     }
 
     fn reset(&mut self) {
         self.tone.reset();
         self.para.reset();
+        self.stack.reset();
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
         match self.pedal {
             0 => self.tone.set_param(index, normalized),
-            _ => self.para.set_param(index, normalized),
+            1 => self.para.set_param(index, normalized),
+            _ => self.stack.set_param(index, normalized),
         }
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
         match self.pedal {
             0 => self.tone.process(left, right),
-            _ => self.para.process(left, right),
+            1 => self.para.process(left, right),
+            _ => self.stack.process(left, right),
         }
     }
 }
@@ -144,14 +155,24 @@ mod tests {
         assert_eq!(FAMILY.key, "eq");
         assert_eq!(FAMILY.pedals.len(), PEDAL_COUNT);
         // Append-only: the 3-band keeps the family key (pre-PRD 011 presets
-        // and plugin ids), the parametric appends after it.
+        // and plugin ids), the parametric appends after it, the tone stack
+        // after that (PRD 023). Presets record the *key*, and the plugin
+        // expands params from the registry, so appending needs no schema bump
+        // and leaves every existing plugin param id where it was.
         assert_eq!(FAMILY.pedals[0].key, "eq");
         assert_eq!(FAMILY.pedals[1].key, "parametric");
+        assert_eq!(FAMILY.pedals[2].key, "tonestack");
         assert_eq!(FAMILY.pedals[0].params.len(), 4);
         assert_eq!(
             FAMILY.pedals[1].params.len(),
             lh_core::global_eq::BAND_COUNT * parametric::BAND_PARAMS
         );
+        // Model / Bass / Mid / Treble / Level.
+        assert_eq!(FAMILY.pedals[2].params.len(), 5);
+        assert!(matches!(
+            FAMILY.pedals[2].params[0].range,
+            lh_core::Range::Stepped { labels } if labels.len() == tonestack::KIND_COUNT
+        ));
     }
 
     /// Same drive as the global EQ's own suite, but through the pedal's
