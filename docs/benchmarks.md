@@ -7,6 +7,40 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-27 (Tone Revolution phase 01: Wright Omega root) — Linux dev container (relative)
+
+The WDF diode root stops iterating (PRD 022). `DiodePair::solve` is now a
+closed-form evaluation — Werner eqn (39) rearranged into two Wright-omega
+lookups, each a fitted quartic guess plus one Newton correction over
+polynomial/bit-trick `exp`/`log` (`blocks::wdf::omega`). The `f64` damped Newton
+survives as `solve_newton`, the accuracy oracle and the row below.
+
+**All four rows come from this run**, so the Newton screamer number is a true
+same-machine baseline and not the 2026-07-23 figure (which was ~68 µs on a
+different day). Two things are worth reading off the table:
+
+- The root **microbench** is 256 back-to-back solves = one 64-frame block at 4×
+  oversampling, mono. Closed form vs Newton there is **12.7×**.
+- Inside the pedal the same swap is only **2.4×**, and that is not a
+  contradiction: `solve` is *stateless*, so the microbench pipelines 256
+  independent solves, while in the circuit every solve feeds the capacitor state
+  and the chain is strictly serial. The pedal measures **latency**, the
+  microbench **throughput**. Screamer minus its root costs 12.4 µs (measured by
+  stubbing the root out), which is the floor any 4× oversampled pedal pays.
+
+`sd1` keeps the Newton root — its asymmetric curve has no eqn (39) form, and
+generalising one is deferred (see `docs/tone_revolution/phase/01`). Its row is
+unchanged and confirms the baseline machine speed.
+
+| Bench                              | Median      | % deadline             |
+| ---------------------------------- | ----------- | ---------------------- |
+| wdf_root_256_solves/omega          | ~2.29 µs    | —      (root only)     |
+| wdf_root_256_solves/newton         | ~29.1 µs    | —      (root only)     |
+| drive_screamer_4x_oversampled      | ~30.5 µs    | 2.3 %  (was ~72.3)     |
+| drive_screamer, Newton root (ref)  | ~72.3 µs    | 5.4 %  (same run)      |
+| drive_sd1_4x_oversampled           | ~68.0 µs    | 5.1 %  (still Newton)  |
+| drive_ts9_4x_oversampled (ref)     | ~11.3 µs    | 0.85 % (memoryless)    |
+
 ## 2026-07-24 (deep water #2: WDF feedback overdrive) — Linux dev container (relative)
 
 The second white-box circuit (PRD 021 / ADR 029): the Boss SD-1 op-amp

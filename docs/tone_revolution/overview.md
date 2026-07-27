@@ -1,8 +1,9 @@
 # Tone Revolution — 移植計畫藍圖（Overview）
 
-狀態：**規劃中（draft v2）— 待使用者拍板分期與範圍**
+狀態：**執行中** — **Phase 01 已實作（PRD 022，2026-07-27）**；Phase 02 起待排。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
+
 里程碑：白皮書 §6 深水區研究線（WDF 白箱電路模擬）之總攻計畫；承接
 PRD 020 / ADR 028（WDF TS 削波級）、PRD 021 / ADR 029（WDF 回授式 overdrive
 `sd1`）
@@ -10,6 +11,16 @@ PRD 020 / ADR 028（WDF TS 削波級）、PRD 021 / ADR 029（WDF 回授式 over
 `/mnt/chowdsp_wdf`（Wave Digital Filter 函式庫，ChowDSP，BSD-3）——兩者同一作者
 Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `blocks::wdf`
 手工重建之物的**成熟上游參考**。
+
+> **進度**
+>
+> | Phase | 狀態 | 產出 |
+> | ----- | ---- | ---- |
+> | 01 快速非線性 root | ✅ **已實作** | PRD 022；`blocks::wdf::omega`；`screamer` 72.3 → **30.5 µs**、root 12.7×、誤差 30 µV |
+> | 02–08 | 待排 | — |
+>
+> Phase 01 的實作落差（自行擬合的四次猜測、精度定性修正、latency vs throughput、
+> branchless 反而變慢）記在 `phase/01-fast-nonlinear-root.md` 頂端的方框裡。
 
 ---
 

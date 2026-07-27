@@ -307,5 +307,47 @@ fn bench_full_chain(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_effects, bench_full_chain);
+/// The WDF diode root on its own, both solvers, over **256 solves** — exactly
+/// one 64-frame block at 4× oversampling, mono. Reading the two numbers against
+/// each other gives the closed form's speedup; reading either against the whole
+/// `drive_screamer_4x_oversampled` row gives the root's share of the pedal.
+fn bench_wdf_root(c: &mut Criterion) {
+    use lh_dsp::blocks::wdf::DiodePair;
+
+    // The port resistance the screamer's clipper actually presents: 2.2 kΩ
+    // series in parallel with the 22 nF shunt discretized at 192 kHz.
+    const R: f32 = 112.3;
+    // 1N4148, as used by every diode-clipper pedal in the family.
+    const DIODE: (f32, f32, f32) = (2.52e-9, 1.75, 25.85e-3);
+
+    let mut group = c.benchmark_group("wdf_root_256_solves");
+
+    // A continuous waveform swinging well past the ~0.7 V knee, so both the
+    // near-linear and the hard-clipped regions are exercised — and so the
+    // Newton path gets the warm start it is entitled to.
+    let waves: Vec<f32> = (0..256)
+        .map(|k| 2.0 * (std::f32::consts::TAU * 220.0 * k as f32 / (4.0 * SR as f32)).sin())
+        .collect();
+
+    group.bench_function("omega", |b| {
+        let mut d = DiodePair::new(DIODE.0, DIODE.1, DIODE.2);
+        b.iter(|| {
+            for &a in black_box(&waves) {
+                black_box(d.solve(a, R));
+            }
+        })
+    });
+    group.bench_function("newton", |b| {
+        let mut d = DiodePair::new(DIODE.0, DIODE.1, DIODE.2);
+        b.iter(|| {
+            for &a in black_box(&waves) {
+                black_box(d.solve_newton(a, R));
+            }
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_effects, bench_full_chain, bench_wdf_root);
 criterion_main!(benches);
