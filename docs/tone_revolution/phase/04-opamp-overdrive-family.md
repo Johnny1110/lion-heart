@@ -48,8 +48,23 @@
 >      閘門，而 `assert_no_alloc` 在 release 被 feature-gate 掉——`cargo test --release`
 >      編不過。當時只跑了 debug 閘門所以沒發現。
 >
-> **待辦**：`mxr-dist`（§2.4）、`rat`（§2.5）、`diode-clipper`（§2.6）、
-> `king-of-tone`（§2.3，排最後）。
+> 3. **`mxr-dist`（§2.4）— PRD 028，2026-07-28。** 無新 ADR。落差四處：
+>    - **§2.4 說「二極體：`Is=2.52e-9, nVt=1.75×Vt`（germanium/GZ34 味）」——那組
+>      數字是矽，不是鍺。** 依 ADR 033 的 `(Is, n)` 慣例改為真正的版本二選一：
+>      早期鍺 `1N34`（`2.0e-7 / 1.28`，預設）與後期矽 `1N914`（`2.52e-9 / 1.75`）。
+>    - **這是本 Phase 第一顆削波在輸出端（並聯到地）的**，所以 up port 改 adapt 在
+>      輸出：框架新增 `NON_INVERTING_OUT_PORTS`，與既有佈局共用 `non_inverting_els`。
+>      準則寫進框架文件：**非線性在哪裡，up port 就在哪裡**。`rat` 可直接沿用。
+>      ADR 032 §5 的退化警告不適用於此（op-amp 輸出阻抗 0.15–13 Ω，遠在求解器地板
+>      之上，且被 `R5` 淹沒）——前提是照 ADR 033 用 datasheet 的 `Ro=75`。
+>    - **Dist 旋鈕的 taper 定義在增益上而非電阻上**：電位器在 gain leg 裡，
+>      `1 + R4/R_leg` 對它是雙曲線，線性掃會把可用範圍擠進最後十分之一。
+>    - **`C1`（輸入 RF 旁路）未建模**：它與內阻 1e-9 Ω 的訊號源並聯，數學上完全無
+>      作用。4.5 V 偏壓同 ADR 034 §4 不建模。
+>    - **root 測試的度量方式要換**（前兩顆的寫法在這裡會誤報）：閉式 root 的絕對誤差
+>      大致固定，除以很小的 `a` 會爆掉且無資訊。改用 PRD 022 的 Newton oracle 比對。
+>
+> **待辦**：`rat`（§2.5）、`diode-clipper`（§2.6）、`king-of-tone`（§2.3，排最後）。
 
 命中目標：#2（別人設計好的 drive 參數——overdrive 主力）
 依賴：Phase 03（R-Type + op-amp）、Phase 01（omega root）
