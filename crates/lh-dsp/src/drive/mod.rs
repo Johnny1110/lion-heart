@@ -35,12 +35,15 @@ mod angry_charlie_v2;
 mod bd2;
 mod centaur;
 mod classic;
+mod diode_clipper;
 mod evva;
 mod fuzz_face;
 mod jan_ray;
+mod king_of_tone;
 mod monster5150;
 mod mxr_dist;
 mod overdrive;
+mod rat;
 mod red_charlie;
 mod screamer;
 mod sd1;
@@ -94,10 +97,13 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &ts_wdf::DESC,
         &zendrive::DESC,
         &mxr_dist::DESC,
+        &rat::DESC,
+        &diode_clipper::DESC,
+        &king_of_tone::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 18;
+pub const MODEL_COUNT: usize = 21;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -113,10 +119,13 @@ enum Ctl {
     /// to `lh-dsp`, so adding it costs no preset or plugin schema change.
     Shape,
     /// A *continuous* setup control routed straight to the circuit, likewise
-    /// unsmoothed here — `ts-wdf`'s diode count. It reaches a coefficient, not
-    /// the sample path, so the circuit glides it internally at its own rebuild
-    /// rate rather than paying for a per-sample trajectory.
+    /// unsmoothed here — `ts-wdf`'s diode count, `zendrive`'s voice. It reaches
+    /// a coefficient, not the sample path, so the circuit glides it internally
+    /// at its own rebuild rate rather than paying for a per-sample trajectory.
     Trim,
+    /// A second stepped selector, for pedals that need two — `diode-clipper`
+    /// picks both a topology and a device. Same contract as [`Ctl::Shape`].
+    Mode,
 }
 
 /// One entry in the drive pedal registry: the faceplate, the param→control
@@ -219,6 +228,28 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         controls: &[Ctl::Drive, Ctl::Shape, Ctl::Level],
         build: || Box::new(mxr_dist::MxrDist::new()),
     },
+    ModelDef {
+        desc: &rat::DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
+        build: || Box::new(rat::Rat::new()),
+    },
+    ModelDef {
+        desc: &diode_clipper::DESC,
+        controls: &[
+            Ctl::Drive,
+            Ctl::Mode,
+            Ctl::Shape,
+            Ctl::Trim,
+            Ctl::Tone,
+            Ctl::Level,
+        ],
+        build: || Box::new(diode_clipper::DiodeClipper::new()),
+    },
+    ModelDef {
+        desc: &king_of_tone::DESC,
+        controls: &[Ctl::Drive, Ctl::Mode, Ctl::Tone, Ctl::Level],
+        build: || Box::new(king_of_tone::KingOfTone::new()),
+    },
 ];
 
 /// One channel of one drive model. Built off the audio thread
@@ -244,8 +275,11 @@ pub trait Circuit: Send {
     fn set_shape(&mut self, _index: usize) {}
     /// A continuous setup control reached the faceplate ([`Ctl::Trim`]). Same
     /// contract as [`Circuit::set_shape`]: off the per-sample path,
-    /// allocation-free. Default no-op; only `ts-wdf` has one.
+    /// allocation-free. Default no-op.
     fn set_trim(&mut self, _value: f32) {}
+    /// A second stepped selector ([`Ctl::Mode`]), for a pedal that needs two.
+    /// Default no-op; only `diode-clipper` has one.
+    fn set_mode(&mut self, _index: usize) {}
 }
 
 // --- shared building blocks ---
@@ -486,6 +520,11 @@ impl Effect for Drive {
                     circuit.set_trim(real);
                 }
             }
+            Ctl::Mode => {
+                for circuit in &mut self.circuits[self.model] {
+                    circuit.set_mode(real as usize);
+                }
+            }
         }
     }
 
@@ -685,6 +724,9 @@ mod tests {
             ("ts-wdf", -42.0),
             ("zendrive", -40.0),
             ("mxr-dist", -30.0),
+            ("rat", -26.0),
+            ("diode-clipper", -32.0),
+            ("king-of-tone", -30.0),
         ];
         for (i, (key, bound)) in bounds.iter().enumerate() {
             assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
@@ -1140,7 +1182,9 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17] {
+        for model in [
+            0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
+        ] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
