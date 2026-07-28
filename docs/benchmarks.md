@@ -7,6 +7,27 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-28 (Tone Revolution phase 04: `zendrive`) — Linux dev container (relative)
+
+Second pedal of the family (PRD 027 / ADR 034), and the one that prices the
+framework's reuse claim: it is the *same junction* as `ts-wdf` with different
+parts, so it should cost the same. It does.
+
+| Bench                              | Median    | Reading                        |
+| ---------------------------------- | --------- | ------------------------------ |
+| `drive_screamer_4x_oversampled`    | ~31.4 µs  | machine calibration            |
+| `drive_ts-wdf_4x_oversampled`      | ~40.3 µs  | shared junction, TS parts      |
+| **`drive_zendrive_4x_oversampled`**| **~41.2 µs** | shared junction, Zendrive parts |
+| `drive_sd1_4x_oversampled`         | ~69.2 µs  | ideal-op-amp WDF               |
+
+41.2 µs is **3.1 %** of the deadline, and 2 % over `ts-wdf` — the same 4-port
+matrix–vector product per sample, the same tree depth, one extra pot to compare
+at sub-block boundaries.
+
+Calibration: `drive_screamer` reads 31.4 µs here against 31.9 µs in the `ts-wdf`
+session below, so the two tables are comparable within this container's ~2 %
+session spread.
+
 ## 2026-07-28 (Tone Revolution phase 04: `ts-wdf`) — Linux dev container (relative)
 
 The framework's first *new* pedal (PRD 026 / ADR 033): the whole Tube Screamer
