@@ -110,6 +110,10 @@ const SD1: Color = Color::from_rgb(0.96, 0.82, 0.22);
 /// circuit at all (PRD 024), just twelve functions, so it wears the only
 /// non-enclosure colour in a family of painted boxes.
 const WAVESHAPER: Color = Color::from_rgb(0.30, 0.84, 0.86);
+/// The Ibanez TS-808's warmer, browner green for the fully-solved Screamer —
+/// next to the ts9's stock green and the screamer's deep jade, the third and
+/// most complete circuit model of the same box wears the vintage enclosure.
+const TS_WDF: Color = Color::from_rgb(0.52, 0.66, 0.30);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -186,6 +190,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "screamer" => SCREAMER,
             "sd1" => SD1,
             "waveshaper" => WAVESHAPER,
+            "ts-wdf" => TS_WDF,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

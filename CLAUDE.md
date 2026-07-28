@@ -84,9 +84,22 @@ revised order:
   rewritten onto it, ~1e-8 relative against the pre-rewrite commit — **no tonal
   change, no new pedals**.
 
-**Phase 04 (op-amp overdrive family) is next** per the revised order — the
-framework above is its gate. The full phase map and each phase's acceptance
-criteria live in the docs linked above.
+- **04** op-amp overdrive family (**in progress, 1 of 6**) — first pedal
+  **`ts-wdf`** landed 2026-07-28 (PRD 026 / **ADR 033**): the whole TS clipping
+  amplifier as one WDF tree on the phase-03 framework, with an optional-diode
+  faceplate (Diode selector + continuous Count). Two policy decisions in ADR 033
+  bind every remaining pedal in the family — **op-amp `Ag`/`Ri`/`Ro` come from
+  the part's datasheet, not from BYOD** (BYOD's `Ag=100` measurably suppresses
+  the drive sweep's top end and the `C4` treble cut the phase's own acceptance
+  criteria require), and **diode menus carry `(Is, n)` per device, not `Is`
+  alone** (BYOD's `1N34 → 200 pA` makes germanium clip *higher* than silicon).
+  Drive family is now **16 pedals**. Remaining: `zendrive`, `mxr-dist`, `rat`,
+  `diode-clipper`, `king-of-tone` (last).
+
+The full phase map and each phase's acceptance criteria live in the docs linked
+above. Note the phase-04 plan doc still says the scattering matrix comes from
+**R-Solver** and asks for `tools/netlists/` — ADR 032 superseded both; a
+correction box at the top of that file records it.
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`
@@ -103,6 +116,12 @@ Debug builds install `assert_no_alloc::AllocDisabler` (app `main.rs`) and wrap t
 processor: **an allocation on the audio thread aborts with SIGABRT (exit 134)** — treat
 that as a real-time violation to fix, never a crash to paper over. It already caught an
 undersized oversampler scratch buffer that offline tests missed.
+
+Since PRD 026 the same check also runs **offline** for the drive family:
+`crates/lh-dsp/tests/alloc.rs` is a separate test binary that installs
+`AllocDisabler` as its own global allocator and sweeps every pedal's knobs under
+`assert_no_alloc`. Put new RT-path coverage there rather than in the library's
+unit tests — `#[global_allocator]` is crate-wide.
 
 Hardware verification outstanding (macOS + interface): record RTL numbers in
 `docs/latency.md`; play through `jam` sweeping params by ear to confirm no clicks.

@@ -3,7 +3,7 @@
 狀態：**執行中** — **Phase 01（PRD 022）、02（PRD 023 / ADR 030）、06（PRD 024 /
 ADR 031）已實作（2026-07-27）；Phase 03（PRD 025 / ADR 032）已實作（2026-07-28）**。
 三個 quick win 加上架構級的 adaptor 框架完成，**Phase 04（op-amp overdrive 家族）
-的地基已就位**。
+已開工**：第一顆 `ts-wdf`（PRD 026 / ADR 033）落地，drive 家族 15 → **16 顆**。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -23,7 +23,8 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | 02 Tone stack 框架 | ✅ **已實作** | PRD 023 / **ADR 030**；`eq::tonestack`（netlist → 狀態空間 → Tustin）；3 機型；5 顆 FMV 系 drive 遷移；獨立 `tonestack` 踏板 |
 > | 06 Waveshaper + ADAA | ✅ **已實作** | PRD 024 / **ADR 031**；`blocks::waveshaper`（一/二階 ADAA + 12 曲線）；**全部 12 顆 memoryless drive 抗鋸齒**（地板 −29 → −38…−87 dB）；新踏板 `waveshaper` |
 > | 03 WDF adaptor + R-Type | ✅ **已實作** | PRD 025 / **ADR 032**；`blocks::wdf` 拆五檔（one-port／adaptor／rtype／diode／omega）；擁有式泛型樹；**散射矩陣執行期由 netlist 數值構造**；op-amp 有限增益；`screamer`/`sd1` 等價重寫（對改寫前 ~1e-8） |
-> | 04–05、07–08 | 待排 | — |
+> | 04 op-amp overdrive 家族 | 🔄 **進行中**（1/6） | PRD 026 / **ADR 033**：`ts-wdf`（完整 TS 削波級，含可選二極體 UX）；op-amp 參數改採 datasheet、二極體選單帶 `(Is, n)`；新增離線 `assert_no_alloc` 閘門。待辦 `zendrive`／`mxr-dist`／`rat`／`diode-clipper`／`king-of-tone` |
+> | 05、07–08 | 待排 | — |
 >
 > 四個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
 > 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
