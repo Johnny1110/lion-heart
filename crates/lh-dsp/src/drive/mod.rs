@@ -46,6 +46,7 @@ mod sd1;
 mod ts9;
 mod ts_wdf;
 mod waveshaper;
+mod zendrive;
 
 use lh_core::{FamilyDesc, ParamDesc, Range, drive_law};
 
@@ -90,10 +91,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &angry_charlie_v2::DESC,
         &waveshaper::DESC,
         &ts_wdf::DESC,
+        &zendrive::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 16;
+pub const MODEL_COUNT: usize = 17;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -204,6 +206,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &ts_wdf::DESC,
         controls: &[Ctl::Drive, Ctl::Shape, Ctl::Trim, Ctl::Tone, Ctl::Level],
         build: || Box::new(ts_wdf::TsWdf::new()),
+    },
+    ModelDef {
+        desc: &zendrive::DESC,
+        controls: &[Ctl::Drive, Ctl::Trim, Ctl::Tone, Ctl::Level],
+        build: || Box::new(zendrive::ZenDrive::new()),
     },
 ];
 
@@ -669,6 +676,7 @@ mod tests {
             ("angry-charlie-v2", -38.0),
             ("waveshaper", -70.0),
             ("ts-wdf", -42.0),
+            ("zendrive", -40.0),
         ];
         for (i, (key, bound)) in bounds.iter().enumerate() {
             assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
@@ -1124,7 +1132,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));

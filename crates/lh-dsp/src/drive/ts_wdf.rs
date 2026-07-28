@@ -72,8 +72,9 @@ use lh_core::{EffectDesc, ParamDesc, Range};
 
 use super::{Circuit, OnePole, knob, lp_coeff};
 use crate::blocks::wdf::{
-    CapacitiveVoltageSource, DiodePair, JEl, Junction, Parallel, RType, Resistor,
-    ResistorCapacitorParallel, ResistorCapacitorSeries, Wdf, op_amp,
+    CapacitiveVoltageSource, DiodePair, JEl, Junction, NON_INVERTING_NODES, NON_INVERTING_PORTS,
+    Parallel, RType, Resistor, ResistorCapacitorParallel, ResistorCapacitorSeries, Wdf,
+    non_inverting_els,
 };
 
 /// Clipping diodes offered by the Diode knob.
@@ -180,33 +181,22 @@ const RO: f32 = 75.0;
 /// Thermal voltage at room temperature.
 const VT: f32 = 0.02585;
 
-// Junction nodes. 0 is ground.
-const N_PLUS: u8 = 1;
-const N_MINUS: u8 = 2;
-const N_OUT: u8 = 3;
-const N_INTERNAL: u8 = 4;
-
-static OPAMP: [JEl; 3] = op_amp(N_PLUS, N_MINUS, N_OUT, N_INTERNAL, AG, RI, RO);
+static OPAMP: [JEl; 3] = non_inverting_els(AG, RI, RO);
 
 /// The op-amp junction. Series/parallel reduction cannot express it — the
 /// controlled source ties the output back to the input pair — so it is an
 /// R-type adaptor whose scattering matrix is built from *this* netlist at knob
 /// rate (ADR 032), never transcribed.
 ///
-/// The up port is the **feedback path**, output to inverting input. That is
-/// where the diodes hang, and it is a high-impedance point (roughly
-/// `(AG+1)·Zg` ≈ 480 kΩ at audio), so the adaptation `R_up = R_thévenin` is
-/// well conditioned — unlike the op-amp's own output pin, which feedback drives
-/// to milliohms (ADR 032 §5).
+/// The layout is the family's shared one ([`NON_INVERTING_PORTS`]): up port on
+/// the feedback path (where the diodes hang, and a high-impedance point — about
+/// `(AG+1)·Zg` ≈ 14 MΩ here, so the adaptation stays well conditioned), then the
+/// input leg, the gain leg, and the load. [`super::zendrive`] is the same
+/// junction with different parts and a different op-amp.
 static JUNCTION: Junction = Junction {
-    nodes: 5,
+    nodes: NON_INVERTING_NODES,
     els: &OPAMP,
-    ports: &[
-        (N_OUT, N_MINUS), // 0 — up: feedback network + diodes
-        (N_PLUS, 0),      // 1 — input leg: C2 (carrying Vin) ‖ R5
-        (N_MINUS, 0),     // 2 — gain leg: R4 + C3
-        (N_OUT, 0),       // 3 — load: RL, and the stage's output tap
-    ],
+    ports: &NON_INVERTING_PORTS,
 };
 
 /// Index of the load port — where the output voltage is read.
