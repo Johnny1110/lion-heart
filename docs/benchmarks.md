@@ -7,6 +7,34 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-28 (Tone Revolution phase 04: `rat`, `diode-clipper`, `king-of-tone`) — Linux dev container (relative)
+
+The last three pedals of the family, which completes phase 04's roster.
+
+**Read the calibration row first, and discount accordingly.** `drive_screamer` is
+untouched by any of this work and reads **~42 µs** here against ~31.9 µs in the
+`ts-wdf` session below — this container was ~1.3× slower and noisier for this
+run (criterion's intervals span ±10 % rather than the usual ±1 %). The ratios
+hold; the absolute numbers do not compare across sessions without dividing them
+through.
+
+| Bench                                  | Median    | ÷ screamer | Reading                     |
+| -------------------------------------- | --------- | ---------- | --------------------------- |
+| `drive_screamer_4x_oversampled`        | ~42.1 µs  | 1.00       | calibration                 |
+| `drive_diode-clipper_4x_oversampled`   | ~49.1 µs  | 1.17       | default Shunt wiring — the cheapest tree here |
+| `drive_rat_4x_oversampled`             | ~50.7 µs  | 1.21       | deep tree, one root         |
+| `drive_ts-wdf_4x_oversampled`          | ~55.2 µs  | 1.31       | (reference, unchanged)      |
+| `drive_king-of-tone_4x_oversampled`    | ~76.4 µs  | 1.82       | **two stages, two roots**   |
+
+`king-of-tone` is the family's most expensive because it is genuinely two
+circuits: two trees solved and two diode roots per oversampled sample. At 1.82×
+the Screamer it is still under 6 % of the deadline once the machine is
+discounted, and it is the only pedal here that pays twice.
+
+`diode-clipper` is the cheapest of the three at its default because the Shunt
+wiring is a two-element tree; selecting its Feedback wiring puts it on the same
+op-amp junction as the rest and costs about what they do.
+
 ## 2026-07-28 (Tone Revolution phase 04: `mxr-dist`) — Linux dev container (relative)
 
 Third pedal (PRD 028). Same op-amp junction as the two before it, but adapted at

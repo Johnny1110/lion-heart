@@ -207,6 +207,10 @@ pub struct AsymDiode {
     vt_f: f64,
     /// Reverse thermal scale `k·n·Vt`.
     vt_r: f64,
+    /// Branch counts, kept so the device can be swapped without them
+    /// ([`AsymDiode::set_params`]).
+    m_fwd: f64,
+    m_rev: f64,
     /// Warm start: the voltage solved last sample (continuous audio → 1–3 steps).
     v: f64,
 }
@@ -216,17 +220,30 @@ impl AsymDiode {
     /// `is 2.52e-9, n 1.75, vt 25.85e-3`); `m_fwd`/`m_rev` are how many sit in
     /// series each way (SD-1 ≈ `2` / `1`).
     pub fn new(is: f32, n: f32, vt: f32, m_fwd: f32, m_rev: f32) -> Self {
-        let vt_n = (n * vt) as f64;
+        let vt_n = f64::from(n * vt);
         Self {
-            is: is as f64,
-            vt_f: m_fwd as f64 * vt_n,
-            vt_r: m_rev as f64 * vt_n,
+            is: f64::from(is),
+            vt_f: f64::from(m_fwd) * vt_n,
+            vt_r: f64::from(m_rev) * vt_n,
+            m_fwd: f64::from(m_fwd),
+            m_rev: f64::from(m_rev),
             v: 0.0,
         }
     }
 
     pub fn reset(&mut self) {
         self.v = 0.0;
+    }
+
+    /// Swap the device parameters at run time, keeping the branch counts fixed —
+    /// the asymmetric counterpart of [`DiodePair::set_params`], for a selectable
+    /// clipping device. Cheap arithmetic; safe at a block or sub-block boundary.
+    pub fn set_params(&mut self, is: f32, n: f32, vt: f32) {
+        debug_assert!(is > 0.0 && n > 0.0 && vt > 0.0);
+        let vt_n = f64::from(n * vt);
+        self.is = f64::from(is);
+        self.vt_f = self.m_fwd * vt_n;
+        self.vt_r = self.m_rev * vt_n;
     }
 
     /// Solve the root for incident wave `a` at port resistance `r`. Returns

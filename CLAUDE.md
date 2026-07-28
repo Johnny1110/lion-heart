@@ -108,8 +108,12 @@ revised order:
   same junction is adapted at a different port. `blocks::wdf` gained
   `NON_INVERTING_OUT_PORTS` alongside `NON_INVERTING_PORTS`, sharing
   `non_inverting_els`; the rule is **the up port goes where the nonlinearity
-  is**, and `rat` will reuse it. Drive family is now **18 pedals**. Remaining:
-  `rat`, `diode-clipper`, `king-of-tone` (last).
+  is**. Then **`rat`** (PRD 029 — loop gain below one, on purpose), the platform
+  piece **`diode-clipper`** (PRD 030 — one diode wired four ways; added
+  `Ctl::Mode`), and **`king-of-tone`** (PRD 031 — two stages, two roots, and the
+  family's only soft feedback clipper). **Phase 04 is complete at six pedals;
+  the drive family is now 21.** Five of them share one junction across two
+  adapted-port layouts, and no scattering matrix is written down anywhere.
 
 The full phase map and each phase's acceptance criteria live in the docs linked
 above. Note the phase-04 plan doc still says the scattering matrix comes from

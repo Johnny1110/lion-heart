@@ -121,6 +121,15 @@ const ZENDRIVE: Color = Color::from_rgb(0.84, 0.74, 0.56);
 /// The Distortion+'s unmistakable canary-and-black enclosure, read as the amber
 /// side of yellow so it stays clear of the SD-1's brighter canary.
 const MXR_DIST: Color = Color::from_rgb(0.92, 0.72, 0.12);
+/// The RAT's black box with white lettering, lifted just far enough off black to
+/// read as a colour — the darkest livery in the family, which suits it.
+const RAT: Color = Color::from_rgb(0.28, 0.29, 0.32);
+/// Breadboard white for the one drive that models no particular pedal — a
+/// workbench, not an enclosure. Pale enough that nothing else is near it.
+const DIODE_CLIPPER: Color = Color::from_rgb(0.88, 0.90, 0.86);
+/// Regal purple for the King — the only violet-red in a family of greens, golds
+/// and one periwinkle, and a nod to the enclosure everyone waits two years for.
+const KING_OF_TONE: Color = Color::from_rgb(0.55, 0.35, 0.66);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -200,6 +209,9 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "ts-wdf" => TS_WDF,
             "zendrive" => ZENDRIVE,
             "mxr-dist" => MXR_DIST,
+            "rat" => RAT,
+            "diode-clipper" => DIODE_CLIPPER,
+            "king-of-tone" => KING_OF_TONE,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {
