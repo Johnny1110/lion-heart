@@ -382,6 +382,41 @@ fn bench_full_chain(c: &mut Criterion) {
     group.finish();
 }
 
+/// What a *moving* knob costs a pedal whose drive pot sits inside an R-type
+/// tree (`ts-wdf`, PRD 026). Turning it invalidates the scattering matrix, so
+/// the block pays a rebuild per sub-block on top of its steady-state cost.
+///
+/// Read against `block64_48k/drive_ts-wdf_4x_oversampled`, which is the same
+/// pedal with the knob parked: the difference is the whole price of building
+/// scattering matrices at run time instead of evaluating a symbolic formula
+/// (ADR 032), measured on a real circuit rather than a synthetic junction.
+fn bench_wdf_knob_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("block64_48k");
+
+    let mut buf = signal();
+    let mut buf_r = signal();
+    let index = lh_dsp::drive::FAMILY
+        .pedal_index("ts-wdf")
+        .expect("ts-wdf is registered");
+    let mut drive = Drive::new();
+    drive.prepare(SR);
+    drive.select_pedal(index);
+
+    let mut pos = 0.0f32;
+    group.bench_function("drive_ts-wdf_knob_sweeping", |b| {
+        b.iter(|| {
+            // A knob the user is actually turning: never twice the same value,
+            // so the settled-skip never fires and every sub-block rebuilds.
+            pos = if pos > 0.98 { 0.0 } else { pos + 0.02 };
+            drive.set_param(0, pos);
+            buf.copy_from_slice(&signal());
+            buf_r.copy_from_slice(&signal());
+            drive.process(black_box(&mut buf), black_box(&mut buf_r));
+        })
+    });
+    group.finish();
+}
+
 /// The WDF diode root on its own, both solvers, over **256 solves** — exactly
 /// one 64-frame block at 4× oversampling, mono. Reading the two numbers against
 /// each other gives the closed form's speedup; reading either against the whole
@@ -553,6 +588,7 @@ criterion_group!(
     benches,
     bench_effects,
     bench_full_chain,
+    bench_wdf_knob_sweep,
     bench_wdf_root,
     bench_adaa,
     bench_wdf_framework

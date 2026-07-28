@@ -85,6 +85,28 @@ impl DiodePair {
         self.v_newton = 0.0;
     }
 
+    /// Swap the junction parameters at run time — a diode-type selector, or a
+    /// continuously variable series count.
+    ///
+    /// `n` is not restricted to whole numbers. `m` diodes in series carry the
+    /// same current at `m` times the voltage, so the pair's thermal scale is
+    /// `m·n·Vt`; a fractional value interpolates between the stacks the way a
+    /// real device's ideality does, which is how a clipper's knee gets tuned
+    /// without pretending to half a diode.
+    ///
+    /// Cheap, but not per-sample cheap: it invalidates the cached
+    /// `ln(R·Is/nVt)`, so the next [`solve`](Self::solve) pays one `f64` `ln`.
+    /// Call it at a block or sub-block boundary.
+    pub fn set_params(&mut self, is: f32, n: f32, vt: f32) {
+        debug_assert!(is > 0.0 && n > 0.0 && vt > 0.0);
+        self.is = is;
+        self.vt_n = n * vt;
+        self.one_over_vt = 1.0 / self.vt_n;
+        // Force the log term to be rebuilt: it depends on both `Is` and `nVt`,
+        // and `r` alone will not have changed.
+        self.r_cached = f32::NAN;
+    }
+
     /// Solve the root for incident wave `a` at port resistance `r`. Returns
     /// `(v, b)`: the diode/node voltage and the reflected wave `2v − a`.
     ///

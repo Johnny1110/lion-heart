@@ -444,6 +444,18 @@ impl<const N: usize, const M: usize, P: PortSet<M>> RType<N, M, P> {
     pub fn s_matrix(&self) -> &[[f32; N]; N] {
         &self.s
     }
+
+    /// The voltage across port `k` after a complete wave exchange —
+    /// `v = (a + b)/2`, the standard WDF read. Port 0 is the up port.
+    ///
+    /// This is how a pedal taps its **output node**: an op-amp's output is a
+    /// junction node, not a leaf, so there is no one-port to ask. Hanging the
+    /// load resistor on a port and reading its voltage here costs nothing per
+    /// sample — both waves are already sitting in the adaptor's arrays.
+    #[inline]
+    pub fn port_voltage(&self, k: usize) -> f32 {
+        0.5 * (self.a[k] + self.b[k])
+    }
 }
 
 impl<const N: usize, const M: usize, P: PortSet<M>> Wdf for RType<N, M, P> {

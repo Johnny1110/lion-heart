@@ -44,6 +44,7 @@ mod red_charlie;
 mod screamer;
 mod sd1;
 mod ts9;
+mod ts_wdf;
 mod waveshaper;
 
 use lh_core::{FamilyDesc, ParamDesc, Range, drive_law};
@@ -88,10 +89,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &sd1::DESC,
         &angry_charlie_v2::DESC,
         &waveshaper::DESC,
+        &ts_wdf::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 15;
+pub const MODEL_COUNT: usize = 16;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -103,9 +105,14 @@ enum Ctl {
     Mid,
     High,
     /// A stepped selector routed straight to the circuit rather than through a
-    /// smoother — the `waveshaper`'s curve. Private to `lh-dsp`, so adding it
-    /// costs no preset or plugin schema change.
+    /// smoother — the `waveshaper`'s curve, `ts-wdf`'s clipping diode. Private
+    /// to `lh-dsp`, so adding it costs no preset or plugin schema change.
     Shape,
+    /// A *continuous* setup control routed straight to the circuit, likewise
+    /// unsmoothed here — `ts-wdf`'s diode count. It reaches a coefficient, not
+    /// the sample path, so the circuit glides it internally at its own rebuild
+    /// rate rather than paying for a per-sample trajectory.
+    Trim,
 }
 
 /// One entry in the drive pedal registry: the faceplate, the param→control
@@ -193,6 +200,11 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         controls: &[Ctl::Drive, Ctl::Shape, Ctl::Tone, Ctl::Level],
         build: || Box::new(waveshaper::Waveshaper::new()),
     },
+    ModelDef {
+        desc: &ts_wdf::DESC,
+        controls: &[Ctl::Drive, Ctl::Shape, Ctl::Trim, Ctl::Tone, Ctl::Level],
+        build: || Box::new(ts_wdf::TsWdf::new()),
+    },
 ];
 
 /// One channel of one drive model. Built off the audio thread
@@ -216,6 +228,10 @@ pub trait Circuit: Send {
     /// thread applies params — so it must stay allocation-free, but it may do
     /// real work (it resets filter state).
     fn set_shape(&mut self, _index: usize) {}
+    /// A continuous setup control reached the faceplate ([`Ctl::Trim`]). Same
+    /// contract as [`Circuit::set_shape`]: off the per-sample path,
+    /// allocation-free. Default no-op; only `ts-wdf` has one.
+    fn set_trim(&mut self, _value: f32) {}
 }
 
 // --- shared building blocks ---
@@ -449,6 +465,13 @@ impl Effect for Drive {
                     circuit.set_shape(real as usize);
                 }
             }
+            // Likewise straight to the pair: it is a setup value the circuit
+            // glides for itself, not a knob the sample path reads.
+            Ctl::Trim => {
+                for circuit in &mut self.circuits[self.model] {
+                    circuit.set_trim(real);
+                }
+            }
         }
     }
 
@@ -522,6 +545,16 @@ mod tests {
     /// The level/output knob is the last param on every faceplate.
     fn level_index(model: usize) -> usize {
         MODELS[model].desc.params.len() - 1
+    }
+
+    /// Registry index of a pedal, by key. Tests must not hard-code positions:
+    /// the registry is append-only, so "the last entry" means a different
+    /// pedal every time the family grows.
+    fn model_of(key: &str) -> usize {
+        MODELS
+            .iter()
+            .position(|m| m.desc.key == key)
+            .unwrap_or_else(|| panic!("no such pedal: {key}"))
     }
 
     /// A sine at nominal guitar level (−18 dBFS). The character tests run
@@ -635,6 +668,7 @@ mod tests {
             ("sd1", -45.0),
             ("angry-charlie-v2", -38.0),
             ("waveshaper", -70.0),
+            ("ts-wdf", -42.0),
         ];
         for (i, (key, bound)) in bounds.iter().enumerate() {
             assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
@@ -697,8 +731,7 @@ mod tests {
     #[test]
     fn waveshaper_every_curve_reaches_the_audio() {
         use crate::blocks::waveshaper::CURVE_COUNT;
-        let model = MODEL_COUNT - 1;
-        assert_eq!(MODELS[model].desc.key, "waveshaper");
+        let model = model_of("waveshaper");
         let x = sine(SR, 220.0, SR as usize);
         let render = |curve: usize| -> Vec<f32> {
             let mut d = prepared(model);
@@ -734,7 +767,7 @@ mod tests {
     /// must not click when it lands mid-note, and both channels must follow.
     #[test]
     fn waveshaper_shape_switch_is_bounded_and_stereo_locked() {
-        let model = MODEL_COUNT - 1;
+        let model = model_of("waveshaper");
         let x = guitar(220.0, SR as usize);
         let mut d = prepared(model);
         set_pos(&mut d, 0, 7.0);
@@ -1091,7 +1124,7 @@ mod tests {
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
         let mut levels = Vec::new();
-        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13] {
+        for model in [0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15] {
             let mut d = prepared(model);
             let y = process_in_blocks(&mut d, &x, 256);
             let out = f64::from(rms(&y[y.len() / 2..]));
@@ -1109,6 +1142,27 @@ mod tests {
             spread < 5.0,
             "modelled pedals at defaults are {spread:.1} dB apart ({levels:?})"
         );
+    }
+
+    /// Diagnostic companion to the test above: what every pedal actually does
+    /// at its default knobs, so a new model's makeup can be dialled in against
+    /// the family instead of against a pass/fail. Run with
+    /// `cargo test -p lh-dsp default_level_survey -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn default_level_survey() {
+        let x = guitar(220.0, SR as usize);
+        let in_rms = f64::from(rms(&x[x.len() / 2..]));
+        for (model, def) in MODELS.iter().enumerate() {
+            let mut d = prepared(model);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let out = f64::from(rms(&y[y.len() / 2..]));
+            println!(
+                "{:>18}  {:+6.2} dB at defaults",
+                def.desc.key,
+                20.0 * (out / in_rms).log10()
+            );
+        }
     }
 
     #[test]
