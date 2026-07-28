@@ -118,6 +118,9 @@ const TS_WDF: Color = Color::from_rgb(0.52, 0.66, 0.30);
 /// pale, low-saturation box in the family, which suits the one drive that is
 /// trying not to be heard.
 const ZENDRIVE: Color = Color::from_rgb(0.84, 0.74, 0.56);
+/// The Distortion+'s unmistakable canary-and-black enclosure, read as the amber
+/// side of yellow so it stays clear of the SD-1's brighter canary.
+const MXR_DIST: Color = Color::from_rgb(0.92, 0.72, 0.12);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -196,6 +199,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "waveshaper" => WAVESHAPER,
             "ts-wdf" => TS_WDF,
             "zendrive" => ZENDRIVE,
+            "mxr-dist" => MXR_DIST,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

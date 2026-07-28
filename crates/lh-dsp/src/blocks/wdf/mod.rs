@@ -69,7 +69,8 @@ pub use one_port::{
     ResistorCapacitorParallel, ResistorCapacitorSeries,
 };
 pub use rtype::{
-    JEl, Junction, NON_INVERTING_NODES, NON_INVERTING_PORTS, RType, non_inverting_els, op_amp,
+    JEl, Junction, NON_INVERTING_NODES, NON_INVERTING_OUT_PORTS, NON_INVERTING_PORTS, RType,
+    non_inverting_els, op_amp,
 };
 
 /// Flush a denormal to zero (RT rule 7 — a decaying reactive state must not

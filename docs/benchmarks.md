@@ -7,6 +7,28 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-28 (Tone Revolution phase 04: `mxr-dist`) — Linux dev container (relative)
+
+Third pedal (PRD 028). Same op-amp junction as the two before it, but adapted at
+the *output* port instead of the feedback path, because this circuit clips shunt
+to ground rather than inside the loop.
+
+| Bench                               | Median    | Reading                     |
+| ----------------------------------- | --------- | --------------------------- |
+| `drive_screamer_4x_oversampled`     | ~32.5 µs  | machine calibration         |
+| `drive_zendrive_4x_oversampled`     | ~41.1 µs  | feedback clipper            |
+| `drive_ts-wdf_4x_oversampled`       | ~42.7 µs  | feedback clipper            |
+| **`drive_mxr-dist_4x_oversampled`** | **~48.8 µs** | shunt clipper, deeper tree |
+
+48.8 µs is **3.7 %** of the deadline, ~15 % over the feedback-clipping pair. The
+difference is tree depth, not the junction: the input leg gains a `Series`, and
+the output network is three adaptor levels (`Series` → `Parallel` → `Parallel`)
+where the others had one.
+
+Calibration: `drive_screamer` reads 32.5 µs here against 31.4 µs in the
+`zendrive` session below — the top of this container's session spread, so read
+cross-session differences under ~4 % as noise.
+
 ## 2026-07-28 (Tone Revolution phase 04: `zendrive`) — Linux dev container (relative)
 
 Second pedal of the family (PRD 027 / ADR 034), and the one that prices the

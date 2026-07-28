@@ -103,8 +103,13 @@ revised order:
   clipper) and the ~3× thermal voltage is *not* compensation — it is two devices
   in series. The wiring bug is real and is fixed here; the params are refitted
   for a different, measurable reason (fitted `Is·sinh`, evaluated `2·Is·sinh`).
-  Drive family is now **17 pedals**. Remaining: `mxr-dist`, `rat`,
-  `diode-clipper`, `king-of-tone` (last).
+  **`mxr-dist`** followed (PRD 028, no new ADR) — the first of the family to clip
+  *shunt to ground at the output* rather than inside the feedback loop, so the
+  same junction is adapted at a different port. `blocks::wdf` gained
+  `NON_INVERTING_OUT_PORTS` alongside `NON_INVERTING_PORTS`, sharing
+  `non_inverting_els`; the rule is **the up port goes where the nonlinearity
+  is**, and `rat` will reuse it. Drive family is now **18 pedals**. Remaining:
+  `rat`, `diode-clipper`, `king-of-tone` (last).
 
 The full phase map and each phase's acceptance criteria live in the docs linked
 above. Note the phase-04 plan doc still says the scattering matrix comes from
