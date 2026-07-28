@@ -171,8 +171,30 @@ pub static NON_INVERTING_PORTS: [(u8, u8); 4] = [
     (3, 0), // the load, and the stage's output tap
 ];
 
-/// The elements of the [`NON_INVERTING_PORTS`] junction: one op-amp, wired to
-/// the node numbering that layout assumes.
+/// The same amplifier as [`NON_INVERTING_PORTS`], adapted at the **output**
+/// instead of the feedback path.
+///
+/// Which port you adapt is decided by where the nonlinearity is, because the
+/// root has to hang off the up port. Screamer-family pedals put their diodes in
+/// the feedback loop, so they use [`NON_INVERTING_PORTS`]; a Distortion+ or a
+/// RAT clips *after* the op-amp, shunt to ground, so the output leads out and
+/// the feedback resistor becomes an ordinary child port.
+///
+/// Adapting here is asking for the node's Thévenin resistance, and an op-amp
+/// output under feedback is stiff — `Ro/(1 + Ag·β)`, a fraction of an ohm to a
+/// few ohms. That is small but perfectly well defined, and it is swamped by
+/// whatever series element follows. It is *not* the degenerate case the module
+/// docs warn about: that one arises when the node's impedance falls below the
+/// solver's floor entirely, which needs an idealised `Ro`.
+pub static NON_INVERTING_OUT_PORTS: [(u8, u8); 4] = [
+    (3, 0), // up: the output, leading to the shunt clipper
+    (3, 2), // the feedback resistor
+    (1, 0), // the input leg, loading the non-inverting pin
+    (2, 0), // the gain leg, inverting pin to ground
+];
+
+/// The elements of the [`NON_INVERTING_PORTS`] / [`NON_INVERTING_OUT_PORTS`]
+/// junctions: one op-amp, wired to the node numbering both layouts assume.
 pub const fn non_inverting_els(ag: f32, ri: f32, ro: f32) -> [JEl; 3] {
     op_amp(1, 2, 3, 4, ag, ri, ro)
 }
