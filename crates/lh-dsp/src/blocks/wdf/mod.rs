@@ -68,7 +68,9 @@ pub use one_port::{
     CapacitiveVoltageSource, Capacitor, ResistiveCurrentSource, ResistiveVoltageSource, Resistor,
     ResistorCapacitorParallel, ResistorCapacitorSeries,
 };
-pub use rtype::{JEl, Junction, RType, op_amp};
+pub use rtype::{
+    JEl, Junction, NON_INVERTING_NODES, NON_INVERTING_PORTS, RType, non_inverting_els, op_amp,
+};
 
 /// Flush a denormal to zero (RT rule 7 — a decaying reactive state must not
 /// sink into denormal territory and stall the FPU).

@@ -144,6 +144,39 @@ pub const fn op_amp(
     ]
 }
 
+/// Node count of the [non-inverting op-amp junction](NON_INVERTING_PORTS).
+pub const NON_INVERTING_NODES: usize = 5;
+
+/// Port layout of the **classic op-amp overdrive junction** — a non-inverting
+/// amplifier whose feedback path is the adapted up port, so the clipping diodes
+/// hang there and see the loop rather than the signal.
+///
+/// Nodes: `0` ground, `1` non-inverting input, `2` inverting input, `3` output,
+/// `4` the op-amp's internal node.
+///
+/// The Tube Screamer, the ZenDrive and the MXR Distortion+ are *this junction*
+/// with different parts hung off it — same nodes, same ports, same scattering
+/// structure. Sharing the layout here is how that fact gets expressed without a
+/// matrix being written down twice: each pedal builds its own `S` from these
+/// ports and its own op-amp constants, at run time, from the topology (ADR 032).
+///
+/// The up port is on the feedback path for a reason beyond faithfulness — it is
+/// a high-impedance node (roughly `(Ag+1)·Z_gain-leg`), which keeps
+/// `R_up = R_thévenin` well conditioned. The op-amp's own output pin would not
+/// be; see the module docs.
+pub static NON_INVERTING_PORTS: [(u8, u8); 4] = [
+    (3, 2), // up: the feedback path — where the clipping diodes hang
+    (1, 0), // the input leg, loading the non-inverting pin
+    (2, 0), // the gain leg, inverting pin to ground
+    (3, 0), // the load, and the stage's output tap
+];
+
+/// The elements of the [`NON_INVERTING_PORTS`] junction: one op-amp, wired to
+/// the node numbering that layout assumes.
+pub const fn non_inverting_els(ag: f32, ri: f32, ro: f32) -> [JEl; 3] {
+    op_amp(1, 2, 3, 4, ag, ri, ro)
+}
+
 /// Scratch for one junction solve. Lives on the caller's stack; nothing here
 /// allocates.
 struct Mna {

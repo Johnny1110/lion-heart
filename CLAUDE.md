@@ -93,7 +93,17 @@ revised order:
   the drive sweep's top end and the `C4` treble cut the phase's own acceptance
   criteria require), and **diode menus carry `(Is, n)` per device, not `Is`
   alone** (BYOD's `1N34 → 200 pA` makes germanium clip *higher* than silicon).
-  Drive family is now **16 pedals**. Remaining: `zendrive`, `mxr-dist`, `rat`,
+  **`zendrive`** landed the same day (PRD 027 / **ADR 034**) — the *same
+  junction* as `ts-wdf` with different parts, which is why the shared layout now
+  lives in the framework as `blocks::wdf::{NON_INVERTING_NODES,
+  NON_INVERTING_PORTS, non_inverting_els}`. Its clipper (1N4148 + diode-connected
+  2N7002 per branch) was fitted here to that device's curve. ADR 034 also
+  **corrects the phase plan**: BYOD's ZenDrive diode params were *not* distorted
+  by its P1/P3 wiring bug (they were fitted offline against a standalone LTspice
+  clipper) and the ~3× thermal voltage is *not* compensation — it is two devices
+  in series. The wiring bug is real and is fixed here; the params are refitted
+  for a different, measurable reason (fitted `Is·sinh`, evaluated `2·Is·sinh`).
+  Drive family is now **17 pedals**. Remaining: `mxr-dist`, `rat`,
   `diode-clipper`, `king-of-tone` (last).
 
 The full phase map and each phase's acceptance criteria live in the docs linked

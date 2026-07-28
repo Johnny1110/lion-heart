@@ -114,6 +114,10 @@ const WAVESHAPER: Color = Color::from_rgb(0.30, 0.84, 0.86);
 /// next to the ts9's stock green and the screamer's deep jade, the third and
 /// most complete circuit model of the same box wears the vintage enclosure.
 const TS_WDF: Color = Color::from_rgb(0.52, 0.66, 0.30);
+/// The Zendrive's cream-and-brown enclosure, read as a warm sand — the only
+/// pale, low-saturation box in the family, which suits the one drive that is
+/// trying not to be heard.
+const ZENDRIVE: Color = Color::from_rgb(0.84, 0.74, 0.56);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -191,6 +195,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "sd1" => SD1,
             "waveshaper" => WAVESHAPER,
             "ts-wdf" => TS_WDF,
+            "zendrive" => ZENDRIVE,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

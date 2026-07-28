@@ -16,9 +16,25 @@
 //! It is a **separate test binary** on purpose. `#[global_allocator]` is
 //! crate-wide, and the library's 300-odd unit tests have no business running
 //! under one.
+//!
+//! **Debug builds only**, like every other `assert_no_alloc` site in this
+//! workspace: the crate compiles `AllocDisabler` out under `disable_release`, so
+//! in release the sweep still runs and still checks the output stays finite, but
+//! nothing watches the allocator. `cargo test` is the gate that matters here.
 
+#[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
+
+/// Run `f` under the allocation guard where the guard exists.
+#[cfg(debug_assertions)]
+fn guarded<R>(f: impl FnOnce() -> R) -> R {
+    assert_no_alloc::assert_no_alloc(f)
+}
+#[cfg(not(debug_assertions))]
+fn guarded<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
 
 use lh_dsp::Effect;
 use lh_dsp::drive::{Drive, FAMILY, MODELS};
@@ -39,7 +55,7 @@ fn hammer(model: usize) {
     let mut left = vec![0.0f32; BLOCK];
     let mut right = vec![0.0f32; BLOCK];
 
-    assert_no_alloc::assert_no_alloc(|| {
+    guarded(|| {
         for n in 0..64 {
             // A knob a human is turning: every param, never twice the same
             // value, so no settled-skip anywhere can hide a rebuild path.

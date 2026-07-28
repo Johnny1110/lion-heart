@@ -29,8 +29,27 @@
 >    - **多做一件**：`crates/lh-dsp/tests/alloc.rs`——把 §4.3 從 app 執行期的
 >      `AllocDisabler` 拉成離線閘門，涵蓋**全部 16 顆**踏板掃旋鈕 + 狂推。
 >
-> **待辦**：`zendrive`（§2.2）、`mxr-dist`（§2.4）、`rat`（§2.5）、
-> `diode-clipper`（§2.6）、`king-of-tone`（§2.3，排最後）。
+> 2. **`zendrive`（§2.2）— PRD 027 / ADR 034，2026-07-28。** 落差三處：
+>    - **§2.2 對 BYOD 擬合值的判讀要更正。** 計畫說那組 `Is≈5.241e-10 / nVt≈0.0787`
+>      是「繞著 P1/P3 bug 擬合出來的」，`nVt` 是物理 `Vt` 的 ~3 倍即為證據。查
+>      `sim/ZenDrive/` 後**兩點都不成立**：擬合是對著一份**獨立的** LTspice 削波器
+>      電路離線做的（`ZenClipper.asc` + `zen_clipper.py`），bug 不可能參與；`nVt`
+>      反常單純因為每支是 **1N4148 串二極體接法 2N7002**，兩顆元件疊在一起。
+>      **接線 bug 本身是真的**（阻抗參考 5 Ω vs 波交換的 20 kΩ，差 3,600 倍），照修。
+>      不沿用擬合值的真正理由是可量測的：它擬 `Is·sinh`、跑 `2·Is·sinh`，整個工作
+>      範圍低 60–105 mV。改為自行擬合 `2·Is·sinh`（1 µA–300 µA，誤差 ≤ 15 mV）。
+>    - **4.5 V 偏壓不建模**：我們的 op-amp 沒有電源軌，那條偏壓在訊號路徑上是純共模，
+>      只換來一段開機暫態（BYOD 得空跑 20,000 sample 等它穩）。屬 §3 允許的簡化。
+>    - **多做一件**：家族共用的 junction 佈局提到框架層
+>      （`blocks::wdf::{NON_INVERTING_NODES, NON_INVERTING_PORTS, non_inverting_els}`），
+>      `ts-wdf` 一併改用。「TS 與 ZenDrive 共用散射矩陣」因此是結構事實而非註解，
+>      `mxr-dist` 可直接沿用。
+>    - **順帶修掉 PRD 026 的疏漏**：`tests/alloc.rs` 沒有 `#[cfg(debug_assertions)]`
+>      閘門，而 `assert_no_alloc` 在 release 被 feature-gate 掉——`cargo test --release`
+>      編不過。當時只跑了 debug 閘門所以沒發現。
+>
+> **待辦**：`mxr-dist`（§2.4）、`rat`（§2.5）、`diode-clipper`（§2.6）、
+> `king-of-tone`（§2.3，排最後）。
 
 命中目標：#2（別人設計好的 drive 參數——overdrive 主力）
 依賴：Phase 03（R-Type + op-amp）、Phase 01（omega root）
