@@ -32,7 +32,7 @@
 use lh_core::{EffectDesc, ParamDesc};
 
 use super::{Circuit, OnePole, knob, lp_coeff};
-use crate::blocks::wdf::{AsymDiode, Capacitor, parallel_root_with_source};
+use crate::blocks::wdf::{AsymDiode, Capacitor, Parallel, Resistor, Wdf};
 
 static PARAMS: [ParamDesc; 3] = [
     knob("drive", "Drive", 5.0, 20.0),
@@ -80,6 +80,10 @@ fn drive_ohms(pos: f32) -> f32 {
     R_DRIVE_MAX * (1.0 - n) * (1.0 - n)
 }
 
+/// The feedback network as a WDF tree: the feedback resistor in parallel with
+/// the capacitor across it. The asymmetric diode pair is the root.
+type FeedbackTree = Parallel<Resistor, Capacitor>;
+
 pub(super) struct Sd1 {
     tone_lp: OnePole,
     dc: OnePole,
@@ -87,9 +91,8 @@ pub(super) struct Sd1 {
     c_dc: f32,
     /// The WDF feedback network: a capacitor across the feedback resistor with
     /// the asymmetric diode pair as the nonlinear root.
-    c_f: Capacitor,
+    fb: FeedbackTree,
     diode: AsymDiode,
-    g_f: f32,
     /// `2·C_g·fs` — the gain leg's bilinear cap admittance.
     g2: f32,
     // Gain-leg bilinear state: last cap voltage and last leg current.
@@ -104,9 +107,8 @@ impl Sd1 {
             dc: OnePole::default(),
             c723: 0.0,
             c_dc: 0.0,
-            c_f: Capacitor::new(C_F, 4.0 * 48_000.0),
+            fb: Parallel::new(Resistor::new(R_F), Capacitor::new(C_F, 4.0 * 48_000.0)),
             diode: AsymDiode::new(IS, N, VT, M_FWD, M_REV),
-            g_f: 1.0 / R_F,
             g2: 2.0 * C_G * 4.0 * 48_000.0,
             v_cg: 0.0,
             i_g: 0.0,
@@ -129,11 +131,17 @@ impl Sd1 {
 
         // That current is forced into the feedback network [R_f ‖ C_f ‖ diodes];
         // solve the nonlinear node voltage V_fb (the drop from Vout to Vin).
-        let a_cf = self.c_f.reflected();
-        let (a_root, r_root) =
-            parallel_root_with_source(&[(self.g_f, 0.0), (self.c_f.conductance(), a_cf)], i_g);
-        let (v_fb, _b) = self.diode.solve(a_root, r_root);
-        self.c_f.set_incident(2.0 * v_fb - a_cf);
+        //
+        // An *ideal* current source has no WDF one-port form — its port
+        // resistance is infinite — but at the root it needs none: injecting `I`
+        // into the node shifts the incident wave by `R·I` and leaves `R` alone.
+        let a = self.fb.reflected();
+        let r = self.fb.resistance();
+        let (v_fb, _b) = self.diode.solve(a + r * i_g, r);
+        // The network below is handed the wave its *node voltage* implies. The
+        // shift belongs to the root's equation, not to the tree, so the
+        // unshifted `a` is what `2v − a` is built from here.
+        self.fb.incident(2.0 * v_fb - a);
 
         vin + v_fb
     }
@@ -143,8 +151,10 @@ impl Circuit for Sd1 {
     fn prepare(&mut self, base_rate: f32, os_rate: f32) {
         self.c723 = lp_coeff(723.0, base_rate);
         self.c_dc = lp_coeff(10.0, base_rate);
-        // The reactive elements are discretized at the rate the solver runs at.
-        self.c_f = Capacitor::new(C_F, os_rate);
+        // The reactive elements are discretized at the rate the solver runs at,
+        // so the tree's port resistances are rebuilt from the root down.
+        self.fb.prepare(os_rate);
+        self.fb.calc_impedance();
         self.g2 = 2.0 * C_G * os_rate;
         self.reset();
     }
@@ -152,7 +162,7 @@ impl Circuit for Sd1 {
     fn reset(&mut self) {
         self.tone_lp.reset();
         self.dc.reset();
-        self.c_f.reset();
+        self.fb.reset();
         self.diode.reset();
         self.v_cg = 0.0;
         self.i_g = 0.0;
@@ -181,8 +191,76 @@ impl Circuit for Sd1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::wdf::parallel_root_with_source;
 
     const OS: f32 = 4.0 * 48_000.0;
+
+    /// **The golden.** The pre-framework implementation, kept verbatim as
+    /// PRD 021 shipped it: the bilinear gain leg, then a hand-reduced
+    /// current-injected parallel node feeding the asymmetric root.
+    struct Legacy {
+        c_f: Capacitor,
+        diode: AsymDiode,
+        g2: f32,
+        v_cg: f32,
+        i_g: f32,
+    }
+
+    impl Legacy {
+        fn new() -> Self {
+            let mut c_f = Capacitor::new(C_F, OS);
+            c_f.calc_impedance();
+            Self {
+                c_f,
+                diode: AsymDiode::new(IS, N, VT, M_FWD, M_REV),
+                g2: 2.0 * C_G * OS,
+                v_cg: 0.0,
+                i_g: 0.0,
+            }
+        }
+
+        fn clip(&mut self, vin: f32, r_drive: f32) -> f32 {
+            let r_gain = R_GAIN_MIN + r_drive;
+            let rg2 = r_gain * self.g2;
+            let v_cg = (vin + rg2 * self.v_cg + r_gain * self.i_g) / (1.0 + rg2);
+            let i_g = self.g2 * (v_cg - self.v_cg) - self.i_g;
+            self.v_cg = v_cg;
+            self.i_g = i_g;
+
+            let a_cf = self.c_f.reflected();
+            let (a_root, r_root) =
+                parallel_root_with_source(&[(1.0 / R_F, 0.0), (self.c_f.conductance(), a_cf)], i_g);
+            let (v_fb, _b) = self.diode.solve(a_root, r_root);
+            self.c_f.incident(2.0 * v_fb - a_cf);
+            vin + v_fb
+        }
+    }
+
+    /// Phase 03 §2.4: the rewrite onto `Parallel<Resistor, Capacitor>` keeps
+    /// the ideal virtual short untouched and changes nothing audible. The
+    /// interesting part is the forced current: an ideal current source has no
+    /// one-port form, so the framework version shifts the root's incident wave
+    /// by `R·I` and hands the tree `2v − a` built from the *unshifted* wave.
+    /// This test is what proves those two spellings are the same circuit.
+    #[test]
+    fn the_framework_rewrite_is_numerically_equivalent() {
+        let mut new = prepared();
+        let mut old = Legacy::new();
+
+        let mut worst = 0.0f32;
+        for k in 0..200_000 {
+            let t = k as f32 / OS;
+            // Sweep the drive pot as well — the gain leg's resistance moves,
+            // which is where a stale cached impedance would show up.
+            let pos = 10.0 * (0.5 + 0.5 * (0.7 * t).sin());
+            let r = drive_ohms(pos);
+            let amp = 0.02 * (1.0 + 200.0 * (k as f32 / 200_000.0));
+            let x = amp * (std::f32::consts::TAU * (150.0 + 6_000.0 * t) * t).sin();
+            let d = (new.clip(x, r) - old.clip(x, r)).abs();
+            worst = worst.max(d);
+        }
+        assert!(worst < 1e-4, "worst |Δ| = {worst:e} V");
+    }
 
     fn prepared() -> Sd1 {
         let mut s = Sd1::new();

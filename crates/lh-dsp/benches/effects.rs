@@ -424,11 +424,137 @@ fn bench_wdf_root(c: &mut Criterion) {
     group.finish();
 }
 
+/// The composable WDF framework's own cost (PRD 025 / ADR 032), isolated from
+/// any pedal: the per-sample scattering of an adaptor tree versus an R-type of
+/// the same circuit, and the block-rate price of rebuilding a scattering matrix
+/// when a knob moves.
+///
+/// All three run one 64-sample block's worth of samples at the 4× oversampled
+/// rate the roots really see (256 iterations), so the numbers are directly
+/// comparable with the `drive_*_4x_oversampled` rows.
+fn bench_wdf_framework(c: &mut Criterion) {
+    use lh_dsp::blocks::wdf::rtype::{Junction, RType};
+    use lh_dsp::blocks::wdf::{Capacitor, Parallel, ResistiveVoltageSource, Resistor, Wdf};
+
+    const OS: f32 = 4.0 * 48_000.0;
+    const N: usize = 256; // one 64-frame block, 4× oversampled
+
+    let mut group = c.benchmark_group("block64_48k");
+
+    // The Screamer's shunt clipper, minus the diode: source ‖ capacitor.
+    let mut tree = Parallel::new(
+        ResistiveVoltageSource::new(2_200.0),
+        Capacitor::new(22e-9, OS),
+    );
+    tree.calc_impedance();
+    group.bench_function("wdf_parallel_tree", |b| {
+        b.iter(|| {
+            for k in 0..N {
+                tree.port1_mut().set_voltage(black_box(k as f32 * 1e-3));
+                let a = tree.reflected();
+                tree.incident(black_box(a));
+            }
+        })
+    });
+
+    // The pre-framework spelling of that same node, in the same run: the
+    // hand-reduced `parallel_root` helper the pedals used before PRD 025. This
+    // is the only honest way to price the framework — whole-pedal numbers are
+    // dominated by the diode root and the oversampler, and container speed
+    // drifts between benchmarking sessions.
+    let mut cap = Capacitor::new(22e-9, OS);
+    cap.calc_impedance();
+    let g_src = 1.0 / 2_200.0;
+    group.bench_function("wdf_parallel_helper", |b| {
+        b.iter(|| {
+            for k in 0..N {
+                let e = black_box(k as f32 * 1e-3);
+                let a1 = cap.reflected();
+                let (a, _r) =
+                    lh_dsp::blocks::wdf::parallel_root(&[(g_src, e), (cap.conductance(), a1)]);
+                cap.incident(black_box(2.0 * a - a1));
+            }
+        })
+    });
+
+    // The same node expressed as a 4-port R-type: source, capacitor and a load
+    // resistor around one junction.
+    static J4: Junction = Junction {
+        nodes: 2,
+        els: &[],
+        ports: &[(1, 0), (1, 0), (1, 0), (1, 0)],
+    };
+    let mut rt: RType<4, 3, _> = RType::new(
+        &J4,
+        (
+            ResistiveVoltageSource::new(2_200.0),
+            Capacitor::new(22e-9, OS),
+            Resistor::new(47_000.0),
+        ),
+    );
+    rt.calc_impedance();
+    group.bench_function("wdf_rtype4_scatter", |b| {
+        b.iter(|| {
+            for k in 0..N {
+                rt.ports_mut().0.set_voltage(black_box(k as f32 * 1e-3));
+                let a = rt.reflected();
+                rt.incident(black_box(a));
+            }
+        })
+    });
+
+    // What a moving knob costs: one full nodal rebuild of the 4×4 matrix. This
+    // happens at most once per block, and only when a knob actually moved.
+    group.bench_function("wdf_rtype4_rebuild", |b| {
+        b.iter(|| {
+            rt.ports_mut().2.set_ohms(black_box(47_000.0));
+            rt.calc_impedance();
+        })
+    });
+
+    // An op-amp junction is the Phase 04 shape: three internal elements
+    // including a controlled source, so the rebuild solves a 6×6 system.
+    static OPAMP_J: Junction = Junction {
+        nodes: 6,
+        els: &{
+            let oa = lh_dsp::blocks::wdf::op_amp(1, 2, 3, 4, 1e5, 1e9, 0.1);
+            [
+                oa[0],
+                oa[1],
+                oa[2],
+                lh_dsp::blocks::wdf::JEl::Res {
+                    a: 3,
+                    b: 5,
+                    ohms: 1_000.0,
+                },
+            ]
+        },
+        ports: &[(5, 0), (1, 0), (2, 0), (3, 2)],
+    };
+    let mut oa: RType<4, 3, _> = RType::new(
+        &OPAMP_J,
+        (
+            ResistiveVoltageSource::new(10_000.0),
+            Resistor::new(4_700.0),
+            Resistor::new(47_000.0),
+        ),
+    );
+    group.bench_function("wdf_rtype4_opamp_rebuild", |b| {
+        b.iter(|| {
+            oa.ports_mut().2.set_ohms(black_box(47_000.0));
+            oa.calc_impedance();
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_effects,
     bench_full_chain,
     bench_wdf_root,
-    bench_adaa
+    bench_adaa,
+    bench_wdf_framework
 );
 criterion_main!(benches);

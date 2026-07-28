@@ -1,8 +1,9 @@
 # Tone Revolution — 移植計畫藍圖（Overview）
 
 狀態：**執行中** — **Phase 01（PRD 022）、02（PRD 023 / ADR 030）、06（PRD 024 /
-ADR 031）已實作（2026-07-27）**；建議順序的三個 quick win 全部完成，Phase 03
-（WDF adaptor + R-Type）起待排。
+ADR 031）已實作（2026-07-27）；Phase 03（PRD 025 / ADR 032）已實作（2026-07-28）**。
+三個 quick win 加上架構級的 adaptor 框架完成，**Phase 04（op-amp overdrive 家族）
+的地基已就位**。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -21,14 +22,17 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | 01 快速非線性 root | ✅ **已實作** | PRD 022；`blocks::wdf::omega`；`screamer` 72.3 → **30.5 µs**、root 12.7×、誤差 30 µV |
 > | 02 Tone stack 框架 | ✅ **已實作** | PRD 023 / **ADR 030**；`eq::tonestack`（netlist → 狀態空間 → Tustin）；3 機型；5 顆 FMV 系 drive 遷移；獨立 `tonestack` 踏板 |
 > | 06 Waveshaper + ADAA | ✅ **已實作** | PRD 024 / **ADR 031**；`blocks::waveshaper`（一/二階 ADAA + 12 曲線）；**全部 12 顆 memoryless drive 抗鋸齒**（地板 −29 → −38…−87 dB）；新踏板 `waveshaper` |
-> | 03–05、07–08 | 待排 | — |
+> | 03 WDF adaptor + R-Type | ✅ **已實作** | PRD 025 / **ADR 032**；`blocks::wdf` 拆五檔（one-port／adaptor／rtype／diode／omega）；擁有式泛型樹；**散射矩陣執行期由 netlist 數值構造**；op-amp 有限增益；`screamer`/`sd1` 等價重寫（對改寫前 ~1e-8） |
+> | 04–05、07–08 | 待排 | — |
 >
-> 三個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
+> 四個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
 > 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
 > 形式由「手推封閉式 + 三階直接式 IIR」改為「netlist → 狀態空間」、六個機型只交付
 > 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle；06 是二階
 > ADAA 自行從定義推導、dry-sum 補償實測後**完全不需要**（ADAA 在 4× 率上）、改造
-> 範圍由 8 顆擴大到全部 12 顆 memoryless 踏板。
+> 範圍由 8 顆擴大到全部 12 顆 memoryless 踏板；**03 是把「R-Solver 符號 codegen」
+> 這個硬前置與「數值構造」這個後備對調**（連帶 `tools/wdf_codegen/` 未產出），
+> 理由與驗證管道見 ADR 032。
 
 ---
 

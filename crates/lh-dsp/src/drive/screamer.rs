@@ -18,7 +18,7 @@
 use lh_core::{EffectDesc, ParamDesc};
 
 use super::{Circuit, OnePole, knob, lp_coeff};
-use crate::blocks::wdf::{Capacitor, DiodePair, parallel_root};
+use crate::blocks::wdf::{Capacitor, DiodePair, Parallel, ResistiveVoltageSource, Wdf};
 
 static PARAMS: [ParamDesc; 3] = [
     knob("drive", "Drive", 5.0, 20.0),
@@ -54,6 +54,15 @@ fn feedback_ohms(pos: f32) -> f32 {
     51_000.0 + 500_000.0 * n * n
 }
 
+/// The clipping network as a WDF tree: the op-amp's output behind `R_SERIES`
+/// (a Thévenin source) in parallel with the shunt capacitor. The diode pair is
+/// the root and is not part of the tree.
+///
+/// This is the whole point of the per-pedal type alias convention (ADR 032) —
+/// the circuit's topology is legible in one line, and the compiler flattens it
+/// into the same straight-line arithmetic the hand-reduced version had.
+type ClipTree = Parallel<ResistiveVoltageSource, Capacitor>;
+
 pub(super) struct Screamer {
     hp720: OnePole,
     tone_lp: OnePole,
@@ -63,9 +72,8 @@ pub(super) struct Screamer {
     c_dc: f32,
     /// The WDF clipping stage: a shunt capacitor and an antiparallel diode
     /// pair at the parallel node, driven through `R_SERIES`.
-    cap: Capacitor,
+    tree: ClipTree,
     diode: DiodePair,
-    g_src: f32,
 }
 
 impl Screamer {
@@ -77,22 +85,22 @@ impl Screamer {
             c720: 0.0,
             c723: 0.0,
             c_dc: 0.0,
-            cap: Capacitor::new(C_SHUNT, 4.0 * 48_000.0),
+            tree: Parallel::new(
+                ResistiveVoltageSource::new(R_SERIES),
+                Capacitor::new(C_SHUNT, 4.0 * 48_000.0),
+            ),
             diode: DiodePair::new(IS, N, VT),
-            g_src: 1.0 / R_SERIES,
         }
     }
 
-    /// One oversampled sample through the WDF shunt clipper: the parallel
-    /// adaptor of {resistive source `e`, capacitor, diode root}. Returns the
-    /// node (diode) voltage `v` — the clipped signal.
+    /// One oversampled sample through the WDF shunt clipper. Returns the node
+    /// (diode) voltage `v` — the clipped signal.
     #[inline]
     fn clip(&mut self, e: f32) -> f32 {
-        let a1 = self.cap.reflected();
-        let (a_root, r_root) = parallel_root(&[(self.g_src, e), (self.cap.conductance(), a1)]);
-        let (v, _b) = self.diode.solve(a_root, r_root);
-        // Back-propagate to the capacitor: b_cap = 2·v − a_cap.
-        self.cap.set_incident(2.0 * v - a1);
+        self.tree.port1_mut().set_voltage(e);
+        let a = self.tree.reflected();
+        let (v, b) = self.diode.solve(a, self.tree.resistance());
+        self.tree.incident(b);
         v
     }
 }
@@ -102,8 +110,10 @@ impl Circuit for Screamer {
         self.c720 = lp_coeff(720.0, os_rate);
         self.c723 = lp_coeff(723.0, base_rate);
         self.c_dc = lp_coeff(10.0, base_rate);
-        // The capacitor is discretized at the rate its solver runs at.
-        self.cap = Capacitor::new(C_SHUNT, os_rate);
+        // The capacitor is discretized at the rate its solver runs at, so the
+        // tree's port resistances have to be rebuilt from the root down.
+        self.tree.prepare(os_rate);
+        self.tree.calc_impedance();
         self.reset();
     }
 
@@ -111,7 +121,7 @@ impl Circuit for Screamer {
         self.hp720.reset();
         self.tone_lp.reset();
         self.dc.reset();
-        self.cap.reset();
+        self.tree.reset();
         self.diode.reset();
     }
 
@@ -144,8 +154,49 @@ impl Circuit for Screamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::wdf::parallel_root;
 
     const OS: f32 = 4.0 * 48_000.0;
+
+    /// **The golden.** The pre-framework implementation, kept verbatim: a
+    /// hand-reduced parallel node feeding the diode root, exactly as PRD 020
+    /// shipped it. `the_framework_rewrite_is_numerically_equivalent` holds the
+    /// composable version to it, so "the refactor changed no sound" is a
+    /// measured claim rather than an assurance.
+    fn legacy_clip(cap: &mut Capacitor, diode: &mut DiodePair, e: f32) -> f32 {
+        let a1 = cap.reflected();
+        let (a_root, r_root) = parallel_root(&[(1.0 / R_SERIES, e), (cap.conductance(), a1)]);
+        let (v, _b) = diode.solve(a_root, r_root);
+        cap.incident(2.0 * v - a1);
+        v
+    }
+
+    /// Phase 03 §2.4: the rewrite onto `Parallel<ResistiveVoltageSource,
+    /// Capacitor>` is a *strictly equivalent* refactor. Float operation order
+    /// differs (the adaptor forms the weighted average as `a₂ − p(a₂ − a₁)`
+    /// where the helper summed `ΣGa/ΣG`), so bit-equality is not promised —
+    /// 1e-4 on the node voltage is, across the whole range the stage sees.
+    #[test]
+    fn the_framework_rewrite_is_numerically_equivalent() {
+        let mut new = Screamer::new();
+        new.prepare(48_000.0, OS);
+        let mut cap = Capacitor::new(C_SHUNT, OS);
+        cap.calc_impedance();
+        let mut diode = DiodePair::new(IS, N, VT);
+
+        let mut worst = 0.0f32;
+        for k in 0..200_000 {
+            // Sweep amplitude from below the diode knee to a slammed op-amp
+            // output, with a moving frequency so the shunt cap's state is
+            // exercised rather than settled.
+            let t = k as f32 / OS;
+            let amp = 0.02 * (1.0 + 400.0 * (k as f32 / 200_000.0));
+            let e = amp * (std::f32::consts::TAU * (150.0 + 6_000.0 * t) * t).sin();
+            let d = (new.clip(e) - legacy_clip(&mut cap, &mut diode, e)).abs();
+            worst = worst.max(d);
+        }
+        assert!(worst < 1e-4, "worst |Δv| = {worst:e} V");
+    }
 
     /// Run a sine of amplitude `amp` at `f` through the WDF core, returning the
     /// settled second half (the capacitor transient has died by then).
