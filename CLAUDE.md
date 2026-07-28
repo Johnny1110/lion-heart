@@ -74,15 +74,28 @@ revised order:
   → −38…−87 dB, character pins unchanged); new `waveshaper` drive pedal.
   Drive family is now **15 pedals**.
 
-**Phase 03 (WDF composable adaptors + R-Type) is next** per the revised order —
-the architectural one, and the gate for the op-amp drive family. The full phase
-map and each phase's acceptance criteria live in the docs linked above.
+- **03** WDF composable adaptor framework (PRD 025 / **ADR 032**), landed
+  2026-07-28 — the architectural one. `blocks::wdf` split into five files;
+  owned generic trees (`Parallel<A, B>` / `Series<A, B>` / `PolarityInverter`)
+  with root-driven waves and post-order `calc_impedance`; `RType<N, M, P>` whose
+  **scattering matrix is built numerically from a junction netlist at knob rate**
+  (not offline symbolic codegen — the plan's fallback promoted to primary, see
+  ADR 032); finite-gain op-amp as three junction elements. `screamer`/`sd1`
+  rewritten onto it, ~1e-8 relative against the pre-rewrite commit — **no tonal
+  change, no new pedals**.
+
+**Phase 04 (op-amp overdrive family) is next** per the revised order — the
+framework above is its gate. The full phase map and each phase's acceptance
+criteria live in the docs linked above.
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`
 (MIT); take circuit topologies + component values + diode SPICE params as
-*facts*; regenerate R-Type scattering matrices with **R-Solver** (don't paste
-BYOD's). Formalized into the main sequence these are **PRD 022+ / ADR 030+**.
+*facts*. **R-Type scattering matrices are never transcribed from anywhere** —
+since ADR 032 they are derived numerically from our own junction netlist at run
+time (the plan's original "regenerate with R-Solver" route was dropped; the
+reasoning is in that ADR). Formalized into the main sequence these are
+**PRD 022+ / ADR 030+**.
 
 ### Operational notes
 

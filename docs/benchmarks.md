@@ -7,6 +7,54 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-28 (Tone Revolution phase 03: WDF composable framework) — Linux dev container (relative)
+
+`blocks::wdf` graduates from hand-reduced straight-line code to a composable
+adaptor tree plus an N-port R-type (PRD 025 / ADR 032). The question this table
+has to answer is the one the plan asked: **did the framework make anything
+slower?** It did not — the framework path is *faster* than the code it replaced.
+
+The whole-pedal rows are not the right place to look for that: they are
+dominated by the diode root and the four half-band FIR passes, and container
+speed drifts between sessions. So the framework is priced **in isolation and in
+the same run**: 256 samples = one 64-frame block at 4× oversampling, mono, the
+Screamer's shunt node with the diode removed, spelled both ways.
+
+| Bench                       | Median      | Reading                              |
+| --------------------------- | ----------- | ------------------------------------ |
+| `wdf_parallel_tree`         | ~2.28 µs    | framework `Parallel<Rvs, Capacitor>` |
+| `wdf_parallel_helper`       | ~2.92 µs    | the pre-PRD-025 hand-reduced helper — **28 % slower** |
+| `wdf_rtype4_scatter`        | ~3.42 µs    | 4-port R-type, per-sample `b = S·a`  |
+| `wdf_rtype4_rebuild`        | ~114 ns     | one knob move: rebuild the 4×4       |
+| `wdf_rtype4_opamp_rebuild`  | ~458 ns     | ditto with an op-amp inside (6×6)    |
+
+The adaptor beats the helper because it caches `p = G₁/(G₁+G₂)` and the port
+resistance at `calc_impedance` time, while the helper re-derived `ΣGa/ΣG` and
+`1/ΣG` — two divides — every sample. Generic monomorphisation costs nothing
+here: the tree compiles to the same straight-line arithmetic the hand-written
+version had.
+
+The **rebuild** rows are what replaced offline symbolic code generation (ADR 032
+§3). They are paid at the block boundary and only when a knob actually moved, so
+114 ns lands at 0.009 % of the deadline and 458 ns at 0.034 % — and zero while
+the knobs are still.
+
+Whole-pedal rows, with the machine calibrated against the phase-01 session:
+
+| Bench                          | This run  | 2026-07-27 (phase 01) | Δ       |
+| ------------------------------ | --------- | --------------------- | ------- |
+| `wdf_root_256_solves/omega`    | ~2.33 µs  | ~2.29 µs              | +1.7 %  |
+| `wdf_root_256_solves/newton`   | ~27.1 µs  | ~29.1 µs              | −6.9 %  |
+| `drive_screamer_4x_oversampled`| ~31.8 µs  | ~30.5 µs              | +4.3 %  |
+| `drive_sd1_4x_oversampled`     | ~68.8 µs  | ~68.0 µs              | +1.2 %  |
+
+The two untouched root rows disagree by +1.7 % and −6.9 %, which is this
+container's honest session-to-session spread; both rewritten pedals sit inside
+it. **No same-run old-vs-new whole-pedal measurement was taken**, so the pedal
+rows are calibrated comparison, not a controlled one — the isolated rows above
+are the controlled measurement, and the equivalence itself is proven
+numerically instead (~1e-8 relative against the pre-rewrite commit, PRD 025 §3.1).
+
 ## 2026-07-27 (Tone Revolution phase 06: ADAA) — Linux dev container (relative)
 
 **Read the machine speed first.** `drive_screamer` is untouched by this phase and
