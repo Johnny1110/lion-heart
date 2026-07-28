@@ -7,6 +7,38 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-28 (Tone Revolution phase 04: `ts-wdf`) — Linux dev container (relative)
+
+The framework's first *new* pedal (PRD 026 / ADR 033): the whole Tube Screamer
+clipping amplifier — op-amp, feedback network, diodes inside it, gain leg, input
+coupling, load — as one WDF tree solved per oversampled sample.
+
+Same run, so the four Screamer models can be read against each other directly:
+
+| Bench                             | Median    | Reading                          |
+| --------------------------------- | --------- | -------------------------------- |
+| `drive_ts9_4x_oversampled`        | ~17.9 µs  | memoryless curve, the baseline   |
+| `drive_screamer_4x_oversampled`   | ~31.9 µs  | WDF shunt clipper                |
+| **`drive_ts-wdf_4x_oversampled`** | **~42.1 µs** | this pedal, knobs parked      |
+| **`drive_ts-wdf_knob_sweeping`**  | **~48.7 µs** | this pedal, drive knob turning |
+| `drive_sd1_4x_oversampled`        | ~71.7 µs  | WDF loop clipper, ideal op-amp   |
+
+42.1 µs is **3.2 %** of the 1,333 µs deadline. It sits between `screamer` and
+`sd1`: the extra over `screamer` is the R-type's 4×4 matrix–vector product plus
+one more adaptor layer per sample.
+
+The **sweeping** row is the one worth keeping. Turning the drive pot invalidates
+the scattering matrix, so the block pays a full-tree rebuild per sub-block — 8
+per stereo block here, ~840 ns each. That is **+16 % while a knob is moving and
+zero when it is still**, and it is the first time ADR 032's "build `S`
+numerically at run time" has been priced on a real circuit rather than on a
+synthetic junction (the phase-03 rows below measured 114 ns / 458 ns for bare
+junctions; the difference is the post-order recursion over the rest of the tree).
+
+Machine calibration: `drive_screamer` reads 31.9 µs here against 31.8 µs in the
+phase-03 session below, so that session's table and this one are directly
+comparable.
+
 ## 2026-07-28 (Tone Revolution phase 03: WDF composable framework) — Linux dev container (relative)
 
 `blocks::wdf` graduates from hand-reduced straight-line code to a composable
