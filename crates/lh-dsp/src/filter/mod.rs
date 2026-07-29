@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn survives_all_rates_and_block_sizes() {
         for pedal in 0..PEDAL_COUNT {
-            for sr in [44_100u32, 48_000, 96_000] {
+            for sr in [44_100u32, 48_000, 96_000, 192_000] {
                 let mut w = Filter::new();
                 w.prepare(sr);
                 w.select_pedal(pedal);

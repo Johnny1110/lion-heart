@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn finite_and_bounded_across_rates() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             let mut m = DrumMachine::new();
             m.prepare(sr);
             m.set_pattern(pattern_index("funk").unwrap());

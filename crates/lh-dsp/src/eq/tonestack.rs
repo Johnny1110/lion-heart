@@ -1099,7 +1099,7 @@ mod tests {
     /// polynomial of `A_d` with the Jury criterion rather than a root finder.
     #[test]
     fn poles_stay_inside_the_unit_circle_at_every_rate() {
-        for rate in [44_100.0f32, 48_000.0, 96_000.0] {
+        for rate in [44_100.0f32, 48_000.0, 96_000.0, 192_000.0] {
             for (kind, spec) in KINDS.iter().enumerate() {
                 for b in [0.0f32, 3.0, 5.0, 7.0, 10.0] {
                     for m in [0.0f32, 5.0, 10.0] {
@@ -1384,7 +1384,7 @@ mod tests {
     #[test]
     fn survives_all_rates_and_block_sizes() {
         for (kind, _) in KINDS.iter().enumerate() {
-            for rate in [44_100u32, 48_000, 96_000] {
+            for rate in [44_100u32, 48_000, 96_000, 192_000] {
                 let mut ts = ToneStack::new(kind);
                 ts.prepare(rate as f32);
                 ts.set_knobs([7.0, 3.0, 8.0]);

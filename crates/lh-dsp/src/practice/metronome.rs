@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn output_is_finite_and_bounded_across_rates() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             let mut m = Metronome::new();
             m.prepare(sr);
             m.set_bpm(137.0);
