@@ -307,6 +307,11 @@ struct Voice {
     ap_y1: [f32; PHASER_STAGES],
     fb: f32,
     xover_lp: f32,
+    /// Cached allpass coefficients (1 for phaser, 4 for univibe).
+    /// Recomputed every COEFF_REBUILD samples instead of per-sample tan().
+    cached_a: [f32; PHASER_STAGES],
+    /// Samples since last coefficient rebuild.
+    coeff_age: usize,
 }
 
 impl Voice {
@@ -318,6 +323,8 @@ impl Voice {
             ap_y1: [0.0; PHASER_STAGES],
             fb: 0.0,
             xover_lp: 0.0,
+            cached_a: [0.0; PHASER_STAGES],
+            coeff_age: 0,
         }
     }
 
@@ -326,6 +333,8 @@ impl Voice {
         self.write = 0;
         self.ap_x1 = [0.0; PHASER_STAGES];
         self.ap_y1 = [0.0; PHASER_STAGES];
+        self.cached_a = [0.0; PHASER_STAGES];
+        self.coeff_age = 0;
         self.fb = 0.0;
         self.xover_lp = 0.0;
     }
@@ -379,11 +388,28 @@ impl Voice {
             }
             PHASER | UNIVIBE => {
                 let mut y = x + feedback * self.fb;
+                // Coefficient cache: recompute tan()-derived allpass
+                // coefficients every COEFF_REBUILD samples instead of
+                // per-sample. The LFO moves slowly (0.1–10 Hz), so the
+                // coefficient change between samples is negligible.
+                const COEFF_REBUILD: usize = 16;
+                if self.coeff_age == 0 {
+                    if mode == PHASER {
+                        let fc = 700.0 * 3f32.powf(lfo * depth);
+                        let t = (std::f32::consts::PI * fc / sample_rate).tan();
+                        self.cached_a[0] = (1.0 - t) / (1.0 + t);
+                    } else {
+                        let sweep = 2f32.powf(1.2 * depth * lfo);
+                        for (i, &hz) in UNIVIBE_HZ.iter().enumerate() {
+                            let t = (std::f32::consts::PI * hz * sweep / sample_rate).tan();
+                            self.cached_a[i] = (1.0 - t) / (1.0 + t);
+                        }
+                    }
+                }
+                self.coeff_age = (self.coeff_age + 1) % COEFF_REBUILD;
+
                 if mode == PHASER {
-                    // Sweep the allpass corner geometrically around 700 Hz.
-                    let fc = 700.0 * 3f32.powf(lfo * depth);
-                    let t = (std::f32::consts::PI * fc / sample_rate).tan();
-                    let a = (1.0 - t) / (1.0 + t);
+                    let a = self.cached_a[0];
                     for stage in 0..PHASER_STAGES {
                         let out = -a * y + self.ap_x1[stage] + a * self.ap_y1[stage];
                         self.ap_x1[stage] = y;
@@ -391,16 +417,13 @@ impl Voice {
                         y = out;
                     }
                 } else {
-                    // Univibe: staggered corners swept together (±1.2 oct).
-                    let sweep = 2f32.powf(1.2 * depth * lfo);
-                    for ((&hz, x1), y1) in
-                        UNIVIBE_HZ.iter().zip(&mut self.ap_x1).zip(&mut self.ap_y1)
-                    {
-                        let t = (std::f32::consts::PI * hz * sweep / sample_rate).tan();
-                        let a = (1.0 - t) / (1.0 + t);
-                        let out = -a * y + *x1 + a * *y1;
-                        *x1 = y;
-                        *y1 = out;
+                    for stage in 0..PHASER_STAGES {
+                        let a = self.cached_a[stage];
+                        let x1 = self.ap_x1[stage];
+                        let y1 = self.ap_y1[stage];
+                        let out = -a * y + x1 + a * y1;
+                        self.ap_x1[stage] = y;
+                        self.ap_y1[stage] = out;
                         y = out;
                     }
                 }
