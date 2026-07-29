@@ -257,9 +257,12 @@ pub static VOICES: [VoiceDef; VOICE_COUNT] = [vca::VOICE, opto::VOICE, fet::VOIC
 pub struct Compressor {
     sample_rate: u32,
     voice: usize,
-    // Effective controls — some come from knobs, some are fixed by the voice.
     threshold_db: f32,
+    /// Smoothed threshold for click-free automation.
+    thr_s: Smoothed,
     ratio: f32,
+    /// Smoothed ratio for click-free automation.
+    ratio_s: Smoothed,
     /// fet all-buttons-in (drops the threshold); only read in `Stepped` mode.
     all_buttons: bool,
     attack_ms: f32,
@@ -293,7 +296,9 @@ impl Compressor {
             sample_rate: 48_000,
             voice: 0,
             threshold_db: vca::DESC.params[0].default,
+            thr_s: Smoothed::new(vca::DESC.params[0].default),
             ratio: vca::DESC.params[1].default,
+            ratio_s: Smoothed::new(vca::DESC.params[1].default),
             all_buttons: false,
             attack_ms: vca::DESC.params[2].default,
             release_ms: vca::DESC.params[3].default,
@@ -358,6 +363,10 @@ impl Effect for Compressor {
         // Rebuild coefficients from the stored values (a rate change must not
         // clobber knob-set attack/release the way a pedal switch does).
         self.recompute_time();
+        self.thr_s.configure(20.0, sample_rate);
+        self.thr_s.snap_to_target();
+        self.ratio_s.configure(20.0, sample_rate);
+        self.ratio_s.snap_to_target();
         self.makeup.configure(30.0, sample_rate);
         self.makeup.snap_to_target();
         self.blend.configure(20.0, sample_rate);
@@ -379,9 +388,18 @@ impl Effect for Compressor {
         };
         let real = param.range.to_real(normalized);
         match ctl {
-            Ctl::Threshold => self.threshold_db = real,
-            Ctl::PeakReduction => self.threshold_db = -OPTO_PR_DEPTH_DB * real.clamp(0.0, 1.0),
-            Ctl::Ratio => self.ratio = real,
+            Ctl::Threshold => {
+                self.threshold_db = real;
+                self.thr_s.set_target(real);
+            }
+            Ctl::PeakReduction => {
+                self.threshold_db = -OPTO_PR_DEPTH_DB * real.clamp(0.0, 1.0);
+                self.thr_s.set_target(self.threshold_db);
+            }
+            Ctl::Ratio => {
+                self.ratio = real;
+                self.ratio_s.set_target(real);
+            }
             Ctl::RatioStep => {
                 let (ratio, all) = match real.round().max(0.0) as usize {
                     0 => (4.0, false),
@@ -391,6 +409,7 @@ impl Effect for Compressor {
                     _ => (20.0, true),
                 };
                 self.ratio = ratio;
+                self.ratio_s.set_target(ratio);
                 self.all_buttons = all;
             }
             Ctl::Attack => {
@@ -430,10 +449,11 @@ impl Effect for Compressor {
             // --- envelope follower: attack when rising, release when falling.
             // The opto's release is program-dependent — the deeper the current
             // gain reduction, the slower the recovery.
+            let thr_db = self.thr_s.tick();
             let coeff = if det > self.env {
                 self.attack_coeff
             } else if def.program_release {
-                let over = lin_to_db(self.env.max(1e-9)) - self.threshold_db;
+                let over = lin_to_db(self.env.max(1e-9)) - thr_db;
                 let depth = (over / OPTO_PROGRAM_RANGE_DB).clamp(0.0, 1.0);
                 self.release_coeff + (self.release_slow_coeff - self.release_coeff) * depth
             } else {
@@ -446,13 +466,13 @@ impl Effect for Compressor {
 
             // --- gain computer (dB domain, per-voice knee & ratio law) ---
             let eff_threshold = if is_stepped && self.all_buttons {
-                self.threshold_db + FET_ALL_OFFSET_DB
+                thr_db + FET_ALL_OFFSET_DB
             } else {
-                self.threshold_db
+                thr_db
             };
             let over = lin_to_db(self.env.max(1e-9)) - eff_threshold;
             let ratio = match def.ratio_mode {
-                RatioMode::Knob | RatioMode::Stepped => self.ratio,
+                RatioMode::Knob | RatioMode::Stepped => self.ratio_s.tick(),
                 RatioMode::Rising { base, top } => {
                     base + (top - base) * (over / OPTO_PROGRAM_RANGE_DB).clamp(0.0, 1.0)
                 }
