@@ -7,6 +7,12 @@ ADR 031）已實作（2026-07-27）；Phase 03（PRD 025 / ADR 032）已實作�
 `mxr-dist`（PRD 028）、
 `rat`（PRD 029）、`diode-clipper`（PRD 030）、`king-of-tone`（PRD 031）**六顆全數落地**，
 drive 家族 15 → **21 顆**。
+**Phase 05（fuzz / 電晶體 / booster）已完成（2026-07-29）**：新模組
+`blocks::transistor`（**非 WDF**——單端口非線性才是 root，多端口要節點求解，見
+**ADR 035**）、`big-muff`（PRD 032，兩級回授二極體 + Phase 02 的 Muff tone stack）、
+`rangemaster`（PRD 033，三節點 Ebers–Moll 鍺電晶體）、`fuzz-face` 加
+Germanium/Silicon 型號選擇（PRD 034，維持 behavioral——**NDK 正式列未來研究**，
+ADR 035 §4）。drive 家族 21 → **23 顆**。
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -27,16 +33,19 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | 06 Waveshaper + ADAA | ✅ **已實作** | PRD 024 / **ADR 031**；`blocks::waveshaper`（一/二階 ADAA + 12 曲線）；**全部 12 顆 memoryless drive 抗鋸齒**（地板 −29 → −38…−87 dB）；新踏板 `waveshaper` |
 > | 03 WDF adaptor + R-Type | ✅ **已實作** | PRD 025 / **ADR 032**；`blocks::wdf` 拆五檔（one-port／adaptor／rtype／diode／omega）；擁有式泛型樹；**散射矩陣執行期由 netlist 數值構造**；op-amp 有限增益；`screamer`/`sd1` 等價重寫（對改寫前 ~1e-8） |
 > | 04 op-amp overdrive 家族 | ✅ **已實作**（6/6） | PRD 026 / **ADR 033**：`ts-wdf`（完整 TS 削波級 + 可選二極體 UX）；op-amp 參數改採 datasheet、二極體選單帶 `(Is, n)`；新增離線 `assert_no_alloc` 閘門。PRD 027 / **ADR 034**：`zendrive`（**與 TS 共用 junction**，提到框架層 `NON_INVERTING_PORTS`）；削波器（1N4148+2N7002 疊層）自行擬合，並**更正計畫對 BYOD 擬合值的判讀**。PRD 028：`mxr-dist`（**輸出端並聯削波**，框架新增 `NON_INVERTING_OUT_PORTS` 佈局；741 op-amp）。PRD 029：`rat`（迴路增益 < 1，Filter 反向）。PRD 030：`diode-clipper`（**平台件**——一顆二極體四種接法，新增 `Ctl::Mode`）。PRD 031：`king-of-tone`（**兩級兩 root**，柔性回授削波）。drive 家族 15 → **21 顆** |
-> | 05、07–08 | 待排 | — |
+> | 05 fuzz / 電晶體 / booster | ✅ **已實作**（3/3） | PRD 032–034 / **ADR 035**：新模組 `blocks::transistor`（**非 WDF**——單端口非線性才是 root，多端口要節點求解）。PRD 032：`big-muff`（兩級固定增益 CE + 回授二極體，標量阻尼 Newton；**修正**回授電流注入用交流戴維南電阻，每級差 6.5 倍增益；第一顆真正用上 Phase 02 的 Muff tone stack）。PRD 033：`rangemaster`（**三節點 Ebers–Moll** 鍺 PNP，工作點在 `prepare` 解一次；**BYOD 版不可當參考**——`*1e16` 是繪圖殘留、對 PNP 餵 NPN 方程）。PRD 034：`fuzz-face` 加**Germanium/Silicon** 型號選擇（維持 behavioral，**NDK 正式列未來研究**）。drive 家族 21 → **23 顆** |
+> | 07–08 | 待排 | — |
 >
-> 四個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
+> 五個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
 > 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
 > 形式由「手推封閉式 + 三階直接式 IIR」改為「netlist → 狀態空間」、六個機型只交付
 > 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle；06 是二階
 > ADAA 自行從定義推導、dry-sum 補償實測後**完全不需要**（ADAA 在 4× 率上）、改造
 > 範圍由 8 顆擴大到全部 12 顆 memoryless 踏板；**03 是把「R-Solver 符號 codegen」
 > 這個硬前置與「數值構造」這個後備對調**（連帶 `tools/wdf_codegen/` 未產出），
-> 理由與驗證管道見 ADR 032。
+> 理由與驗證管道見 ADR 032；05 是 ADR 編號（暫定 032 → 實為 **035**）、新模組不進
+> `blocks::wdf`、Rangemaster 不是「標量」而是三節點、參考實作的兩個數值問題，以及
+> **成本高於預期**（`rangemaster` 4.55× screamer，家族最貴）。
 
 ---
 
@@ -159,13 +168,13 @@ lion-heart 應用碼是 **MIT OR Apache-2.0（寬鬆雙授權）**（見 `Cargo.
 > （不在「別人設計好的名踏板」目標內），且其電路設計本體出自 BYOD 專案，「元件值
 > ＝公開事實」的論據對它們最弱。真想要再另議。
 
-### 5b. Fuzz / 電晶體 / booster（Phase 05）
+### 5b. Fuzz / 電晶體 / booster（Phase 05，**已完成 2026-07-29**）
 
-| 踏板 | 原型 | BYOD 來源 | 建模技術（v2 查核後） |
+| 踏板 | 原型 | BYOD 來源 | 建模技術（落地後） |
 |---|---|---|---|
-| Big Muff | EHX Big Muff Pi | `drive/big_muff`、`drive/muff_clipper` | **非 WDF**：固定增益 CE 電晶體級 + 回授二極體 + C12，逐 sample 標量 Newton——與 lion-heart `sd1` 的回授二極體 root 同類機制（見 Phase 05） |
-| Fuzz Face | Dallas Arbiter | `drive/fuzz_machine`（`FuzzFaceNDK`） | NDK（節點 DK 法）——**BYOD 的 NDK 碼由私有工具生成，無公開產生器**；lion-heart 已有 behavioral `fuzz-face`，本計畫維持之（見 Phase 05） |
-| Rangemaster | Dallas Rangemaster | `drive/RangeBooster.cpp` | 完整 **Ebers-Moll** BJT 標量 Newton（真正需要「電晶體 root」的一顆） |
+| Big Muff | EHX Big Muff Pi | `drive/big_muff`、`drive/muff_clipper` | ✅ `big-muff`（PRD 032）。**非 WDF**：固定增益 CE 級 + 回授二極體 + C12，標量阻尼 Newton（`blocks::transistor::ShuntFeedbackStage`）——與 `sd1` 同機制類。**修正**：回授電流注入用**交流**戴維南電阻 `R19‖R20`，不是 BYOD 的直流值 `R20`（每級差 6.5 倍增益，ADR 035 §3.1） |
+| Fuzz Face | Dallas Arbiter | `drive/fuzz_machine`（`FuzzFaceNDK`） | ✅ 維持 behavioral，加 **Germanium/Silicon 型號選擇**（PRD 034）。NDK 碼由私有工具生成、無公開產生器 → **正式列未來研究**（ADR 035 §4） |
+| Rangemaster | Dallas Rangemaster | `drive/RangeBooster.cpp` | ✅ `rangemaster`（PRD 033）。**三節點** Ebers-Moll（雙極電晶體是雙端口非線性，不可能是 WDF root，也不是標量）。**BYOD 版不可當參考**：`*1e16` 縮放是繪圖殘留、對 PNP 餵 NPN 方程（ADR 035 §3.2）；鍺參數自訂 `Is=1e-7 / βF=100 / βR=2` |
 | Bass Face | （Fuzz Face 低音版） | `drive/BassFace.cpp` | BYOD 原創變體——**不列主線**（同 5a 排除原則） |
 
 ### 5c. Memoryless waveshaper（Phase 06）
