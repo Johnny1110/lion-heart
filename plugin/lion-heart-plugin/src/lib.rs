@@ -80,20 +80,11 @@ impl Default for LionHeartPlugin {
     fn default() -> Self {
         let (nam_amp, nam_handle) = NamAmp::new();
         let (cab, cab_handle) = CabIr::new();
-        let effects: Vec<Box<dyn Effect>> = vec![
-            Box::new(NoiseGate::new()),
-            Box::new(Filter::new()),
-            Box::new(Compressor::new()),
-            Box::new(Drive::new()),
-            Box::new(nam_amp),
-            Box::new(PowerAmp::new()),
-            Box::new(Eq::new()),
-            Box::new(Modulation::new()),
-            Box::new(Delay::new()),
-            Box::new(Reverb::new()),
-            Box::new(cab),
-            Box::new(Limiter::new()),
-        ];
+        let mut effects = lh_dsp::default_dsp_effects();
+        // Insert NAM after Drive (index 4) and Cab after Reverb (index 9,
+        // which becomes 10 after the NAM insert).
+        effects.insert(4, Box::new(nam_amp));
+        effects.insert(10, Box::new(cab));
         let (chain, handle) = build_chain(effects);
         let params = Arc::new(LionParams::from_families(&handle.families()));
         let last_float = params.floats.iter().map(|sp| sp.param.value()).collect();

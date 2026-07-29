@@ -94,3 +94,25 @@ pub trait Effect: Send {
         0.0
     }
 }
+
+/// The 10 standard DSP effects that form the default board's non-asset slots,
+/// in chain order: gate → filter → compressor → drive → power amp → EQ →
+/// modulation → delay → reverb → limiter. NAM (amp capture) and Cab IR are
+/// **not** included — they require asset handles the caller must extract.
+///
+/// Both the plugin and the app call this so the effect list cannot drift
+/// between them.
+pub fn default_dsp_effects() -> Vec<Box<dyn Effect>> {
+    vec![
+        Box::new(dynamics::NoiseGate::new()),
+        Box::new(filter::Filter::new()),
+        Box::new(dynamics::Compressor::new()),
+        Box::new(drive::Drive::new()),
+        Box::new(power::PowerAmp::new()),
+        Box::new(eq::Eq::new()),
+        Box::new(modulation::Modulation::new()),
+        Box::new(time::Delay::new()),
+        Box::new(time::Reverb::new()),
+        Box::new(dynamics::Limiter::new()),
+    ]
+}
