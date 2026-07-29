@@ -1197,7 +1197,7 @@ mod tests {
 
     #[test]
     fn survives_all_rates_and_block_sizes() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             for (mode, _) in pedals() {
                 let mut m = Modulation::new();
                 m.prepare(sr);
@@ -1213,5 +1213,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chorus_detunes_the_signal() {
+        // A chorus at full depth/wet must produce energy at frequencies
+        // other than the input — the detuned copy spreads the spectrum.
+        let mut m = prepared(CHORUS);
+        set_by(&mut m, "rate", 0.5);
+        set_by(&mut m, "depth", 1.0);
+        set_by(&mut m, "mix", 1.0);
+        let x = sine(SR, 220.0, SR as usize);
+        let (l, _) = process_stereo_in_blocks(&mut m, &x, 64);
+        // The dry input has all energy at 220 Hz. The chorus output must
+        // have significant energy elsewhere (detuning sidebands).
+        let dry_rms = rms(&x[SR as usize / 4..]);
+        let wet_rms = rms(&l[SR as usize / 4..]);
+        assert!(wet_rms > 0.1, "chorus must pass signal");
+        // The waveform must differ from the dry — not just a gain change.
+        let max_diff = x[SR as usize / 4..]
+            .iter()
+            .zip(&l[SR as usize / 4..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 0.05,
+            "chorus must alter the waveform, not just gain"
+        );
+    }
+
+    #[test]
+    fn flanger_feedback_colors_the_signal() {
+        // High feedback on a flanger creates resonant comb peaks that
+        // are audibly different from the no-feedback case.
+        let x = sine(SR, 220.0, SR as usize);
+        let no_fb = {
+            let mut m = prepared(FLANGER);
+            set_by(&mut m, "rate", 0.5);
+            set_by(&mut m, "depth", 0.8);
+            set_by(&mut m, "mix", 1.0);
+            set_by(&mut m, "feedback", 0.0);
+            process_stereo_in_blocks(&mut m, &x, 64).0
+        };
+        let high_fb = {
+            let mut m = prepared(FLANGER);
+            set_by(&mut m, "rate", 0.5);
+            set_by(&mut m, "depth", 0.8);
+            set_by(&mut m, "mix", 1.0);
+            set_by(&mut m, "feedback", 0.9);
+            process_stereo_in_blocks(&mut m, &x, 64).0
+        };
+        let diff = no_fb
+            .iter()
+            .zip(&high_fb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff > 0.1,
+            "feedback must color the flanger: max diff {diff}"
+        );
+    }
+
+    #[test]
+    fn phaser_notches_differ_from_flanger() {
+        // A phaser uses allpass cascades; a flanger uses a delay comb.
+        // Same rate/depth/mix must produce audibly different coloration.
+        let x = sine(SR, 330.0, SR as usize);
+        let render = |mode: usize| {
+            let mut m = prepared(mode);
+            set_by(&mut m, "rate", 1.0);
+            set_by(&mut m, "depth", 0.8);
+            set_by(&mut m, "mix", 1.0);
+            set_by(&mut m, "feedback", 0.3);
+            process_stereo_in_blocks(&mut m, &x, 64).0
+        };
+        let phaser = render(PHASER);
+        let flanger = render(FLANGER);
+        let diff = phaser
+            .iter()
+            .zip(&flanger)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            diff > 0.05,
+            "phaser and flanger must sound different: max diff {diff}"
+        );
     }
 }

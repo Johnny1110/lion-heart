@@ -614,7 +614,7 @@ mod tests {
     /// A circuit's response must not depend on how finely it is sampled.
     #[test]
     fn the_response_holds_across_sample_rates() {
-        for base in [44_100.0f32, 48_000.0, 96_000.0] {
+        for base in [44_100.0f32, 48_000.0, 96_000.0, 192_000.0] {
             let os = 4.0 * base;
             let mut p = KingOfTone::new();
             p.prepare(base, os);

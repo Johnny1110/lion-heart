@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn survives_all_rates() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             let amp = 10f32.powf(-18.0 / 20.0);
             let x: Vec<f32> = sine(sr, 1_000.0, sr as usize * 3)
                 .iter()

@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn detects_open_strings_within_two_cents() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             for (freq, name, octave) in OPEN_STRINGS {
                 let mut tuner = Tuner::new(sr);
                 feed_sine(&mut tuner, sr as f32, freq, 0.3, 0.2);

@@ -845,7 +845,7 @@ mod tests {
 
     #[test]
     fn survives_all_rates_and_block_sizes() {
-        for sr in [44_100u32, 48_000, 96_000] {
+        for sr in [44_100u32, 48_000, 96_000, 192_000] {
             for voice in 0..VOICE_COUNT {
                 let mut c = Compressor::new();
                 c.prepare(sr);
