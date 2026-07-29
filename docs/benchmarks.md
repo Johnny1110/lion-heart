@@ -7,6 +7,56 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-29 (Tone Revolution phase 08: `mane`, the house pedal) — Linux dev container (relative)
+
+The self-designed pedal (PRD 036) and, more usefully, an **attribution**: the
+family now has four pedals on the same op-amp junction with two different roots,
+so the table can say what each layer costs rather than just what the pedal costs.
+
+Calibration this run: `drive_screamer` reads **~31.5 µs** — the low end of this
+container's range (~31.4 µs in the `zendrive` session, ~42.1 µs in the `rat`
+session, ~35.9 µs in the phase-05 session). Divide through it.
+
+| Bench                                   | Median    | ÷ screamer | What it isolates                                  |
+| --------------------------------------- | --------- | ---------- | ------------------------------------------------- |
+| `drive_screamer_4x_oversampled`         | ~31.5 µs  | 1.00       | calibration: small tree, omega root               |
+| `drive_red-charlie_4x_oversampled`      | ~31.5 µs  | 1.00       | memoryless clipper **+ a JCM800 tone stack**      |
+| `drive_zendrive_4x_oversampled`         | ~41.0 µs  | 1.30       | **R-type junction** + omega root                  |
+| `drive_ts-wdf_4x_oversampled`           | ~42.2 µs  | 1.34       | same junction, same root, more parts              |
+| `drive_king-of-tone_4x_oversampled`     | ~46.8 µs  | 1.49       | two junctions, two omega roots                    |
+| `drive_sd1_4x_oversampled`              | ~68.0 µs  | 2.16       | **simple** tree + **asymmetric Newton** root      |
+| **`drive_mane_4x_oversampled`**         | **~77.9 µs** | **2.47** | R-type junction + asymmetric Newton root + stack  |
+| `drive_big-muff_4x_oversampled`         | ~86.9 µs  | 2.76       | two scalar Newton solves per sample               |
+| `drive_rangemaster_4x_oversampled`      | ~165.6 µs | 5.26       | three-node Ebers–Moll (family's most expensive)   |
+
+**The reading.** `mane` costs 2.47× the calibration pedal, and the expensive part
+is neither of the two things one would guess:
+
+- **Not the R-type junction.** `zendrive` and `ts-wdf` run the *same* junction —
+  same four ports, same op-amp folded in, same numerically-built scattering
+  matrix — for 1.30×. The matrix is rebuilt at knob rate, not per sample
+  (ADR 032), so per sample it is one 4×4 matrix–vector product.
+- **Not the tone stack.** `red-charlie` carries a full JCM800 passive network and
+  reads the same as `screamer`; the stack runs a ≤4-state space at the *base*
+  rate, so it is a rounding error next to anything at 4×.
+- **It is the root.** `sd1` has a much simpler tree than `ts-wdf` and still costs
+  1.6× more, and the only difference is that its `AsymDiode` root **iterates**
+  where a `DiodePair` evaluates PRD 022's Wright-omega closed form. That closed
+  form covers the *symmetric* `sinh` pair only; the asymmetric case has none
+  today, and both `sd1` and `mane` pay for it.
+
+So "find a closed form for the asymmetric root" is now a priced work item —
+worth roughly 35 µs a block on two pedals — rather than a vague wish. Not a
+phase-08 job.
+
+`mane` at 77.9 µs is **5.8 %** of the 1,333 µs deadline (`rangemaster` is 12 %).
+
+Alias floor, same run: `mane` **−45.05 dB**, second only to `ts-wdf` (−46.1) among
+the solved-circuit pedals and far clear of `big-muff` (−34.4) and `rangemaster`
+(−24.1). The 47 pF across the feedback resistor does that work. ADAA does not
+apply to a solved circuit (PRD 024 assumes an explicit curve), so 4× oversampling
+is the only defence and the loop's own lowpass is what makes it enough.
+
 ## 2026-07-29 (Tone Revolution phase 05: `big-muff`, `rangemaster`) — Linux dev container (relative)
 
 The transistor pedals (PRD 032 / 033, ADR 035). Both solve a circuit by Newton

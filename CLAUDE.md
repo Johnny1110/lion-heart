@@ -142,11 +142,49 @@ revised order:
   family (~4.6× `screamer`, ~12 % of the deadline); it converges in 2 Newton
   steps, so that is the price of the device model, not slack.
 
+- **08** self-R&D platform (PRD 035–036 / **ADR 036**), landed 2026-07-29 — the
+  plan's closing phase, and **the one whose plan drifted furthest**: it was
+  written before phase 03, and phase 03 replaced its foundation. Both of its
+  toolchains are void — §2.1's R-Solver scattering-matrix codegen has **nothing
+  to generate** (ADR 032 made the matrix a run-time numerical construction from
+  a junction netlist that *is* Rust, so `tools/wdf_codegen/` and
+  `tools/netlists/` do not and will not exist), and §2.2's SPICE flow needed
+  ngspice, which is absent and which phase 02 had already replaced with its own
+  nodal oracle. What the platform actually lacked was a way to know a tree is
+  right, so the phase delivers **a second solver**: `testutil::netlist`, an
+  independent modified-nodal-analysis reference sharing no code, formula or
+  constant with `blocks::wdf`. Both discretise capacitors trapezoidally, so they
+  are two views of *one* discrete system and the residual is attributable —
+  series/parallel tree 2.5e-7 V, **R-type junction 3.2e-5 relative** (that is
+  `f32` in a scattering solve conditioned at a few hundred, and it is the floor
+  for any comparison), and **the closed-form root's error is 1400× the tree's**,
+  pinned as its own test. Alongside it: `testutil::whitebox` (the discrimination
+  kit — `memory` reads 3.4e-6 for a curve and 1.52 for a circuit),
+  `tests/whitebox.rs`, `docs/tone_revolution/cookbook.md`, and
+  `tools/fit_device.py` (device-level `(Is, n)` fitting, no simulator). The
+  example pedal is **`mane`** (PRD 036), specified by the user as *clipping
+  **and** voicing*: Focus sweeps the gain leg's capacitor **inside** the feedback
+  loop (it decides which frequencies break up — the same low E goes from 0.275
+  THD to 0.004, 70×), Bass/Mid/Treble run the phase-02 passive JCM800 network
+  **after** it. Hand-solved AC analysis to **0.22 %**, and **no new junction, no
+  new adaptor, no new root** — which is the phase's actual claim. ADR 036 §3 adds
+  one policy: datasheet is the source for op-amp parameters, but **numerical
+  conditioning is a constraint** — a JFET's 1e12 Ω `Ri` is indistinguishable from
+  1e9 Ω in this junction and 1e12 wrecks the `f32` solve. **Drive family is
+  now 24.** Cost note: `mane` is 2.47× `screamer`, and the benchmark attributes
+  it — not the R-type junction (1.30×) and not the tone stack (free), but the
+  **asymmetric Newton root**, which has no closed form where the symmetric pair
+  has PRD 022's. That is now a priced work item, not a wish.
+
 The full phase map and each phase's acceptance criteria live in the docs linked
-above. Two plan docs carry correction boxes at the top: phase 04's still says the
-scattering matrix comes from **R-Solver** and asks for `tools/netlists/`
-(ADR 032 superseded both), and phase 05's ADR number, module placement,
-"scalar" Newton claim and cost estimate were all revised on landing (ADR 035).
+above. Three plan docs carry correction boxes at the top: phase 04's still says
+the scattering matrix comes from **R-Solver** and asks for `tools/netlists/`
+(ADR 032 superseded both), phase 05's ADR number, module placement, "scalar"
+Newton claim and cost estimate were all revised on landing (ADR 035), and
+phase 08's two toolchains, its optional tweakable-component mode and its
+ZenDrive re-fit acceptance item were all dropped (ADR 036).
+
+**Only phase 07 (neural / tube, optional) is left unscheduled.**
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`
@@ -156,6 +194,13 @@ since ADR 032 they are derived numerically from our own junction netlist at run
 time (the plan's original "regenerate with R-Solver" route was dropped; the
 reasoning is in that ADR). Formalized into the main sequence these are
 **PRD 022+ / ADR 030+**.
+
+### Adding a pedal
+
+`docs/tone_revolution/cookbook.md` is the step-by-step (zh-TW): which solver a
+circuit belongs to, where component parameters come from, the three verification
+layers, and the append-only registry rules. `crates/lh-dsp/src/drive/mane.rs` is
+the worked example that follows it end to end.
 
 ### Operational notes
 

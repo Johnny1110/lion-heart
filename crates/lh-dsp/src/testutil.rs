@@ -1,5 +1,20 @@
 //! Offline render harness: run effects without any audio device, in tests and
 //! benches, exactly as they run on the audio thread.
+//!
+//! Two submodules extend that from "run an effect" to "check a circuit"
+//! (PRD 035, the phase-08 R&D platform):
+//!
+//! - [`netlist`] — an independent modified-nodal-analysis solver, the golden
+//!   reference a WDF tree gets compared against.
+//! - [`whitebox`] — the measurements that tell a solved circuit from a static
+//!   curve.
+//!
+//! Both live here rather than in `tests/` so that a pedal's own unit tests can
+//! reach them, which is the whole point: building a circuit and checking a
+//! circuit should be the same day's work.
+
+pub mod netlist;
+pub mod whitebox;
 
 use crate::Effect;
 

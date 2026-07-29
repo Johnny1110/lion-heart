@@ -41,6 +41,7 @@ mod evva;
 mod fuzz_face;
 mod jan_ray;
 mod king_of_tone;
+mod mane;
 mod monster5150;
 mod mxr_dist;
 mod overdrive;
@@ -104,10 +105,11 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &king_of_tone::DESC,
         &big_muff::DESC,
         &rangemaster::DESC,
+        &mane::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 23;
+pub const MODEL_COUNT: usize = 24;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -263,6 +265,21 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &rangemaster::DESC,
         controls: &[Ctl::Drive, Ctl::Trim, Ctl::Level],
         build: || Box::new(rangemaster::Rangemaster::new()),
+    },
+    ModelDef {
+        desc: &mane::DESC,
+        // Focus is a `Trim`: continuous, but it reaches a capacitance rather
+        // than the sample path, so the circuit glides it at its own rebuild
+        // rate. Bass/Mid/Treble go to the passive stack via `eq`.
+        controls: &[
+            Ctl::Drive,
+            Ctl::Trim,
+            Ctl::Low,
+            Ctl::Mid,
+            Ctl::High,
+            Ctl::Level,
+        ],
+        build: || Box::new(mane::Mane::new()),
     },
 ];
 
@@ -743,6 +760,7 @@ mod tests {
             ("king-of-tone", -30.0),
             ("big-muff", -30.0),
             ("rangemaster", -20.0),
+            ("mane", -40.0),
         ];
         for (i, (key, bound)) in bounds.iter().enumerate() {
             assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");

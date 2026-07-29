@@ -1,5 +1,41 @@
 # Phase 08 — 自研平台工具鏈：從電路到白箱踏板
 
+> **落地修正框（2026-07-29）。** 本 Phase 已實作，但本文是在 **Phase 03 之前**
+> 寫的，而 Phase 03 換掉了它的地基。與本文出入甚大，以
+> **ADR 036 + PRD 035/036** 為準：
+>
+> 1. **§2.1 的 codegen 整節作廢——無物可產。** 本文要求建 `tools/wdf_codegen/`
+>    跑 **R-Solver** 產生符號散射矩陣、netlist 存 `tools/netlists/`。**ADR 032**
+>    把「符號 codegen（硬前置）」與「執行期數值構造（後備）」對調了：矩陣現在由
+>    junction 自己的 netlist 在 `calc_impedance()` 裡數值解出來，而那個 netlist
+>    就是 Rust（`JEl` / `Junction`）。沒有中間產物，也就沒有 codegen 步驟。
+>    **`tools/wdf_codegen/` 與 `tools/netlists/` 都不存在，也不會存在。**
+>    （本文 §6 自己把這列為風險並指定「後備＝數值 S 構造」——後備成了主線。）
+> 2. **§2.2 的 SPICE 流程改成器件級擬合。** 本文要 LTSpice/ngspice 原理圖 + 暫態
+>    模擬 + `sim/<pedal>/fit.py`。這個環境沒有 ngspice，而 Phase 02 早已把它的
+>    ngspice fixtures 換成本專案自己的節點分析 oracle。實作改為
+>    **`tools/fit_device.py`**（numpy/scipy，無模擬器）：擬一條指數 I–V 本來就
+>    不需要模擬器。電路級的對照由第 3 點做得更好。**`sim/` 不存在。**
+> 3. **§2.3 的 harness 是本 Phase 真正的主體**，而且比本文設想的更進一步：
+>    不是「高倍過取樣的數值積分當 golden」，而是
+>    **`lh_dsp::testutil::netlist`——一個獨立的修正節點分析求解器**，與
+>    `blocks::wdf` 不共用任何程式碼、公式或常數。兩邊用**同一種梯形離散化**，
+>    所以是同一個離散系統的兩種寫法，殘差因此可歸因（PRD 035 §3.1）。
+>    驗收對象是 **R-type junction**——框架裡唯一沒有封閉式可核對的部分。
+> 4. **§2.5 的 tweakable component 模式沒做**（本文標為選配）。`diode-clipper`
+>    （PRD 030）已經是這個想法的踏板版本；通用版需要 GUI 管線，價值與成本不符。
+>    食譜改為說明「怎麼把一個元件值變成一顆旋鈕」（`Ctl::Trim`）。
+> 5. **§4 的「對 ZenDrive 的 MOSFET 重跑擬合」不做。** **ADR 034** 已在 Phase 04
+>    處理完，而且更正了本文的判讀依據——BYOD 的 Zen 參數**不是**被它的 P1/P3
+>    接線 bug 污染（那是離線對獨立 LTspice 削波器擬的），重擬的真正理由是
+>    「擬合 `Is·sinh`、求值 `2·Is·sinh`」。重跑不會產生新資訊。
+> 6. **§2.6 的範例踏板是 `mane`**（PRD 036），規格由使用者定：**不只削波，還要
+>    音色調教**。Focus 掃增益腳的電容（**迴路內**，決定哪些頻率先破），
+>    Bass/Mid/Treble 走 Phase 02 的被動 JCM800 網路（**迴路後**）。
+>    **它沒有新增任何 junction、adaptor 或 root**——那正是平台可用的證明。
+> 7. **關聯 ADR 不是「沿用 ADR 031」**（本文標頭）。本 Phase 的 ADR 是 **036**；
+>    031 是 ADAA。
+
 命中目標：**#3（框架支撐我未來自研音色踏板）** · 計畫收官
 依賴：Phase 03（WDF 框架穩定）；與 Phase 04 交織（第一批踏板就用這條工具鏈產生
 散射矩陣，避免手抄）

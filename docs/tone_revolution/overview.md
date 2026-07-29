@@ -11,8 +11,14 @@ drive 家族 15 → **21 顆**。
 `blocks::transistor`（**非 WDF**——單端口非線性才是 root，多端口要節點求解，見
 **ADR 035**）、`big-muff`（PRD 032，兩級回授二極體 + Phase 02 的 Muff tone stack）、
 `rangemaster`（PRD 033，三節點 Ebers–Moll 鍺電晶體）、`fuzz-face` 加
-Germanium/Silicon 型號選擇（PRD 034，維持 behavioral——**NDK 正式列未來研究**，
+Germanium/Silicon 型號選擇（PRD 034，維持 behavioral——**NDK 正式列未來研究**,
 ADR 035 §4）。drive 家族 21 → **23 顆**。
+**Phase 08（自研平台）已完成（2026-07-29）**：`testutil::netlist`（獨立節點分析
+求解器，當 WDF 的 golden）+ `testutil::whitebox`（白箱判別套件）+
+`tests/whitebox.rs`（harness）+ `docs/tone_revolution/cookbook.md`（食譜）+
+`tools/fit_device.py`（器件擬合），以及自研範例踏板 **`mane`**（PRD 036）。
+**計畫的 codegen 與 SPICE 兩條工具鏈都作廢**，理由見 **ADR 036**。
+drive 家族 23 → **24 顆**。**八個 Phase 只剩 07（類神經/電子管，選配）。**
 日期：2026-07-24（初稿）／2026-07-27（v2 校訂：對照 BYOD/chowdsp_wdf 原始碼
 逐項查核技術主張，修正錯誤並補強風險；變更摘要見 §11）
 
@@ -34,9 +40,10 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > | 03 WDF adaptor + R-Type | ✅ **已實作** | PRD 025 / **ADR 032**；`blocks::wdf` 拆五檔（one-port／adaptor／rtype／diode／omega）；擁有式泛型樹；**散射矩陣執行期由 netlist 數值構造**；op-amp 有限增益；`screamer`/`sd1` 等價重寫（對改寫前 ~1e-8） |
 > | 04 op-amp overdrive 家族 | ✅ **已實作**（6/6） | PRD 026 / **ADR 033**：`ts-wdf`（完整 TS 削波級 + 可選二極體 UX）；op-amp 參數改採 datasheet、二極體選單帶 `(Is, n)`；新增離線 `assert_no_alloc` 閘門。PRD 027 / **ADR 034**：`zendrive`（**與 TS 共用 junction**，提到框架層 `NON_INVERTING_PORTS`）；削波器（1N4148+2N7002 疊層）自行擬合，並**更正計畫對 BYOD 擬合值的判讀**。PRD 028：`mxr-dist`（**輸出端並聯削波**，框架新增 `NON_INVERTING_OUT_PORTS` 佈局；741 op-amp）。PRD 029：`rat`（迴路增益 < 1，Filter 反向）。PRD 030：`diode-clipper`（**平台件**——一顆二極體四種接法，新增 `Ctl::Mode`）。PRD 031：`king-of-tone`（**兩級兩 root**，柔性回授削波）。drive 家族 15 → **21 顆** |
 > | 05 fuzz / 電晶體 / booster | ✅ **已實作**（3/3） | PRD 032–034 / **ADR 035**：新模組 `blocks::transistor`（**非 WDF**——單端口非線性才是 root，多端口要節點求解）。PRD 032：`big-muff`（兩級固定增益 CE + 回授二極體，標量阻尼 Newton；**修正**回授電流注入用交流戴維南電阻，每級差 6.5 倍增益；第一顆真正用上 Phase 02 的 Muff tone stack）。PRD 033：`rangemaster`（**三節點 Ebers–Moll** 鍺 PNP，工作點在 `prepare` 解一次；**BYOD 版不可當參考**——`*1e16` 是繪圖殘留、對 PNP 餵 NPN 方程）。PRD 034：`fuzz-face` 加**Germanium/Silicon** 型號選擇（維持 behavioral，**NDK 正式列未來研究**）。drive 家族 21 → **23 顆** |
-> | 07–08 | 待排 | — |
+> | 08 自研平台 | ✅ **已實作** | PRD 035 / **ADR 036**：**計畫 §2.1 的 R-Solver codegen 與 §2.2 的 SPICE 流程雙雙作廢**（ADR 032 已把矩陣改成執行期數值構造；ngspice 不存在且 Phase 02 早已改用自建 oracle）。實作的是 **`testutil::netlist`**——獨立的修正節點分析求解器，與 `blocks::wdf` 零共用，兩邊同一種梯形離散化所以殘差可歸因（串並聯樹 2.5e-7 V；**R-type junction 相對 3.2e-5，那是 `f32` 在條件數幾百的散射解裡的地板**；閉式 root 的誤差是樹的 **1400 倍**，單獨釘成一條測試）。加上 **`testutil::whitebox`** 判別套件（`memory` 對曲線 3.4e-6、對電路 1.52，四個數量級分離）、**食譜**、**`tools/fit_device.py`**。PRD 036：**`mane`**——使用者定的規格「不只削波，還要音色調教」，Focus 在**迴路內**掃增益腳電容（決定哪些頻率先破：同一個低音 E 的 THD 從 0.275 掉到 0.004，**70 倍**），Bass/Mid/Treble 在**迴路後**走 JCM800 被動網路；手解 AC 分析 **0.22 %**；**沒有新增任何 junction/adaptor/root**。drive 家族 23 → **24 顆** |
+> | 07 類神經 / 電子管 | 待排（選配） | — |
 >
-> 五個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
+> 六個 Phase 的實作落差都記在各自 `phase/NN-*.md` 頂端的方框裡：01 是自行擬合的
 > 四次猜測、精度定性修正、latency vs throughput、branchless 反而變慢；02 是引擎
 > 形式由「手推封閉式 + 三階直接式 IIR」改為「netlist → 狀態空間」、六個機型只交付
 > 三個（其餘無法佐證元件值）、ngspice fixtures 換成獨立節點分析 oracle；06 是二階
@@ -45,7 +52,10 @@ Jatin Chowdhury；`chowdsp_wdf` 正是 BYOD 的底層，也是 lion-heart `block
 > 這個硬前置與「數值構造」這個後備對調**（連帶 `tools/wdf_codegen/` 未產出），
 > 理由與驗證管道見 ADR 032；05 是 ADR 編號（暫定 032 → 實為 **035**）、新模組不進
 > `blocks::wdf`、Rangemaster 不是「標量」而是三節點、參考實作的兩個數值問題，以及
-> **成本高於預期**（`rangemaster` 4.55× screamer，家族最貴）。
+> **成本高於預期**（`rangemaster` 4.55× screamer，家族最貴）；**08 是落差最大的
+一個**——它寫在 Phase 03 之前，而 Phase 03 換掉了它的地基，所以 §2.1（codegen）
+與 §2.2（SPICE）整節作廢，§2.5（tweakable 模式）與 §4 的 ZenDrive 重擬合不做，
+主體變成「第二個獨立求解器」。
 
 ---
 
