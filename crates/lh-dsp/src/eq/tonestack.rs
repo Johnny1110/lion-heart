@@ -864,21 +864,28 @@ impl Stack {
     }
 
     pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        // Advance the tone smoothers across the block and rebuild once from
-        // where they land — the same block-rate contract `eq::chain` uses, and
-        // safe here because the network's state is physical (see the module
-        // docs).
-        for _ in 0..left.len() {
-            for s in &mut self.knobs {
-                s.tick();
+        // Sub-block coefficient rebuilds: the tone smoothers advance 64
+        // samples at a time and the state-space matrices are rebuilt from
+        // where they land, instead of jumping to the block endpoint. At
+        // 48 kHz / 64 samples that is a 750 Hz update rate — far above
+        // zipper noise, and a 16× improvement over the full-block path.
+        const EQ_REBUILD: usize = 64;
+        for (l_chunk, r_chunk) in left
+            .chunks_mut(EQ_REBUILD)
+            .zip(right.chunks_mut(EQ_REBUILD))
+        {
+            for _ in 0..l_chunk.len() {
+                for s in &mut self.knobs {
+                    s.tick();
+                }
             }
+            self.core.set_knobs([
+                self.knobs[0].current(),
+                self.knobs[1].current(),
+                self.knobs[2].current(),
+            ]);
+            self.core.process(l_chunk, r_chunk);
         }
-        self.core.set_knobs([
-            self.knobs[0].current(),
-            self.knobs[1].current(),
-            self.knobs[2].current(),
-        ]);
-        self.core.process(left, right);
         // Level is a plain gain, so it rides its smoother per sample — no
         // reason to make it step at the block boundary.
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {

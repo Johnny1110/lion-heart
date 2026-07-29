@@ -219,24 +219,33 @@ impl GlobalEq {
             return;
         }
 
-        self.rebuild_coeffs(left.len());
-
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let (dry_l, dry_r) = (*l, *r);
-            let (mut wl, mut wr) = (dry_l, dry_r);
-            for band in &mut self.bands {
-                if !band.engaged() {
-                    continue;
+        // Sub-block coefficient rebuilds: advance control smoothers 64
+        // samples at a time and rebuild from where they land, instead of
+        // jumping to the block endpoint. At 48 kHz / 64 samples that is a
+        // 750 Hz update rate — far above zipper noise.
+        const EQ_REBUILD: usize = 64;
+        for (l_chunk, r_chunk) in left
+            .chunks_mut(EQ_REBUILD)
+            .zip(right.chunks_mut(EQ_REBUILD))
+        {
+            self.rebuild_coeffs(l_chunk.len());
+            for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter_mut()) {
+                let (dry_l, dry_r) = (*l, *r);
+                let (mut wl, mut wr) = (dry_l, dry_r);
+                for band in &mut self.bands {
+                    if !band.engaged() {
+                        continue;
+                    }
+                    let w = band.wet.tick();
+                    let fl = band.filters[0].process_sample(wl);
+                    let fr = band.filters[1].process_sample(wr);
+                    wl += w * (fl - wl);
+                    wr += w * (fr - wr);
                 }
-                let w = band.wet.tick();
-                let fl = band.filters[0].process_sample(wl);
-                let fr = band.filters[1].process_sample(wr);
-                wl += w * (fl - wl);
-                wr += w * (fr - wr);
+                let m = self.master.tick();
+                *l = dry_l + m * (wl - dry_l);
+                *r = dry_r + m * (wr - dry_r);
             }
-            let m = self.master.tick();
-            *l = dry_l + m * (wl - dry_l);
-            *r = dry_r + m * (wr - dry_r);
         }
     }
 }

@@ -175,14 +175,20 @@ impl Tone {
     }
 
     pub fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        self.update_coeffs(left.len());
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let mut y = self.low[0].process_sample(*l);
-            y = self.mid[0].process_sample(y);
-            *l = self.high[0].process_sample(y);
-            let mut y = self.low[1].process_sample(*r);
-            y = self.mid[1].process_sample(y);
-            *r = self.high[1].process_sample(y);
+        const EQ_REBUILD: usize = 64;
+        for (l_chunk, r_chunk) in left
+            .chunks_mut(EQ_REBUILD)
+            .zip(right.chunks_mut(EQ_REBUILD))
+        {
+            self.update_coeffs(l_chunk.len());
+            for (l, r) in l_chunk.iter_mut().zip(r_chunk.iter_mut()) {
+                let mut y = self.low[0].process_sample(*l);
+                y = self.mid[0].process_sample(y);
+                *l = self.high[0].process_sample(y);
+                let mut y = self.low[1].process_sample(*r);
+                y = self.mid[1].process_sample(y);
+                *r = self.high[1].process_sample(y);
+            }
         }
     }
 }
