@@ -193,7 +193,8 @@ and its ZenDrive re-fit acceptance item were all dropped (ADR 036).
 
 **Only phase 07 (neural / tube, optional) is left unscheduled.**
 
-**Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
+**Licensing red line:** lion-heart is **MIT OR Apache-2.0** (including VST3
+builds — the VST3 SDK is now MIT-licensed as of SDK 3.8.x). **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`
 (MIT); take circuit topologies + component values + diode SPICE params as
 *facts*. **R-Type scattering matrices are never transcribed from anywhere** —
@@ -260,7 +261,7 @@ The GUI spike workspace has its own gates (run from `spikes/`):
 | `lh-midi`        | MIDI foot control: PC/CC parsing, mapping, midir input            | —             |
 | `lh-assets`      | IR WAV loading (decode, sinc-resample, normalize, build convolver), general WAV read/write (`wav`, PRD 014) + the `~/.lion-heart` disk layout shared by app & plugin | dsp           |
 | `app/lion-heart` | Standalone GUI application (iced)                                 | everything    |
-| `plugin/…`       | CLAP/VST3 wrapper via nih-plug (GPLv3 for VST3 builds)            | core→assets   |
+| `plugin/…`       | CLAP/VST3 wrapper via nih-plug (MIT/Apache-2.0)                   | core→assets   |
 
 GUI code is never imported by `lh-*` crates — the engine must build and test without any UI.
 

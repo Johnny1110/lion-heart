@@ -60,7 +60,7 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 | NAM inference         | [nam-rs](https://lib.rs/crates/nam-rs)                        | pure-Rust, RT-safe; fallback: FFI to NeuralAmpModelerCore (C++) |
 | IR convolution        | [fft-convolver](https://github.com/neodsp/fft-convolver)      | uniform-partitioned FFT, zero latency, RT-safe                  |
 | GUI                   | [iced](https://iced.rs)                                       | chosen over vizia by the M4 spike ([ADR 001](docs/adr/001-gui-framework.md)); `egui` allowed for internal dev tools |
-| Plugin export         | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (note: VST3 builds are GPLv3)                       |
+| Plugin export         | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (VST3 SDK is now MIT-licensed)                     |
 | MIDI                  | midir (CoreMIDI backend)                                      | foot controller: program change, CC, expression                 |
 
 ## Roadmap
@@ -99,7 +99,7 @@ crates/
 app/
   lion-heart   # the standalone GUI application
 plugin/
-  lion-heart-plugin  # CLAP/VST3 wrapper (nih-plug); VST3 builds are GPLv3
+  lion-heart-plugin  # CLAP/VST3 wrapper (nih-plug); MIT/Apache-2.0
 spikes/        # M4 GUI framework spike (separate workspace, excluded from CI)
 docs/
   white-paper.md   # the plan (zh-TW) — authoritative
@@ -189,7 +189,15 @@ Pick devices with `--input/--output` (index or name substring), e.g.
 
 ## License
 
-Application code: **MIT OR Apache-2.0** (dual). Future VST3-bundled builds will be distributed under **GPLv3** as required by the VST3 SDK licensing; the CLAP build and the standalone app are unaffected.
+All code: **MIT OR Apache-2.0** (dual) — including VST3 builds. The VST3 SDK is now [MIT-licensed](https://github.com/steinbergmedia/vst3sdk) as of SDK 3.8.x.
+
+<p align="center">
+  <img src="docs/assets/vst3_logo.jpg" alt="VST 3 Compatible" width="200">
+</p>
+
+> **VST 3 Compatible** — VST is a trademark of Steinberg Media Technologies GmbH,
+> used under the [VST3 SDK MIT license](https://github.com/steinbergmedia/vst3sdk).
+> See the [VST 3 Usage Guidelines](https://github.com/steinbergmedia/vst3sdk/blob/master/VST3_Usage_Guidelines.pdf) for trademark and logo usage rules.
 
 ## Acknowledgments
 
