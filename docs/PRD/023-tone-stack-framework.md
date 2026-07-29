@@ -1,11 +1,20 @@
 # PRD 023: 真實被動 tone stack 框架
 
-狀態：**已實作（2026-07-27）— 待使用者耳朵驗收**
+狀態：**已實作（2026-07-27）— 耳朵驗收後 makeup 重校（2026-07-29，ADR 037）**
 日期：2026-07-27
 里程碑：Tone Revolution · Phase 02（`docs/tone_revolution/phase/02-tonestack-framework.md`）
 關聯：PRD 011（`eq` 家族兩顆踏板）、ADR 003（drive model registry）、
 PRD 022 / Phase 01（同計畫的前一步，彼此獨立）
 新增 ADR：**030（tone stack 引擎）** — 引擎形式與遷移決策的來龍去脈在那裡
+
+> **更正（2026-07-29，ADR 037）**：§2 表格與 §4 測試表的 makeup 已重校。原
+> 「頻帶平均 = unity」校準（+7.38／+5.32／+6.13）把 noon 低頻 shelf 推到 unity
+> 之上，五顆遷移 drive 的 40–160 Hz 絕對電平比遷移前高 +4～5 dB——耳朵驗收
+> 以「低頻溢出」不通過。現行值依「noon 天花板 = unity」為 **+1.63／+0.98／
+> +4.05**；測試 `noon_sits_near_unity_with_the_makeup_applied` 改名
+> `noon_ceiling_sits_at_unity_with_the_makeup_applied`（斷言 noon 最大增益在
+> 0 dB ± 0.25），`modelled_pedals_sit_near_unity_at_default_knobs` 的 spread
+> 改按 voicing 群組斷言。量測與論證見 ADR 037。
 
 ## 1. 背景與決策
 

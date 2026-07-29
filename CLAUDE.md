@@ -67,7 +67,13 @@ revised order:
   netlist into a state space and Tustin-discretises it at block rate;
   `bassman`/`jcm800`/`big-muff` models; the five FMV-voiced drives migrated off
   the old additive 3-band (**voicing change**, character tests re-pinned); a
-  standalone `tonestack` pedal appended to the `eq` family.
+  standalone `tonestack` pedal appended to the `eq` family. **Makeup recalibrated
+  2026-07-29 (ADR 037)** after ear acceptance failed on LF overflow: band-average
+  unity had lifted the noon low shelf +4–5 dB *absolute* (measured against a
+  pre-02 build; the netlists were right, only the calibration point was wrong).
+  Makeup now pins the noon **ceiling** to unity (bassman +1.63 / jcm800 +0.98 /
+  big-muff +4.05), so noon sits ≤ 0 dB everywhere like the passive network
+  itself.
 - **06** Waveshaper + ADAA (PRD 024 / **ADR 031**): `blocks::waveshaper` gives
   first/second-order antiderivative anti-aliasing plus a 12-curve bank; **every
   memoryless clipper in the drive family** now runs through it (alias floor −29
@@ -177,12 +183,13 @@ revised order:
   has PRD 022's. That is now a priced work item, not a wish.
 
 The full phase map and each phase's acceptance criteria live in the docs linked
-above. Three plan docs carry correction boxes at the top: phase 04's still says
-the scattering matrix comes from **R-Solver** and asks for `tools/netlists/`
-(ADR 032 superseded both), phase 05's ADR number, module placement, "scalar"
-Newton claim and cost estimate were all revised on landing (ADR 035), and
-phase 08's two toolchains, its optional tweakable-component mode and its
-ZenDrive re-fit acceptance item were all dropped (ADR 036).
+above. Four plan docs carry correction boxes at the top: phase 02's makeup
+calibration was re-done after ear acceptance (ADR 037, see the 02 bullet),
+phase 04's still says the scattering matrix comes from **R-Solver** and asks
+for `tools/netlists/` (ADR 032 superseded both), phase 05's ADR number, module
+placement, "scalar" Newton claim and cost estimate were all revised on landing
+(ADR 035), and phase 08's two toolchains, its optional tweakable-component mode
+and its ZenDrive re-fit acceptance item were all dropped (ADR 036).
 
 **Only phase 07 (neural / tube, optional) is left unscheduled.**
 
