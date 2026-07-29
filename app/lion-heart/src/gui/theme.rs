@@ -136,6 +136,9 @@ const BIG_MUFF: Color = Color::from_rgb(0.72, 0.16, 0.20);
 /// The Rangemaster's brushed-gold hammertone box — the oldest circuit in the
 /// family gets the only metallic livery in it.
 const RANGEMASTER: Color = Color::from_rgb(0.78, 0.64, 0.34);
+/// The house pedal wears the house colours: a tawny lion's mane, the only one
+/// in the family that is not somebody else's enclosure.
+const MANE: Color = Color::from_rgb(0.85, 0.55, 0.22);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -220,6 +223,7 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "king-of-tone" => KING_OF_TONE,
             "big-muff" => BIG_MUFF,
             "rangemaster" => RANGEMASTER,
+            "mane" => MANE,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {
