@@ -130,6 +130,12 @@ const DIODE_CLIPPER: Color = Color::from_rgb(0.88, 0.90, 0.86);
 /// Regal purple for the King — the only violet-red in a family of greens, golds
 /// and one periwinkle, and a nod to the enclosure everyone waits two years for.
 const KING_OF_TONE: Color = Color::from_rgb(0.55, 0.35, 0.66);
+/// The Big Muff's black-and-red sunburst script, read as the deep crimson of a
+/// Ram's Head enclosure — the only true red in the family.
+const BIG_MUFF: Color = Color::from_rgb(0.72, 0.16, 0.20);
+/// The Rangemaster's brushed-gold hammertone box — the oldest circuit in the
+/// family gets the only metallic livery in it.
+const RANGEMASTER: Color = Color::from_rgb(0.78, 0.64, 0.34);
 
 // Delay voices: digital reads cold and clean, tape warm sepia, vintage a
 // dusty analog teal.
@@ -212,6 +218,8 @@ pub fn pedal_color(family_key: &str, pedal_key: &str) -> Color {
             "rat" => RAT,
             "diode-clipper" => DIODE_CLIPPER,
             "king-of-tone" => KING_OF_TONE,
+            "big-muff" => BIG_MUFF,
+            "rangemaster" => RANGEMASTER,
             _ => ACCENT, // classic wears the house amber
         },
         "filter" => match pedal_key {

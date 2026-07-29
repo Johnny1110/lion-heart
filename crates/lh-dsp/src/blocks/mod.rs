@@ -7,6 +7,7 @@ pub mod grain;
 pub mod oversample;
 pub mod smooth;
 pub mod swap;
+pub mod transistor;
 pub mod waveshaper;
 pub mod wdf;
 

@@ -33,6 +33,7 @@
 mod angry_charlie;
 mod angry_charlie_v2;
 mod bd2;
+mod big_muff;
 mod centaur;
 mod classic;
 mod diode_clipper;
@@ -43,6 +44,7 @@ mod king_of_tone;
 mod monster5150;
 mod mxr_dist;
 mod overdrive;
+mod rangemaster;
 mod rat;
 mod red_charlie;
 mod screamer;
@@ -100,10 +102,12 @@ pub static FAMILY: FamilyDesc = FamilyDesc {
         &rat::DESC,
         &diode_clipper::DESC,
         &king_of_tone::DESC,
+        &big_muff::DESC,
+        &rangemaster::DESC,
     ],
 };
 
-pub const MODEL_COUNT: usize = 21;
+pub const MODEL_COUNT: usize = 23;
 
 /// Which internal control a pedal's param position drives.
 #[derive(Clone, Copy)]
@@ -185,7 +189,7 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
     },
     ModelDef {
         desc: &fuzz_face::DESC,
-        controls: &[Ctl::Drive, Ctl::Level],
+        controls: &[Ctl::Drive, Ctl::Shape, Ctl::Level],
         build: || Box::new(fuzz_face::FuzzFace::new()),
     },
     ModelDef {
@@ -249,6 +253,16 @@ pub static MODELS: [ModelDef; MODEL_COUNT] = [
         desc: &king_of_tone::DESC,
         controls: &[Ctl::Drive, Ctl::Mode, Ctl::Tone, Ctl::Level],
         build: || Box::new(king_of_tone::KingOfTone::new()),
+    },
+    ModelDef {
+        desc: &big_muff::DESC,
+        controls: &[Ctl::Drive, Ctl::Tone, Ctl::Level],
+        build: || Box::new(big_muff::BigMuff::new()),
+    },
+    ModelDef {
+        desc: &rangemaster::DESC,
+        controls: &[Ctl::Drive, Ctl::Trim, Ctl::Level],
+        build: || Box::new(rangemaster::Rangemaster::new()),
     },
 ];
 
@@ -727,6 +741,8 @@ mod tests {
             ("rat", -26.0),
             ("diode-clipper", -32.0),
             ("king-of-tone", -30.0),
+            ("big-muff", -30.0),
+            ("rangemaster", -20.0),
         ];
         for (i, (key, bound)) in bounds.iter().enumerate() {
             assert_eq!(MODELS[i].desc.key, *key, "bounds must track the registry");
@@ -877,7 +893,7 @@ mod tests {
         assert_eq!(captions(6), ["Pre Gain", "Low", "Mid", "High", "Post Gain"]);
         assert_eq!(captions(7), ["Gain", "Bass", "Middle", "Treble", "Volume"]);
         assert_eq!(captions(8), ["Gain", "Bass", "Treble", "Volume"]);
-        assert_eq!(captions(9), ["Fuzz", "Volume"]);
+        assert_eq!(captions(9), ["Fuzz", "Type", "Volume"]);
         assert_eq!(captions(10), ["Drive", "Tone", "Level"]);
         assert_eq!(captions(11), ["Drive", "Tone", "Level"]);
         assert_eq!(captions(12), ["Drive", "Tone", "Level"]);
@@ -2085,6 +2101,76 @@ mod tests {
         assert!(
             fuzz_h2 > 5.0 * h2(0),
             "fuzz-face must be far more asymmetric than the symmetric ts9"
+        );
+    }
+
+    /// PRD 034: the Type selector picks a different *pedal*, not a tone tilt.
+    /// Silicon's matched, predictably-biased pair clips far more symmetrically
+    /// (measured: 0.039 second harmonic against germanium's 0.102) and carries
+    /// far more of the high odd harmonics that make a BC108 Fuzz Face harsh
+    /// where an NKT275 is woolly.
+    #[test]
+    fn fuzz_face_silicon_is_squarer_and_brighter_than_germanium() {
+        let ff = model_of("fuzz-face");
+        let x = guitar(220.0, SR as usize);
+        let spectrum = |voice: f32| -> (f64, f64) {
+            let mut d = prepared(ff);
+            set_pos(&mut d, 1, voice);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let f1 = tone_at(&y, 220.0);
+            (tone_at(&y, 440.0) / f1, tone_at(&y, 1_980.0) / f1)
+        };
+        let (ge_h2, ge_h9) = spectrum(0.0);
+        let (si_h2, si_h9) = spectrum(10.0);
+        assert!(
+            si_h2 < 0.6 * ge_h2,
+            "silicon must be markedly more symmetric: h2 {si_h2:.4} vs germanium {ge_h2:.4}"
+        );
+        assert!(
+            si_h9 > 2.0 * ge_h9,
+            "silicon must be markedly brighter: h9 {si_h9:.4} vs germanium {ge_h9:.4}"
+        );
+    }
+
+    /// The velcro splutter is *germanium's*: blocking distortion in a leaky,
+    /// 0.2 V junction. A silicon Fuzz Face sustains, which is the single most
+    /// audible difference between the two and the one this pins.
+    #[test]
+    fn only_the_germanium_fuzz_face_gates() {
+        let ff = model_of("fuzz-face");
+        let x = plucked(220.0, 0.25, SR as usize);
+        let tail_over_body = |voice: f32| -> f64 {
+            let mut d = prepared(ff);
+            set_pos(&mut d, 1, voice);
+            let y = process_in_blocks(&mut d, &x, 256);
+            let body = f64::from(rms(&y[3 * y.len() / 8..y.len() / 2]));
+            let tail = f64::from(rms(&y[7 * y.len() / 8..]));
+            tail / body.max(1e-9)
+        };
+        let ge = tail_over_body(0.0);
+        let si = tail_over_body(10.0);
+        assert!(
+            si > 20.0 * ge.max(1e-4),
+            "silicon must sustain where germanium gates: tail/body {si:.4} vs {ge:.4}"
+        );
+    }
+
+    /// Both voices are calibrated to the same loudness, so the selector is a
+    /// character control and never a volume jump mid-song.
+    #[test]
+    fn both_fuzz_face_voices_sit_at_the_same_level() {
+        let ff = model_of("fuzz-face");
+        let x = guitar(220.0, SR as usize);
+        let level = |voice: f32| -> f64 {
+            let mut d = prepared(ff);
+            set_pos(&mut d, 1, voice);
+            let y = process_in_blocks(&mut d, &x, 256);
+            20.0 * (f64::from(rms(&y[y.len() / 2..])) / f64::from(rms(&x[x.len() / 2..]))).log10()
+        };
+        let (ge, si) = (level(0.0), level(10.0));
+        assert!(
+            (ge - si).abs() < 1.5,
+            "the Type selector must not change loudness: germanium {ge:+.2} dB vs silicon {si:+.2} dB"
         );
     }
 
