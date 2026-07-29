@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["gui"]
+gui = ["dep:iced", "dep:realfft"]
+
 [dependencies]
 lh-core.workspace = true
 lh-dsp.workspace = true
@@ -15,7 +19,7 @@ lh-assets.workspace = true
 lh-io.workspace = true
 lh-midi.workspace = true
 rtrb.workspace = true
-iced.workspace = true
+iced = { workspace = true, optional = true }
 assert_no_alloc.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -23,7 +27,7 @@ ctrlc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Spectrum analyzer FFT (GUI thread only — never on the audio path).
-realfft.workspace = true
+realfft = { workspace = true, optional = true }
 # Song-player decode (loader thread only — never on the audio path).
 symphonia.workspace = true
 

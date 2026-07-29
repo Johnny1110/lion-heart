@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+#[cfg(feature = "gui")]
 mod gui;
 mod leveling;
 mod recorder;
@@ -23,7 +24,18 @@ static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        None => gui::run(cli.gui),
+        None => {
+            #[cfg(feature = "gui")]
+            {
+                gui::run(cli.gui)
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                eprintln!("GUI not compiled in. Build with --features gui or use a subcommand.");
+                eprintln!("Subcommands: devices, run, latency, jam, render, level");
+                std::process::exit(1);
+            }
+        }
         Some(Command::Devices) => commands::devices::run(),
         Some(Command::Run(args)) => commands::run::run(args),
         Some(Command::Latency(args)) => commands::latency::run(args),
