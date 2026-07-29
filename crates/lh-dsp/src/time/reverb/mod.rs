@@ -1962,4 +1962,27 @@ mod tests {
         );
         assert!(wobbly > 1e-2, "mod 1 must move the tail (diff {wobbly})");
     }
+
+    #[test]
+    fn wet_tap_is_stereo_decorrelated() {
+        // The FDN core is mono-fed (0.5*(L+R)), but L/R wet taps come from
+        // orthogonal Hadamard rows of the same lines. Even with an identical
+        // L/R impulse, the wet outputs must diverge — the reverb is not a
+        // mono collapse.
+        let mut r = prepared(voice_of("hall"));
+        set_by(&mut r, "mix", 1.0); // full wet
+        settle(&mut r, 0.1);
+        let (l, r_out) = impulse_response_stereo(&mut r, 1.0);
+        // After the initial transient, L and R must differ.
+        let skip = SR as usize / 20; // 50 ms
+        let max_diff = l[skip..]
+            .iter()
+            .zip(&r_out[skip..])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "wet L/R must be decorrelated (max diff {max_diff})"
+        );
+    }
 }
