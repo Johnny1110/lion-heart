@@ -1,12 +1,12 @@
 name: release
 
-# Pushing a tag like `v0.1.0` builds the macOS standalone binary and the
-# CLAP/VST3 bundles, then attaches them to a GitHub Release (as a draft, so
-# a human presses the final button).
+# Pushing a tag like `v0.1.0` builds and uploads release artifacts, then
+# attaches them to a GitHub Release (as a draft, so a human presses the final
+# button.
 #
-# Codesigning/notarization runs only when the Apple credentials exist as
-# repository secrets — see docs/release.md. Unsigned artifacts still work
-# via `xattr -dr com.apple.quarantine` (documented in the release notes).
+# macOS is signed/notarized when Apple credentials exist. Linux and Windows
+# jobs skip signing and only upload release artifacts. Unsigned macOS artifacts
+# still work via `xattr -dr com.apple.quarantine` (documented in the release notes).
 
 on:
   push:
@@ -44,6 +44,7 @@ jobs:
           mkdir -p dist
           tar -C target/release -czf "dist/lion-heart-${VERSION}-macos.tar.gz" lion-heart
           tar -C target/bundled -czf "dist/lion-heart-plugins-${VERSION}-macos.tar.gz" .
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS-macos
 
       - name: Draft GitHub release
         env:
@@ -53,3 +54,83 @@ jobs:
             --draft \
             --title "Lion-Heart ${GITHUB_REF_NAME}" \
             --notes "Standalone app + CLAP/VST3 bundles (macOS). Unsigned builds: run \`xattr -dr com.apple.quarantine <file>\` after unpacking. VST3 bundles are GPLv3 (see README §License)."
+
+  release-linux:
+    needs: [release-macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install ALSA headers and pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Build standalone (release)
+        run: cargo build --release -p lion-heart
+
+      - name: Bundle plugin (CLAP + VST3)
+        run: cargo xtask bundle lion-heart-plugin --release
+
+      - name: Package artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist/staging dist
+          cp target/release/lion-heart dist/staging/
+          cp README.md dist/staging/
+          if [ -f LICENSE ]; then
+            cp LICENSE dist/staging/
+          fi
+          cp -R target/bundled/Lion-Heart.clap dist/staging/
+          cp -R target/bundled/Lion-Heart.vst3 dist/staging/
+          tar -czf "dist/lion-heart-${VERSION}-linux.tar.gz" -C dist/staging .
+          sha256sum "dist/lion-heart-${VERSION}-linux.tar.gz" > dist/SHA256SUMS-linux
+
+      - name: Upload release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" dist/* \
+            --clobber
+
+  release-windows:
+    needs: [release-macos]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build standalone (release)
+        run: cargo build --release -p lion-heart
+
+      - name: Bundle plugin (CLAP + VST3)
+        id: bundle-plugin
+        continue-on-error: true
+        run: cargo xtask bundle lion-heart-plugin --release
+
+      - name: Package artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          mkdir -p dist/staging dist
+          cp target/release/lion-heart.exe dist/staging/
+          cp README.md dist/staging/
+          if [ -f LICENSE ]; then
+            cp LICENSE dist/staging/
+          fi
+          if [ -d target/bundled/Lion-Heart.clap ] && [ -d target/bundled/Lion-Heart.vst3 ]; then
+            cp -R target/bundled/Lion-Heart.clap dist/staging/
+            cp -R target/bundled/Lion-Heart.vst3 dist/staging/
+          else
+            echo "Plugin bundle artifacts not found on Windows runner; uploading standalone-only archive."
+          fi
+          tar -czf "dist/lion-heart-${VERSION}-windows.tar.gz" -C dist/staging .
+          sha256sum "dist/lion-heart-${VERSION}-windows.tar.gz" > dist/SHA256SUMS-windows
+
+      - name: Upload release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" dist/* \
+            --clobber
