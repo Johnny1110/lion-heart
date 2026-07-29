@@ -154,6 +154,7 @@ impl DuplexRunner {
             let mut scratch_l = vec![0.0f32; SCRATCH_FRAMES];
             let mut scratch_r = vec![0.0f32; SCRATCH_FRAMES];
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
+                lh_core::rt::flush_denormals_to_zero();
                 let t0 = Instant::now();
                 stats.out_callbacks.fetch_add(1, Ordering::Relaxed);
                 let frames = data.len() / out_channels;
