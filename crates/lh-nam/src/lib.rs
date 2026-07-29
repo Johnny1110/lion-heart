@@ -37,7 +37,7 @@ pub enum NamError {
 
 /// A loaded, runnable capture plus its calibration.
 pub struct NamAsset {
-    pub model: nam_rs::Model,
+    pub(crate) model: nam_rs::Model,
     /// Output scale folding the capture's loudness metadata onto
     /// [`NORMALIZE_TARGET_DB`]; 1.0 when the file carries no loudness.
     pub base_gain: f32,

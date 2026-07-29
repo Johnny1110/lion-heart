@@ -21,8 +21,8 @@ pub const CONV_BLOCK: usize = 128;
 
 #[derive(Debug, Error)]
 pub enum AssetError {
-    #[error("cannot read {path}: {source}")]
-    Wav { path: String, source: hound::Error },
+    #[error("cannot read {path}: {message}")]
+    Wav { path: String, message: String },
 
     #[error("{path} decodes to silence/empty audio")]
     Empty { path: String },
@@ -74,7 +74,7 @@ pub fn load_ir_pair(path: &Path, engine_rate: u32) -> Result<(IrPair, IrInfo), A
     let display = path.display().to_string();
     let mut reader = hound::WavReader::open(path).map_err(|source| AssetError::Wav {
         path: display.clone(),
-        source,
+        message: source.to_string(),
     })?;
     let spec = reader.spec();
 
@@ -96,7 +96,7 @@ pub fn load_ir_pair(path: &Path, engine_rate: u32) -> Result<(IrPair, IrInfo), A
     }
     .map_err(|source| AssetError::Wav {
         path: display.clone(),
-        source,
+        message: source.to_string(),
     })?;
 
     let source_samples = ir.len();
