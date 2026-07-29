@@ -1,10 +1,10 @@
 # Lion-Heart
 
-**An open-source guitar amp & multi-effects processor for macOS, written in Rust.**
+**An open-source guitar amp & multi-effects processor for desktop platforms, written in Rust.**
 
 Plug your guitar into an audio interface, shape your tone in software — noise gate to high-gain amp stack to ambient delays — and send it back out. Built for two jobs: recording guitars, and replacing the floor modeler on stage.
 
-> **Status: M7 — plugin & release (pre-alpha).** The full rig — gate →
+> **Status: M7 — plugin & release completed.** The full rig — gate →
 > compressor → drive → **NAM amp** → EQ → modulation → delay → **reverb
 > (FDN)** → **cab IR** → safety limiter — now runs a **stereo bus end to
 > end**: chorus/flanger/phaser spread wide (quadrature LFOs), tremolo
@@ -14,11 +14,11 @@ Plug your guitar into an audio interface, shape your tone in software — noise 
 > **CLAP/VST3 plugin** (nih-plug, passes the clap-validator conformance
 > suite) with every knob host-automatable, next to the standalone GUI with
 > **MIDI foot control**, live view, tuner and meters. A tagged `v*` push
-> drafts a GitHub release with signed/notarized artifacts when Apple
-> credentials are configured ([docs/release.md](docs/release.md)). The audio thread stays
-> allocation-free (enforced by `assert_no_alloc` in debug builds). Full
-> technical plan: [white paper](docs/white-paper.md) (Traditional Chinese /
-> 繁體中文).
+> opens a GitHub release and uploads platform artifacts ([docs/release.md](docs/release.md)):
+> signed/notarized on macOS when Apple credentials are configured, unsigned for
+> Linux and Windows. The audio thread stays allocation-free (enforced by
+> `assert_no_alloc` in debug builds). Full technical plan: [white paper](docs/white-paper.md)
+> (Traditional Chinese / 繁體中文).
 
 ## Why
 
@@ -45,7 +45,7 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 
 ## Architecture in five lines
 
-1. The real-time audio thread runs the DSP chain inside the CoreAudio (cpal) callback — it never allocates, locks, or blocks.
+1. The real-time audio thread runs the DSP chain inside the cpal callback — it never allocates, locks, or blocks.
 2. The UI and asset workers talk to it only through lock-free queues, triple buffers, and atomic pointer swaps.
 3. Heavy work (parsing `.nam`, building convolvers) happens on worker threads; finished objects are swapped in atomically and retired objects are dropped off-thread.
 4. Parameters are ID-addressed, normalized, and smoothed per-sample on the audio thread.
@@ -56,12 +56,12 @@ guitar ─▶ interface ─▶ [ gate → comp → drive → NAM amp → EQ → 
 | Area                  | Choice                                                        | Notes                                                          |
 | --------------------- | ------------------------------------------------------------- | -------------------------------------------------------------- |
 | Language              | Rust                                                          | see white paper §5.1 for the Rust-vs-C++ decision record        |
-| Audio I/O             | [cpal](https://github.com/RustAudio/cpal) (CoreAudio backend) | escape hatch: `coreaudio-rs` for macOS-specific control         |
+| Audio I/O             | [cpal](https://github.com/RustAudio/cpal) (cross-platform) | platform backends for desktop audio (ALSA/JACK/CoreAudio/WinMM via cpal) |
 | NAM inference         | [nam-rs](https://lib.rs/crates/nam-rs)                        | pure-Rust, RT-safe; fallback: FFI to NeuralAmpModelerCore (C++) |
 | IR convolution        | [fft-convolver](https://github.com/neodsp/fft-convolver)      | uniform-partitioned FFT, zero latency, RT-safe                  |
 | GUI                   | [iced](https://iced.rs)                                       | chosen over vizia by the M4 spike ([ADR 001](docs/adr/001-gui-framework.md)); `egui` allowed for internal dev tools |
 | Plugin export         | [nih-plug](https://github.com/robbert-vdh/nih-plug)           | CLAP + VST3 (note: VST3 builds are GPLv3)                       |
-| MIDI                  | midir (CoreMIDI backend)                                      | foot controller: program change, CC, expression                 |
+| MIDI                  | midir (CoreMIDI/CoreMIDI-like/WinMM/ALSA)                        | foot controller: program change, CC, expression                 |
 
 ## Roadmap
 
@@ -81,7 +81,6 @@ Milestones are **completion units, not dates** (this is a burst-driven side proj
 
 ## Non-goals (for now)
 
-- Windows / Linux at MVP (the design stays portable — cpal/iced/nam-rs are cross-platform — but ports come after M7)
 - AU and AAX plugin formats; mobile
 - Building our own capture-training UI (use the upstream NAM trainer)
 
@@ -108,18 +107,16 @@ docs/
 
 ## Documentation
 
-- [Installation guide](docs/install.md) — build & run on **macOS and Windows**, pick your interface, load a tone, install the plugin
+- [Installation guide](docs/install.md) — build & run on **macOS, Linux, and Windows**, pick your interface, load a tone, install the plugin
 - [White paper / 白皮書](docs/white-paper.md) — vision, requirements, architecture, tech choices, milestones (Traditional Chinese)
 - [CLAUDE.md](CLAUDE.md) — engineering conventions, including the non-negotiable real-time audio rules
 - `docs/adr/` — architecture decision records (created as decisions happen)
 
 ## Building & running
 
-> **New here?** The [installation guide](docs/install.md) walks through macOS and
-> Windows setup — installing Rust, building, choosing your interface, and loading
-> a tone — step by step. The quick reference below assumes you have Rust already.
+> **New here?** The [installation guide](docs/install.md) walks through macOS, Linux, and Windows setup — installing Rust, building, choosing your interface, and loading a tone — step by step. The quick reference below assumes you have Rust already.
 
-Requires stable Rust 1.85+ (macOS and Windows; Linux also builds, given `libasound2-dev` + `pkg-config`).
+Requires stable Rust 1.85+ (Linux/macOS/Windows; Linux requires `libasound2-dev` + `pkg-config`).
 
 The `Makefile` wraps the common flows — run `make` (or `make help`) for the list:
 
