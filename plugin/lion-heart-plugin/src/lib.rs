@@ -163,6 +163,13 @@ impl Plugin for LionHeartPlugin {
         let sr = buffer_config.sample_rate as u32;
         self.sample_rate.store(sr, Ordering::Relaxed);
         self.chain.prepare(sr);
+        // Sync initial bypass states: the change-detection loop in
+        // `process` only sends `SetActive` on *changes*, so slots that
+        // default to bypassed (filter, power) would stay active until the
+        // host toggles them. Push the defaults explicitly here.
+        for sb in &self.params.bypasses {
+            let _ = self.handle.set_active(sb.slot, sb.param.value());
+        }
         true
     }
 
@@ -176,6 +183,7 @@ impl Plugin for LionHeartPlugin {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        lh_core::rt::flush_denormals_to_zero();
         // Host parameters → chain messages, changes only. The effects smooth
         // internally, so unsmoothed values are what we want here.
         //

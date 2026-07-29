@@ -11,6 +11,7 @@
 pub mod drive_law;
 pub mod global_eq;
 pub mod preset;
+pub mod rt;
 pub mod tempo;
 
 /// The default pedalboard, as family keys in processing order. The single

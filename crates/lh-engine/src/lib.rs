@@ -718,8 +718,30 @@ impl Chain {
             self.pending_order.is_some() || self.pending_removes.iter().any(|&r| r);
         if structure_pending && self.fade.current() <= 1e-3 {
             if let Some((order, len)) = self.pending_order.take() {
-                self.order.clear();
-                self.order.extend_from_slice(&order[..len as usize]);
+                let len = len as usize;
+                // Validate: len in bounds, each index occupies a live slot,
+                // no duplicates. A malformed message is dropped silently
+                // rather than panicking the audio callback.
+                if len <= MAX_SLOTS
+                    && order[..len]
+                        .iter()
+                        .all(|&i| (i as usize) < MAX_SLOTS && self.slots[i as usize].is_some())
+                    && {
+                        let mut seen = [false; MAX_SLOTS];
+                        order[..len].iter().all(|&i| {
+                            let idx = i as usize;
+                            if seen[idx] {
+                                false
+                            } else {
+                                seen[idx] = true;
+                                true
+                            }
+                        })
+                    }
+                {
+                    self.order.clear();
+                    self.order.extend_from_slice(&order[..len]);
+                }
             }
             for index in 0..MAX_SLOTS {
                 if self.pending_removes[index] {
@@ -1291,19 +1313,39 @@ impl ChainHandle {
             }
             new_order.push(index);
         }
+        let mut order_msg = [0u8; MAX_SLOTS];
+        order_msg[..new_order.len()].copy_from_slice(&new_order);
+        self.tx
+            .push(EngineMsg::SetOrder {
+                order: order_msg,
+                len: new_order.len() as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
         self.order = new_order;
-        self.push_order()
+        Ok(())
     }
 
-    /// Move the slot at chain position `from` to position `to`.
     pub fn move_position(&mut self, from: usize, to: usize) -> Result<(), EngineError> {
         if from >= self.order.len() {
             return Err(EngineError::BadOrder(format!("no slot at position {from}")));
         }
-        let index = self.order.remove(from);
-        let to = to.min(self.order.len());
-        self.order.insert(to, index);
-        self.push_order()
+        // Compute the new order without mutating self.order, so a QueueFull
+        // leaves the shadow state unchanged.
+        let index = self.order[from];
+        let mut new_order = self.order.clone();
+        new_order.remove(from);
+        let to = to.min(new_order.len());
+        new_order.insert(to, index);
+        let mut order_msg = [0u8; MAX_SLOTS];
+        order_msg[..new_order.len()].copy_from_slice(&new_order);
+        self.tx
+            .push(EngineMsg::SetOrder {
+                order: order_msg,
+                len: new_order.len() as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
+        self.order = new_order;
+        Ok(())
     }
 
     /// Install a **control-side built** effect at chain position `position`
@@ -1343,11 +1385,30 @@ impl ChainHandle {
     /// of the fade. Untouched slots keep their state (tails survive).
     pub fn remove_slot(&mut self, handle: &str) -> Result<(), EngineError> {
         let index = self.slot_index(handle)?;
-        self.order.retain(|&i| i as usize != index);
-        self.push_order()?;
+        // Build the new order and check capacity for both messages (SetOrder
+        // + RemoveSlot) before mutating any shadow state. SPSC guarantees
+        // the capacity check is stable — only this thread pushes.
+        let new_order: Vec<u8> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| i as usize != index)
+            .collect();
+        if self.tx.slots() < 2 {
+            return Err(EngineError::QueueFull);
+        }
+        let mut order_msg = [0u8; MAX_SLOTS];
+        order_msg[..new_order.len()].copy_from_slice(&new_order);
+        self.tx
+            .push(EngineMsg::SetOrder {
+                order: order_msg,
+                len: new_order.len() as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
         self.tx
             .push(EngineMsg::RemoveSlot { index: index as u8 })
             .map_err(|_| EngineError::QueueFull)?;
+        self.order = new_order;
         self.slots[index] = None;
         Ok(())
     }
@@ -1357,11 +1418,29 @@ impl ChainHandle {
     /// bookkeeping as [`Self::remove_slot`]; the engine keeps the effect.
     pub fn spill_slot(&mut self, handle: &str) -> Result<(), EngineError> {
         let index = self.slot_index(handle)?;
-        self.order.retain(|&i| i as usize != index);
-        self.push_order()?;
+        // Same transactional pattern as remove_slot: build new order,
+        // check capacity for 2 messages, push both, then update shadow.
+        let new_order: Vec<u8> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&i| i as usize != index)
+            .collect();
+        if self.tx.slots() < 2 {
+            return Err(EngineError::QueueFull);
+        }
+        let mut order_msg = [0u8; MAX_SLOTS];
+        order_msg[..new_order.len()].copy_from_slice(&new_order);
+        self.tx
+            .push(EngineMsg::SetOrder {
+                order: order_msg,
+                len: new_order.len() as u8,
+            })
+            .map_err(|_| EngineError::QueueFull)?;
         self.tx
             .push(EngineMsg::SpillSlot { index: index as u8 })
             .map_err(|_| EngineError::QueueFull)?;
+        self.order = new_order;
         self.slots[index] = None;
         Ok(())
     }
@@ -1701,7 +1780,8 @@ pub fn build_chain(effects: Vec<Box<dyn Effect>>) -> (Chain, ChainHandle) {
         shadows.push(None);
         slots.push(None);
     }
-    let order: Vec<u8> = (0..count as u8).collect();
+    let mut order: Vec<u8> = Vec::with_capacity(MAX_SLOTS);
+    order.extend(0..count as u8);
 
     (
         Chain {
