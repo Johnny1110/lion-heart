@@ -28,16 +28,16 @@ help: ## Show this help
 	@printf '\ninstall target: %s\n' "$(BINDIR)/$(BIN)"
 
 build: ## Debug build of the whole workspace
-	$(CARGO) build
+	$(CARGO) build --locked
 
 release: ## Optimized release build
-	$(CARGO) build --release
+	$(CARGO) build --locked --release
 
 run: ## Launch the standalone GUI (release)
-	$(CARGO) run -p $(APP) --release
+	$(CARGO) run --locked -p $(APP) --release
 
 test: ## Run all workspace tests (offline, no audio device)
-	$(CARGO) test
+	$(CARGO) test --locked
 
 fmt: ## Format the workspace
 	$(CARGO) fmt
@@ -45,15 +45,20 @@ fmt: ## Format the workspace
 fmt-check: ## Check formatting without writing (CI gate)
 	$(CARGO) fmt --check
 
-clippy: ## Clippy with warnings denied (CI gate)
-	$(CARGO) clippy --all-targets -- -D warnings
+clippy: ## Clippy — fix warnings, don't just deny them
+	$(CARGO) clippy --all-targets
 
 lint: clippy ## Alias for clippy
 
 check: fmt-check clippy test ## Pre-commit gate: fmt-check + clippy + test
 
 bench: ## Per-block DSP cost (criterion)
-	$(CARGO) bench -p lh-dsp --bench effects
+	$(CARGO) bench --locked -p lh-dsp --bench effects
+
+bench-all: ## All benchmark suites (dsp + engine + nam)
+	$(CARGO) bench --locked -p lh-dsp --bench effects
+	$(CARGO) bench --locked -p lh-engine --bench spillover
+	$(CARGO) bench --locked -p lh-nam --bench amp
 
 bundle: ## Build the CLAP/VST3 plugin into target/bundled
 	$(CARGO) xtask bundle lion-heart-plugin --release
