@@ -1,18 +1,15 @@
 # Lion-Heart — Installation Guide
 
 Lion-Heart is a guitar amp & multi-effects processor. This guide gets it running
-on **macOS** and **Windows** — as a standalone app, and as a CLAP/VST3 plugin in
+on **macOS**, **Linux**, and **Windows** — as a standalone app, and as a CLAP/VST3 plugin in
 your DAW.
 
-> **Today you install by building from source.** There are no pre-built
-> downloads yet — the first tagged release (v0.1) is still pending hardware
-> verification. Building is a single command once Rust is installed, and this
-> guide walks through every step.
+> **You can install either from a tagged release or by building from source.**
+> Once a release is tagged, pre-built archives for macOS, Linux, and Windows
+> are published on the GitHub Releases page.
 >
-> **Windows support is brand new** (landed 2026-07-23,
-> [ADR 027](adr/027-cross-platform-port.md)). It builds and its file paths are
-> portable, but it has not yet been verified on a Windows CI runner or real
-> audio hardware. If something doesn't work,
+> For source installs, Rust must be installed and setup is quick on each
+> platform. If you hit a platform-specific issue,
 > [please open an issue](https://github.com/Johnny1110/lion-heart/issues).
 
 ## What you'll need
@@ -156,10 +153,10 @@ cargo xtask bundle lion-heart-plugin --release
 This produces `target/bundled/Lion-Heart.clap` and `target/bundled/Lion-Heart.vst3`.
 Copy them into your system's plugin folders, then rescan in your DAW:
 
-| Format | macOS | Windows |
-| --- | --- | --- |
-| CLAP | `~/Library/Audio/Plug-Ins/CLAP/` | `C:\Program Files\Common Files\CLAP\` |
-| VST3 | `~/Library/Audio/Plug-Ins/VST3/` | `C:\Program Files\Common Files\VST3\` |
+| Format | macOS | Linux | Windows |
+| --- | --- | --- | --- |
+| CLAP | `~/Library/Audio/Plug-Ins/CLAP/` | `~/.clap/` | `C:\Program Files\Common Files\CLAP\` |
+| VST3 | `~/Library/Audio/Plug-Ins/VST3/` | `~/.vst3/` | `C:\Program Files\Common Files\VST3\` |
 
 > The **VST3 build is GPLv3** (VST3 SDK licensing); the CLAP build and the
 > standalone app stay MIT OR Apache-2.0. Plugin v1 has no custom editor
@@ -168,19 +165,23 @@ Copy them into your system's plugin folders, then rescan in your DAW:
 
 ---
 
-## Pre-built binaries (coming with v0.1)
+## Pre-built binaries
 
-Once v0.1 is tagged, macOS builds will appear on the
-[Releases page](https://github.com/Johnny1110/lion-heart/releases). If a macOS
-download is **unsigned**, Gatekeeper quarantines it — clear the flag once after
+Once a release is tagged, artifacts for macOS, Linux, and Windows appear on the
+[Releases page](https://github.com/Johnny1110/lion-heart/releases) with SHA256 checksums.
+
+Release artifacts are distributed as `.tar.gz` archives for all platforms:
+
+- `lion-heart-${VERSION}-macos.tar.gz`
+- `lion-heart-${VERSION}-linux.tar.gz`
+- `lion-heart-${VERSION}-windows.tar.gz`
+
+If a macOS download is **unsigned**, Gatekeeper quarantines it — clear the flag once after
 unpacking:
 
 ```sh
 xattr -dr com.apple.quarantine <file>
 ```
-
-Windows and Linux release binaries are planned but not built yet
-([ADR 027](adr/027-cross-platform-port.md)) — build from source in the meantime.
 
 ---
 
@@ -203,17 +204,17 @@ cargo run -p lion-heart --release   # macOS users can also just `make run`
 
 ---
 
-## Linux (not a target platform, but it builds)
+## Linux
 
-Install the ALSA development headers first, then follow the macOS cargo steps:
+Linux is supported through cpal/ALSA. Install the ALSA development headers first, then build:
 
 ```sh
 sudo apt install libasound2-dev pkg-config   # Debian/Ubuntu
 cargo run -p lion-heart --release
 ```
 
-Audio goes through ALSA. JACK/PipeWire and pre-built binaries are future work
-([ADR 027](adr/027-cross-platform-port.md)).
+Audio runs via ALSA by default; JACK/PipeWire routing is controlled by your
+system and plugin paths.
 
 ---
 

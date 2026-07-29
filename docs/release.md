@@ -2,11 +2,11 @@
 
 ## What ships
 
-- `lion-heart` — the standalone app (macOS binary)
+- `lion-heart` — standalone app archives for macOS, Linux, and Windows
 - `Lion-Heart.clap` / `Lion-Heart.vst3` — plugin bundles built with
   `cargo xtask bundle lion-heart-plugin --release`
-  (VST3 bundles are **GPLv3** — vst3-sys licensing; the CLAP bundle and the
-  standalone app stay MIT OR Apache-2.0)
+  (VST3 bundles are **GPLv3** — vst3-sys licensing; the CLAP bundle and
+  the standalone app stay MIT OR Apache-2.0)
 
 ## How
 
@@ -18,13 +18,15 @@
    git tag v0.1.0 && git push origin v0.1.0
    ```
 
-4. The `release` workflow builds everything on a macOS runner and opens a
-   **draft** GitHub release with the artifacts attached — review and publish.
+4. The `release` workflow builds platform artifacts on macOS, Linux, and Windows;
+   the macOS job creates a **draft** GitHub release with base artifacts, and Linux/
+   Windows jobs upload additional artifacts before human review.
 
 ## Codesigning & notarization (optional but recommended)
 
-Unsigned artifacts work after `xattr -dr com.apple.quarantine <file>`, but
-Gatekeeper warns. To sign + notarize automatically, add these repository
+Unsigned macOS artifacts work after `xattr -dr com.apple.quarantine <file>`, but
+Gatekeeper warns. Linux/Windows artifacts are naturally unsigned. To sign + notarize
+automatically, add these repository
 secrets (Settings → Secrets → Actions); the workflow picks them up when
 present:
 
