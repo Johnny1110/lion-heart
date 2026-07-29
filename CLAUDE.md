@@ -115,10 +115,38 @@ revised order:
   the drive family is now 21.** Five of them share one junction across two
   adapted-port layouts, and no scattering matrix is written down anywhere.
 
+- **05** fuzz / transistor / booster (PRD 032–034 / **ADR 035**), landed
+  2026-07-29 — the phase that stops using WDF, on purpose. New module
+  **`blocks::transistor`**, because a WDF root is by definition a *single-port*
+  nonlinearity and this family breaks that in two different ways: `big-muff`'s
+  amplifier is a common-emitter stage linearised to `A = −Rc/Re`, so it has no
+  input/output impedance an R-type junction could use (and ADR 033 forbids
+  inventing them); a BJT is a *two-port* nonlinearity, so it can never be a root
+  at all. **`big-muff`** (PRD 032) is two `ShuntFeedbackStage`s — the same
+  mechanism class as `sd1`, solved as one node equation by damped Newton — into
+  the Phase 02 `big-muff` tone stack, the first pedal to use it.
+  **`rangemaster`** (PRD 033) is a three-node Ebers–Moll solve over
+  `blocks::transistor::Bjt`, its DC operating point solved once at `prepare`
+  (never on the audio thread — `reset()` runs there) and pinned against four
+  lines of hand arithmetic. **`fuzz-face`** (PRD 034) gained a
+  Germanium/Silicon selector and stays behavioural: the reference NDK
+  coefficients come from a private generator, so **NDK is recorded as future
+  research** (ADR 035 §4). Two corrections to the reference implementation are in
+  ADR 035 §3, both found by re-deriving the equations here — the Big Muff
+  feedback current is injected across the **AC** Thévenin resistance `R19‖R20`
+  (9.09 kΩ), not the DC one (`R20`, 100 kΩ), which is 6.5× of gain per stage; and
+  the Rangemaster's `*1e16 − 5e5 − 1.0` output scaling is a *plotting* leftover
+  from feeding NPN equations to a PNP. Device parameters are germanium's, not the
+  reference's silicon — ADR 033's diode policy, one device class along. **Drive
+  family is now 23.** Cost note: `rangemaster` is the most expensive pedal in the
+  family (~4.6× `screamer`, ~12 % of the deadline); it converges in 2 Newton
+  steps, so that is the price of the device model, not slack.
+
 The full phase map and each phase's acceptance criteria live in the docs linked
-above. Note the phase-04 plan doc still says the scattering matrix comes from
-**R-Solver** and asks for `tools/netlists/` — ADR 032 superseded both; a
-correction box at the top of that file records it.
+above. Two plan docs carry correction boxes at the top: phase 04's still says the
+scattering matrix comes from **R-Solver** and asks for `tools/netlists/`
+(ADR 032 superseded both), and phase 05's ADR number, module placement,
+"scalar" Newton claim and cost estimate were all revised on landing (ADR 035).
 
 **Licensing red line:** lion-heart is **MIT OR Apache-2.0**. **BYOD is GPL-3 —
 never copy its code.** Port algorithms from `chowdsp_wdf` (BSD) / `omega.h`

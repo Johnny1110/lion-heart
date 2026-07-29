@@ -7,6 +7,43 @@ deadline **1,333 µs** per block (white paper §3.2). Run with:
 cargo bench -p lh-dsp --bench effects
 ```
 
+## 2026-07-29 (Tone Revolution phase 05: `big-muff`, `rangemaster`) — Linux dev container (relative)
+
+The transistor pedals (PRD 032 / 033, ADR 035). Both solve a circuit by Newton
+iteration per oversampled sample rather than evaluating a WDF root's closed
+form, and the table's job is to price that.
+
+Calibration is good this run: `drive_screamer` reads **~35.9 µs** against ~31.4 µs
+in the `zendrive` session and ~42.1 µs in the `rat` session — mid-range for this
+container. Divide through it before comparing to any other table here.
+
+| Bench                                  | Median    | ÷ screamer | Reading                        |
+| -------------------------------------- | --------- | ---------- | ------------------------------ |
+| `drive_fuzz-face_4x_oversampled`       | ~19.4 µs  | 0.54       | behavioural + ADAA (reference) |
+| `drive_screamer_4x_oversampled`        | ~35.9 µs  | 1.00       | calibration                    |
+| `drive_king-of-tone_4x_oversampled`    | ~47.6 µs  | 1.33       | two WDF roots (reference)      |
+| **`drive_big-muff_4x_oversampled`**    | **~85.3 µs** | **2.38** | **two scalar Newtons**         |
+| **`drive_rangemaster_4x_oversampled`** | **~163 µs**  | **4.55** | **3×3 nodal Newton**           |
+
+`big-muff` at 2.38× is the price of iterating twice per sample where
+`king-of-tone` — also two stages — evaluates a closed form twice. A WDF root
+does not iterate; these do.
+
+**`rangemaster` is the most expensive pedal in the drive family**, at ~12 % of
+the 64-frame deadline. Three unknowns, two exponentials and a pivoted 3×3 solve
+per Newton step, ~3 steps, 192 kHz. Two optimizations are already in and both
+are recorded in PRD 033 §3.3: skipping the exponential of a junction more than
+40 thermal voltages into reverse (free — it contributes 1e-23 S), and a 1e-8 V
+nodal convergence tolerance instead of 1e-10 (**~5 %**; quadratic convergence
+means the tighter threshold bought a whole extra iteration to move the answer by
+a picovolt, and `f32` cannot represent the difference anyway).
+
+What is *not* available: the solve genuinely converges in **2 iterations** at
+every realistic level (measured, 99.9 % of samples at amplitudes 0 / 0.01 / 0.15),
+so there is no iteration budget left to cut. Further speed needs a branch-free
+3×3 solve and a cheaper exponential — a performance work item, not a phase-05
+one.
+
 ## 2026-07-28 (Tone Revolution phase 04: `rat`, `diode-clipper`, `king-of-tone`) — Linux dev container (relative)
 
 The last three pedals of the family, which completes phase 04's roster.
