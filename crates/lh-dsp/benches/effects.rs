@@ -24,10 +24,11 @@ fn signal() -> Vec<f32> {
 /// Refill both channels and run one stereo process call.
 macro_rules! bench_stereo {
     ($group:expr, $name:expr, $effect:expr, $buf_l:expr, $buf_r:expr) => {
+        let sig = signal();
         $group.bench_function($name, |b| {
             b.iter(|| {
-                $buf_l.copy_from_slice(&signal());
-                $buf_r.copy_from_slice(&signal());
+                $buf_l.copy_from_slice(&sig);
+                $buf_r.copy_from_slice(&sig);
                 $effect.process(black_box(&mut $buf_l), black_box(&mut $buf_r));
             })
         });

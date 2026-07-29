@@ -402,27 +402,35 @@ impl LionParams {
         }
         let preset_names = Arc::new(list_presets());
         let names_for_display = Arc::clone(&preset_names);
-        let preset = IntParam::new("Preset (assets)", 0, IntRange::Linear { min: 0, max: 99 })
-            .with_value_to_string(Arc::new(move |v| match v {
-                0 => "(none)".to_string(),
-                v => names_for_display
-                    .get(v as usize - 1)
-                    .cloned()
-                    .unwrap_or_else(|| format!("{v} (no such preset)")),
-            }))
-            .with_string_to_value(Arc::new(move |s| {
-                let s = s.trim();
-                if s == "(none)" {
-                    return Some(0);
-                }
-                preset_names
-                    .iter()
-                    .position(|n| n == s)
-                    .map(|i| i as i32 + 1)
-                    // Fall back to a leading integer, which also round-trips the
-                    // "<n> (no such preset)" display of out-of-range values.
-                    .or_else(|| s.split_whitespace().next()?.parse::<i32>().ok())
-            }));
+        let max_preset = preset_names.len() as i32;
+        let preset = IntParam::new(
+            "Preset (assets)",
+            0,
+            IntRange::Linear {
+                min: 0,
+                max: max_preset,
+            },
+        )
+        .with_value_to_string(Arc::new(move |v| match v {
+            0 => "(none)".to_string(),
+            v => names_for_display
+                .get(v as usize - 1)
+                .cloned()
+                .unwrap_or_else(|| format!("{v} (no such preset)")),
+        }))
+        .with_string_to_value(Arc::new(move |s| {
+            let s = s.trim();
+            if s == "(none)" {
+                return Some(0);
+            }
+            preset_names
+                .iter()
+                .position(|n| n == s)
+                .map(|i| i as i32 + 1)
+                // Fall back to a leading integer, which also round-trips the
+                // "<n> (no such preset)" display of out-of-range values.
+                .or_else(|| s.split_whitespace().next()?.parse::<i32>().ok())
+        }));
         Self {
             floats,
             selectors,

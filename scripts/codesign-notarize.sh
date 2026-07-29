@@ -15,6 +15,14 @@ IDENTITY_NAME="lion-heart-signing"
 KEYCHAIN="lion-heart-signing.keychain-db"
 KEYCHAIN_PASSWORD="$(openssl rand -hex 16)"
 
+cleanup() {
+  # Restore the default keychain and delete the throwaway one.
+  security default-keychain -s login.keychain-db 2>/dev/null || true
+  security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+  rm -f /tmp/certificate.p12
+}
+trap cleanup EXIT
+
 echo "== importing signing certificate into a throwaway keychain"
 echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/certificate.p12
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
