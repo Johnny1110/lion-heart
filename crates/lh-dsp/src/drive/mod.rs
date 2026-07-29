@@ -1215,7 +1215,21 @@ mod tests {
         // structure is pinned by v1 preset compatibility.)
         let x = guitar(220.0, SR as usize);
         let in_rms = f64::from(rms(&x[x.len() / 2..]));
-        let mut levels = Vec::new();
+        // The FMV-voiced five carry a real scooped stack whose noon *ceiling*
+        // is calibrated to unity (ADR 037), so a 220 Hz sine reads them a few
+        // dB low — the energy a scoop takes from the middle is energy this
+        // probe cannot see at the shoulders. The tight switching-comfort
+        // spread is therefore asserted per voicing group; the ±6 dB unity
+        // window above still bounds every pedal at once.
+        let scooped_keys = [
+            "evva",
+            "red-charlie",
+            "monster5150",
+            "angry-charlie",
+            "angry-charlie-v2",
+        ];
+        let mut flat = Vec::new();
+        let mut scooped = Vec::new();
         for model in [
             0usize, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
         ] {
@@ -1228,14 +1242,21 @@ mod tests {
                 "{}: default knobs should sit near unity, got {db:.1} dB",
                 MODELS[model].desc.key
             );
-            levels.push(db);
+            if scooped_keys.contains(&MODELS[model].desc.key) {
+                scooped.push(db);
+            } else {
+                flat.push(db);
+            }
         }
-        let spread = levels.iter().cloned().fold(f64::MIN, f64::max)
-            - levels.iter().cloned().fold(f64::MAX, f64::min);
-        assert!(
-            spread < 5.0,
-            "modelled pedals at defaults are {spread:.1} dB apart ({levels:?})"
-        );
+        assert_eq!(scooped.len(), scooped_keys.len(), "every FMV pedal probed");
+        for (name, levels) in [("non-scooped", &flat), ("FMV-scooped", &scooped)] {
+            let spread = levels.iter().cloned().fold(f64::MIN, f64::max)
+                - levels.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                spread < 5.0,
+                "{name} pedals at defaults are {spread:.1} dB apart ({levels:?})"
+            );
+        }
     }
 
     /// Diagnostic companion to the test above: what every pedal actually does
@@ -1852,10 +1873,13 @@ mod tests {
         let flat = process_in_blocks(&mut d, &x, 256);
         let at = |freq: f32| tone_at(&flat, freq) / tone_at(&x, freq).max(1e-12);
         for freq in [80.0, 220.0, 750.0, 3_000.0] {
-            // Still a usable level everywhere — the makeup gain sees to that.
+            // Still audible everywhere. The makeup restores the noon
+            // *ceiling* to unity rather than the band average (ADR 037), so
+            // the scoop bottom rides the full Bassman depth below it —
+            // ~−16 dB through the whole pedal — instead of being propped up.
             let ratio = at(freq);
             assert!(
-                (0.2..5.0).contains(&ratio),
+                (0.1..2.0).contains(&ratio),
                 "evva must pass {freq} Hz at a sane level, ratio {ratio:.3}"
             );
         }

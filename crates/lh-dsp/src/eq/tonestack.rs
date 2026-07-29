@@ -142,9 +142,16 @@ pub struct Kind {
     /// Which faceplate knobs this model actually wires up, as a bit per knob.
     /// The Big Muff has one control; the FMV stacks have three.
     pub knob_mask: u8,
-    /// Undoes the network's insertion loss so the stack sits near unity at
-    /// noon — the band-average gain over 80 Hz–7.2 kHz, negated. Without it
-    /// every migrated drive would drop 5–8 dB and miss its level pin.
+    /// Restores the network's noon *maximum* (its low shelf) to unity: the
+    /// largest gain the netlist reaches at noon over 15 Hz–16 kHz, negated.
+    /// The noon response is therefore ≤ 0 dB everywhere, like the passive
+    /// network itself — what remains below the ceiling is the scoop.
+    ///
+    /// Never calibrate this to a band average. The first calibration did
+    /// (average over 80 Hz–7.2 kHz), and averaging across a 7–9 dB scoop
+    /// lifts the shelves *above* unity — every FMV-voiced drive gained a
+    /// measured +4–5 dB of absolute low end against its pre-migration self,
+    /// which is a bass boost no passive stack can produce (ADR 037).
     pub makeup_db: f32,
 }
 
@@ -298,7 +305,7 @@ pub static KINDS: [Kind; KIND_COUNT] = [
         out: FMV_OUT,
         tapers: [Taper::Linear; MAX_KNOBS],
         knob_mask: 0b111,
-        makeup_db: 7.38,
+        makeup_db: 1.63,
     },
     Kind {
         key: "jcm800",
@@ -308,7 +315,7 @@ pub static KINDS: [Kind; KIND_COUNT] = [
         out: FMV_OUT,
         tapers: [Taper::Linear; MAX_KNOBS],
         knob_mask: 0b111,
-        makeup_db: 5.32,
+        makeup_db: 0.98,
     },
     Kind {
         key: "big-muff",
@@ -318,7 +325,7 @@ pub static KINDS: [Kind; KIND_COUNT] = [
         out: MUFF_OUT,
         tapers: [Taper::Linear; MAX_KNOBS],
         knob_mask: 1 << TREBLE,
-        makeup_db: 6.13,
+        makeup_db: 4.05,
     },
 ];
 
@@ -1266,19 +1273,31 @@ mod tests {
 
     // --- calibration ---------------------------------------------------------
 
-    /// Every model's makeup gain must land its noon setting near unity, or a
-    /// migrated drive drops 5–8 dB and misses its level pin. Measured the way
-    /// the constant was derived: the average over the guitar band.
+    /// Every model's makeup gain must land the noon *ceiling* at unity: the
+    /// low shelf sits at 0 dB and no frequency exceeds it, so a scooped noon
+    /// can never read as an absolute bass boost downstream.
+    ///
+    /// This replaces the original band-average calibration pin. Averaging
+    /// over 80 Hz–7.2 kHz across a 7–9 dB scoop had pushed the shelves
+    /// +4–5 dB above unity — measured against a pre-migration build, every
+    /// FMV-voiced drive put exactly that much more absolute energy into
+    /// 40–160 Hz at identical knobs (ADR 037). The raw maximum comes from
+    /// the analog oracle over a fine log grid, so the pin is rate-independent
+    /// and fails with the retune value in the message.
     #[test]
-    fn noon_sits_near_unity_with_the_makeup_applied() {
+    fn noon_ceiling_sits_at_unity_with_the_makeup_applied() {
         for (kind, spec) in KINDS.iter().enumerate() {
-            let mut ts = prepared(kind, [5.0, 5.0, 5.0]);
-            let avg: f32 =
-                BAND.iter().map(|f| rendered_db(&mut ts, *f)).sum::<f32>() / BAND.len() as f32;
+            let mut max = f64::NEG_INFINITY;
+            for i in 0..=200 {
+                let freq = 15.0f32 * (16_000.0f32 / 15.0).powf(i as f32 / 200.0);
+                max = max.max(nodal_db(&KINDS[kind], [5.0, 5.0, 5.0], freq));
+            }
+            let ceiling = max + makeup(kind);
             assert!(
-                avg.abs() < 0.5,
-                "{} sits at {avg:.2} dB at noon — retune makeup_db",
-                spec.key
+                ceiling.abs() < 0.25,
+                "{} noon ceiling sits at {ceiling:+.2} dB — retune makeup_db to {:.2}",
+                spec.key,
+                -max
             );
         }
     }
