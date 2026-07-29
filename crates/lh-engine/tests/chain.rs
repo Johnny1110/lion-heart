@@ -1060,3 +1060,120 @@ fn spectrum_tap_excludes_the_aux() {
         "spectrum tap must exclude the aux"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1-7: end-to-end default-chain test — the full 12-stage board that the
+// plugin ships, not just the 3-stage subset above.
+// ---------------------------------------------------------------------------
+
+use lh_dsp::cab::CabIr;
+use lh_dsp::dynamics::{Compressor, Limiter};
+use lh_dsp::eq::Eq;
+use lh_dsp::filter::Filter;
+use lh_dsp::modulation::Modulation;
+use lh_dsp::power::PowerAmp;
+use lh_dsp::time::Reverb;
+use lh_nam::NamAmp;
+use std::path::PathBuf;
+
+/// The plugin's 12-stage default chain, minus the NAM model and IR (both
+/// pass through when uninstalled). Returns the chain + the NAM handle so a
+/// fixture can be loaded if desired.
+fn default_chain() -> (lh_engine::Chain, lh_engine::ChainHandle) {
+    let (nam_amp, _nam_handle) = NamAmp::new();
+    let (cab, _cab_handle) = CabIr::new();
+    let effects: Vec<Box<dyn Effect>> = vec![
+        Box::new(NoiseGate::new()),
+        Box::new(Filter::new()),
+        Box::new(Compressor::new()),
+        Box::new(Drive::new()),
+        Box::new(nam_amp),
+        Box::new(PowerAmp::new()),
+        Box::new(Eq::new()),
+        Box::new(Modulation::new()),
+        Box::new(Delay::new()),
+        Box::new(Reverb::new()),
+        Box::new(cab),
+        Box::new(Limiter::new()),
+    ];
+    build_chain(effects)
+}
+
+/// Render `input` through `chain` in blocks of `block_size`.
+fn render_blocks(chain: &mut lh_engine::Chain, input: &[f32], block_size: usize) -> Vec<f32> {
+    let mut left = input.to_vec();
+    let mut right = input.to_vec();
+    for (l, r) in left
+        .chunks_mut(block_size)
+        .zip(right.chunks_mut(block_size))
+    {
+        chain.process(l, r);
+    }
+    left
+}
+
+#[test]
+fn default_chain_renders_finite_audio() {
+    let (mut chain, _handle) = default_chain();
+    chain.prepare(SR);
+    let x = sine(SR, 220.0, SR as usize);
+    let y = render_blocks(&mut chain, &x, 64);
+    assert_finite("default chain output", &y);
+    assert!(
+        rms(&y[SR as usize / 2..]) > 0.01,
+        "signal must pass through"
+    );
+}
+
+#[test]
+fn default_chain_output_is_bounded() {
+    let (mut chain, _handle) = default_chain();
+    chain.prepare(SR);
+    // Drive a hot signal — the safety limiter should keep it bounded.
+    let x: Vec<f32> = sine(SR, 220.0, SR as usize)
+        .iter()
+        .map(|s| s * 5.0)
+        .collect();
+    let y = render_blocks(&mut chain, &x, 64);
+    assert_finite("hot chain output", &y);
+    let peak = y.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+    assert!(peak < 10.0, "peak {} must be bounded by limiter", peak);
+}
+
+#[test]
+fn default_chain_block_partition_equivalent() {
+    // Processing in different block sizes must produce equivalent output
+    // (within float rounding). This catches block-boundary state bugs.
+    let x = sine(SR, 440.0, 4_096);
+
+    let (mut chain_a, _) = default_chain();
+    chain_a.prepare(SR);
+    let y_a = render_blocks(&mut chain_a, &x, 32);
+
+    let (mut chain_b, _) = default_chain();
+    chain_b.prepare(SR);
+    let y_b = render_blocks(&mut chain_b, &x, 1024);
+
+    // Skip the first few samples (smoother transient differences).
+    let skip = 128;
+    let max_err = y_a[skip..]
+        .iter()
+        .zip(&y_b[skip..])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_err < 1e-3,
+        "block-partition mismatch: max err {max_err}"
+    );
+}
+
+#[test]
+fn default_chain_survives_all_sample_rates() {
+    for &sr in &[44_100u32, 48_000, 96_000] {
+        let (mut chain, _) = default_chain();
+        chain.prepare(sr);
+        let x = sine(sr, 220.0, sr as usize / 2);
+        let y = render_blocks(&mut chain, &x, 64);
+        assert_finite(&format!("chain @ {sr} Hz"), &y);
+    }
+}

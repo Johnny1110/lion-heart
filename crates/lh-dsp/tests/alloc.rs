@@ -85,3 +85,126 @@ fn every_drive_pedal_is_allocation_free_under_a_knob_sweep() {
         hammer(model);
     }
 }
+
+// ---------------------------------------------------------------------------
+// P1-8: allocation-free guarantee for every effect family, not just Drive.
+// ---------------------------------------------------------------------------
+
+use lh_dsp::cab::CabIr;
+use lh_dsp::dynamics::comp::FAMILY as COMP_FAMILY;
+use lh_dsp::dynamics::gate::FAMILY as GATE_FAMILY;
+use lh_dsp::dynamics::limiter::FAMILY as LIM_FAMILY;
+use lh_dsp::dynamics::{Compressor, Limiter, NoiseGate};
+use lh_dsp::eq::Eq;
+use lh_dsp::filter::Filter;
+use lh_dsp::modulation::{FAMILY as MOD_FAMILY, Modulation};
+use lh_dsp::power::PowerAmp;
+use lh_dsp::time::Delay;
+use lh_dsp::time::delay::FAMILY as DELAY_FAMILY;
+use lh_dsp::time::reverb::{FAMILY as REVERB_FAMILY, Reverb, VOICE_COUNT as REVERB_VOICES};
+
+/// Generic hammer: prepare the effect, then sweep every param while
+/// processing hot and cold blocks inside the no-allocation guard.
+fn hammer_effect(mut effect: Box<dyn Effect>, params: usize) {
+    effect.prepare(SR);
+    let mut left = vec![0.0f32; BLOCK];
+    let mut right = vec![0.0f32; BLOCK];
+    guarded(|| {
+        for n in 0..64 {
+            for p in 0..params {
+                let t = ((n * 7 + p * 13) % 64) as f32 / 63.0;
+                effect.set_param(p, t);
+            }
+            let amp = if n % 8 == 7 { 1e5 } else { 0.2 };
+            for (i, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+                let ph = std::f32::consts::TAU * 220.0 * i as f32 / SR as f32;
+                *l = amp * ph.sin();
+                *r = amp * ph.cos();
+            }
+            effect.process(&mut left, &mut right);
+            for s in left.iter().chain(right.iter()) {
+                assert!(s.is_finite(), "effect produced non-finite sample at n={n}");
+            }
+        }
+    });
+}
+
+#[test]
+fn modulation_voices_are_allocation_free() {
+    for voice in 0..MOD_FAMILY.pedals.len() {
+        let mut modul = Modulation::new();
+        modul.select_pedal(voice);
+        hammer_effect(Box::new(modul), MOD_FAMILY.pedals[voice].params.len());
+    }
+}
+
+#[test]
+fn delay_voices_are_allocation_free() {
+    for voice in 0..DELAY_FAMILY.pedals.len() {
+        let mut delay = Delay::new();
+        delay.select_pedal(voice);
+        hammer_effect(Box::new(delay), DELAY_FAMILY.pedals[voice].params.len());
+    }
+}
+
+#[test]
+fn reverb_voices_are_allocation_free() {
+    for voice in 0..REVERB_VOICES {
+        let mut rev = Reverb::new();
+        rev.select_pedal(voice);
+        hammer_effect(Box::new(rev), REVERB_FAMILY.pedals[voice].params.len());
+    }
+}
+
+#[test]
+fn eq_is_allocation_free() {
+    hammer_effect(
+        Box::new(Eq::new()),
+        lh_dsp::eq::FAMILY.pedals[0].params.len(),
+    );
+}
+
+#[test]
+fn filter_is_allocation_free() {
+    hammer_effect(
+        Box::new(Filter::new()),
+        lh_dsp::filter::FAMILY.pedals[0].params.len(),
+    );
+}
+
+#[test]
+fn compressor_is_allocation_free() {
+    for voice in 0..COMP_FAMILY.pedals.len() {
+        let mut comp = Compressor::new();
+        comp.select_pedal(voice);
+        hammer_effect(Box::new(comp), COMP_FAMILY.pedals[voice].params.len());
+    }
+}
+
+#[test]
+fn noise_gate_is_allocation_free() {
+    hammer_effect(
+        Box::new(NoiseGate::new()),
+        GATE_FAMILY.pedals[0].params.len(),
+    );
+}
+
+#[test]
+fn limiter_is_allocation_free() {
+    hammer_effect(Box::new(Limiter::new()), LIM_FAMILY.pedals[0].params.len());
+}
+
+#[test]
+fn power_amp_is_allocation_free() {
+    hammer_effect(
+        Box::new(PowerAmp::new()),
+        lh_dsp::power::FAMILY.pedals[0].params.len(),
+    );
+}
+
+#[test]
+fn cab_ir_is_allocation_free_without_asset() {
+    // CabIr passes audio through when no IR is installed.
+    let (cab, _handle) = CabIr::new();
+    hammer_effect(Box::new(cab), lh_dsp::cab::FAMILY.pedals[0].params.len());
+}
