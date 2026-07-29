@@ -6,6 +6,7 @@ use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin};
 
 use crate::Effect;
 use crate::blocks::onepole_ms;
+use crate::blocks::smooth::Smoothed;
 
 static PARAMS: [ParamDesc; 2] = [
     ParamDesc {
@@ -54,7 +55,7 @@ const ENV_DECAY_MS: f32 = 20.0;
 pub struct NoiseGate {
     sample_rate: u32,
     // control values
-    thr_open: f32,
+    thr_s: Smoothed,
     release_ms: f32,
     // derived coefficients
     env_decay: f32,
@@ -76,7 +77,7 @@ impl NoiseGate {
     pub fn new() -> Self {
         let mut gate = Self {
             sample_rate: 48_000,
-            thr_open: db_to_lin(PARAMS[0].default),
+            thr_s: Smoothed::new(db_to_lin(PARAMS[0].default)),
             release_ms: PARAMS[1].default,
             env_decay: 0.0,
             attack_coeff: 0.0,
@@ -102,7 +103,8 @@ impl Effect for NoiseGate {
     }
 
     fn prepare(&mut self, sample_rate: u32) {
-        self.sample_rate = sample_rate;
+        self.thr_s.configure(20.0, sample_rate);
+        self.thr_s.snap_to_target();
         self.recompute();
         self.reset();
     }
@@ -115,7 +117,9 @@ impl Effect for NoiseGate {
 
     fn set_param(&mut self, index: usize, normalized: f32) {
         match index {
-            0 => self.thr_open = db_to_lin(PARAMS[0].range.to_real(normalized)),
+            0 => self
+                .thr_s
+                .set_target(db_to_lin(PARAMS[0].range.to_real(normalized))),
             1 => {
                 self.release_ms = PARAMS[1].range.to_real(normalized);
                 self.release_coeff = onepole_ms(self.release_ms, self.sample_rate);
@@ -125,7 +129,6 @@ impl Effect for NoiseGate {
     }
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32]) {
-        let thr_close = self.thr_open * CLOSE_RATIO;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             // Linked detector: the louder channel drives one shared gain, so
             // the stereo image never wobbles as the gate rides the edge.
@@ -136,10 +139,12 @@ impl Effect for NoiseGate {
             } else {
                 self.env + self.env_decay * (a - self.env)
             };
+            let thr_open = self.thr_s.tick();
+            let thr_close = thr_open * CLOSE_RATIO;
             self.open = if self.open {
                 self.env >= thr_close
             } else {
-                self.env >= self.thr_open
+                self.env >= thr_open
             };
             let (target, coeff) = if self.open {
                 (1.0, self.attack_coeff)
