@@ -39,3 +39,23 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+  plugin-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+
+      - name: Install clap-validator
+        run: cargo install clap-validator --locked
+
+      - name: Bundle plugin
+        run: cargo xtask bundle lion-heart-plugin --release
+
+      - name: Validate CLAP
+        run: clap-validator validate target/bundled/Lion-Heart.clap
