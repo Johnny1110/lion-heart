@@ -52,6 +52,7 @@ use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 use crate::Effect;
 use crate::blocks::biquad::Biquad;
 use crate::blocks::smooth::Smoothed;
+use crate::blocks::waveshaper::{Adaa1, tanh_f1};
 use crate::blocks::{onepole_hz, onepole_ms};
 
 const N: usize = 8;
@@ -379,13 +380,6 @@ impl ApLine {
     }
 }
 
-/// Unity small-signal, bounded loud: `tanh(drive·x)/drive` (RT rule 7 —
-/// every regenerative extra stays finite forever).
-#[inline]
-fn soft_clip(x: f32, drive: f32) -> f32 {
-    (x * drive).tanh() / drive
-}
-
 /// Delay-line pitch shifter: two read taps swept by a phasor, crossfaded by
 /// a sine window (the classic "doppler" shifter — no FFT, RT-safe). Grain
 /// ~64 ms: long enough to track low notes, short enough to stay a texture.
@@ -574,6 +568,8 @@ pub struct Reverb {
     // shimmer
     shifters: [PitchShift; 2],
     shim_hold: f32,
+    /// ADAA state for the in-tank soft-clipper (anti-aliasing).
+    clip_adaa: Adaa1,
 
     // chorale (per channel × formant)
     formants: [[Biquad; 2]; 2],
@@ -679,6 +675,7 @@ impl Reverb {
                 },
             ],
             shim_hold: 0.0,
+            clip_adaa: Adaa1::new(),
             formants: [[Biquad::default(); 2]; 2],
             chirps: Vec::new(),
             echo: ILine::empty(),
@@ -844,6 +841,7 @@ impl Effect for Reverb {
             }
             self.shifters[1].phase = 0.25; // keep the dual taps decorrelated
             self.shim_hold = 0.0;
+            self.clip_adaa.reset();
             self.env_fast = 0.0;
             self.env_slow = 0.0;
             self.swell_gain = 0.0;
@@ -940,6 +938,7 @@ impl Effect for Reverb {
         }
         self.shifters[1].phase = 0.25;
         self.shim_hold = 0.0;
+        self.clip_adaa.reset();
         for ch in &mut self.formants {
             for f in ch {
                 f.reset();
@@ -1058,7 +1057,13 @@ impl Effect for Reverb {
                     // Spring: dwell drive, then the dispersive chirp bank.
                     if def.insert == Insert::Chirp {
                         let drive = 0.8 + 5.0 * self.dwell.tick();
-                        feed = soft_clip(feed, drive);
+                        let d = drive as f64;
+                        let d_sq = d * d;
+                        feed = self.clip_adaa.process(
+                            feed,
+                            |v| (d * v as f64).tanh() / d,
+                            |v| tanh_f1(d * v as f64) / d_sq,
+                        );
                         let active = (self.springs + 1).min(self.chirps.len());
                         let mut sum = 0.0;
                         for cascade in self.chirps.iter_mut().take(active) {
@@ -1102,7 +1107,13 @@ impl Effect for Reverb {
                     if def.insert == Insert::Shimmer {
                         let amt = 0.72 * self.amount.tick();
                         let (r1, r2) = INTERVAL_RATIOS[self.interval.min(3)];
-                        let fed = soft_clip(self.shim_hold, 1.3);
+                        let d = 1.3f64;
+                        let d_sq = d * d;
+                        let fed = self.clip_adaa.process(
+                            self.shim_hold,
+                            |v| (d * v as f64).tanh() / d,
+                            |v| tanh_f1(d * v as f64) / d_sq,
+                        );
                         let mut shifted = self.shifters[0].process(fed, r1, grain_smp);
                         if r2 > 0.0 {
                             shifted =
@@ -1147,7 +1158,14 @@ impl Effect for Reverb {
                     }
                     let last = self.echo.read_at(heads as f32 * spacing + wow);
                     let fb = self.repeats.tick();
-                    let write = dry + fb * soft_clip(last, MAGNETO_DRIVE);
+                    let d = MAGNETO_DRIVE as f64;
+                    let d_sq = d * d;
+                    let clipped = self.clip_adaa.process(
+                        last,
+                        |v| (d * v as f64).tanh() / d,
+                        |v| tanh_f1(d * v as f64) / d_sq,
+                    );
+                    let write = dry + fb * clipped;
                     // In-loop tone (block-rate coeff): repeats darken pass
                     // over pass, tape-like.
                     self.echo_lp += self.damp_coeff * (write - self.echo_lp);

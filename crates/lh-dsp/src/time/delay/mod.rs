@@ -45,6 +45,7 @@ use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range};
 use crate::Effect;
 use crate::blocks::onepole_hz;
 use crate::blocks::smooth::Smoothed;
+use crate::blocks::waveshaper::{Adaa1, tanh_f1};
 
 /// Longest delay any voice offers (digital), plus room for the read head to
 /// wander under modulation without wrapping past the write head.
@@ -211,13 +212,6 @@ pub struct VoiceDef {
 /// The delay voice registry, aligned with [`FAMILY`]`.pedals`.
 pub static VOICES: [VoiceDef; VOICE_COUNT] = [digital::VOICE, tape::VOICE, vintage::VOICE];
 
-/// Unity small-signal, bounded loud: `tanh(drive·x)/drive`. The `1/drive`
-/// ceiling keeps a saturated feedback loop finite forever (RT rule 7).
-#[inline]
-fn soft_clip(x: f32, drive: f32) -> f32 {
-    (x * drive).tanh() / drive
-}
-
 /// The feedback lowpass corner for a tone-knob position, geometric over the
 /// voice's range.
 #[inline]
@@ -230,6 +224,8 @@ struct DelayChannel {
     buf: Vec<f32>,
     write: usize,
     tone_lp: f32,
+    /// ADAA state for the feedback soft-clipper (anti-aliasing).
+    clip_adaa: Adaa1,
 }
 
 impl DelayChannel {
@@ -267,7 +263,13 @@ impl DelayChannel {
 
         let mut fb_in = x + feedback * wet;
         if def.saturate {
-            fb_in = soft_clip(fb_in, def.drive);
+            let d = def.drive as f64;
+            let d_sq = d * d;
+            fb_in = self.clip_adaa.process(
+                fb_in,
+                |v| (d * v as f64).tanh() / d,
+                |v| tanh_f1(d * v as f64) / d_sq,
+            );
         }
         if fb_in.abs() < 1e-15 {
             fb_in = 0.0;
@@ -280,6 +282,7 @@ impl DelayChannel {
     fn clear(&mut self) {
         self.buf.iter_mut().for_each(|s| *s = 0.0);
         self.write = 0;
+        self.clip_adaa.reset();
         self.tone_lp = 0.0;
     }
 }
@@ -316,6 +319,7 @@ impl Delay {
             buf: Vec::new(),
             write: 0,
             tone_lp: 0.0,
+            clip_adaa: Adaa1::new(),
         };
         // Defaults mirror the digital faceplate (voice 0); a pedal switch
         // re-sends the incoming voice's values from the control shadow.
@@ -363,6 +367,7 @@ impl Effect for Delay {
             // the voice's `mod_*_ms` constants, so stale depths never leak.
             for ch in &mut self.ch {
                 ch.tone_lp = 0.0;
+                ch.clip_adaa.reset();
             }
             self.tone_last = f32::NAN;
         }

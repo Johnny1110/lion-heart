@@ -39,10 +39,26 @@ impl Biquad {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
+        // Flush denormals to zero — prevents CPU spikes on idle filters.
+        // Branch is well-predicted: near-zero when idle, far above threshold
+        // when processing audio.
+        if self.z1.abs() < 1e-30 {
+            self.z1 = 0.0;
+        }
+        if self.z2.abs() < 1e-30 {
+            self.z2 = 0.0;
+        }
         y
     }
 
     fn set(&mut self, b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) {
+        // Guard against invalid coefficients (zero/nonfinite a0 from
+        // extreme parameters) — fall back to unity gain instead of
+        // producing NaN/inf that would propagate through the audio path.
+        if !a0.is_finite() || a0 == 0.0 {
+            *self = Self::default();
+            return;
+        }
         self.b0 = b0 / a0;
         self.b1 = b1 / a0;
         self.b2 = b2 / a0;
@@ -50,8 +66,33 @@ impl Biquad {
         self.a2 = a2 / a0;
     }
 
+    /// Clamp cutoff frequency and Q into safe ranges for RBJ cookbook
+    /// formulas. `fc` must be strictly below Nyquist; `q` must be positive
+    /// and finite. Returns `(fc, q)` or `None` if inputs are unrepairable
+    /// (e.g. nonfinite sample rate), in which case the caller should leave
+    /// the biquad unchanged.
+    fn sanitize(sample_rate: f32, fc: f32, q: f32) -> Option<(f32, f32)> {
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return None;
+        }
+        let nyq = sample_rate * 0.5;
+        let fc = fc.clamp(10.0, nyq * 0.999);
+        let q = q.clamp(0.1, 100.0);
+        if !fc.is_finite() || !q.is_finite() {
+            return None;
+        }
+        Some((fc, q))
+    }
+
     /// Peaking EQ centered on `fc` with `gain_db` boost/cut.
     pub fn set_peaking(&mut self, sample_rate: f32, fc: f32, gain_db: f32, q: f32) {
+        let (fc, q) = match Self::sanitize(sample_rate, fc, q) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let a = 10f32.powf(gain_db / 40.0);
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let alpha = w.sin() / (2.0 * q);
@@ -68,6 +109,13 @@ impl Biquad {
 
     /// Low shelf with corner `fc`, slope 1.
     pub fn set_low_shelf(&mut self, sample_rate: f32, fc: f32, gain_db: f32) {
+        let (fc, _) = match Self::sanitize(sample_rate, fc, 0.707) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let a = 10f32.powf(gain_db / 40.0);
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
@@ -85,6 +133,13 @@ impl Biquad {
 
     /// Highpass (12 dB/oct); `q` shapes the corner (0.707 = Butterworth).
     pub fn set_highpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let (fc, q) = match Self::sanitize(sample_rate, fc, q) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
         let alpha = sin_w / (2.0 * q);
@@ -94,6 +149,13 @@ impl Biquad {
 
     /// Lowpass (12 dB/oct); `q` shapes the corner (0.707 = Butterworth).
     pub fn set_lowpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let (fc, q) = match Self::sanitize(sample_rate, fc, q) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
         let alpha = sin_w / (2.0 * q);
@@ -104,6 +166,13 @@ impl Biquad {
     /// Bandpass (constant 0 dB peak gain) centered on `fc`; `q` sets the
     /// bandwidth. Used for resonant coloring (e.g. vowel formants).
     pub fn set_bandpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let (fc, q) = match Self::sanitize(sample_rate, fc, q) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
         let alpha = sin_w / (2.0 * q);
@@ -114,6 +183,13 @@ impl Biquad {
     /// group delay around `fc` (higher `q` = sharper delay peak). Cascades of
     /// these make dispersive "chirps" (spring reverb).
     pub fn set_allpass(&mut self, sample_rate: f32, fc: f32, q: f32) {
+        let (fc, q) = match Self::sanitize(sample_rate, fc, q) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
         let alpha = sin_w / (2.0 * q);
@@ -144,6 +220,13 @@ impl Biquad {
 
     /// High shelf with corner `fc`, slope 1.
     pub fn set_high_shelf(&mut self, sample_rate: f32, fc: f32, gain_db: f32) {
+        let (fc, _) = match Self::sanitize(sample_rate, fc, 0.707) {
+            Some(v) => v,
+            None => {
+                *self = Self::default();
+                return;
+            }
+        };
         let a = 10f32.powf(gain_db / 40.0);
         let w = 2.0 * std::f32::consts::PI * fc / sample_rate;
         let (sin_w, cos_w) = w.sin_cos();
@@ -270,5 +353,83 @@ mod tests {
         assert!((gain_at(&mut high, 10_000.0) - -9.0).abs() < 1.0);
         high.reset();
         assert!(gain_at(&mut high, 100.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn fc_above_nyquist_is_clamped_not_nan() {
+        // fc above Nyquist is clamped to just below Nyquist — the filter
+        // remains valid (no NaN/inf), just extreme.
+        let mut f = Biquad::default();
+        f.set_highpass(SR, 30_000.0, 0.707); // above Nyquist (24 kHz)
+        assert!(
+            gain_at(&mut f, 1_000.0).is_finite(),
+            "output must be finite"
+        );
+        f.set_lowpass(SR, f32::INFINITY, 0.707);
+        assert!(
+            gain_at(&mut f, 1_000.0).is_finite(),
+            "infinite fc must be finite"
+        );
+    }
+
+    #[test]
+    fn zero_or_negative_q_is_clamped_not_nan() {
+        // q <= 0 is clamped to a safe minimum — the filter remains valid.
+        let mut f = Biquad::default();
+        f.set_peaking(SR, 800.0, 12.0, 0.0); // q=0 → would div by zero
+        assert!(gain_at(&mut f, 800.0).is_finite(), "q=0 must be finite");
+        f.set_highpass(SR, 1_000.0, -1.0); // negative q
+        assert!(
+            gain_at(&mut f, 1_000.0).is_finite(),
+            "negative q must be finite"
+        );
+    }
+
+    #[test]
+    fn nonfinite_sample_rate_falls_back_to_unity() {
+        let mut f = Biquad::default();
+        f.set_lowpass(f32::NAN, 1_000.0, 0.707);
+        assert!(
+            gain_at(&mut f, 1_000.0).abs() < 1.0,
+            "NaN SR should be unity"
+        );
+        f.set_bandpass(0.0, 800.0, 4.0);
+        assert!(
+            gain_at(&mut f, 800.0).abs() < 1.0,
+            "zero SR should be unity"
+        );
+    }
+
+    #[test]
+    fn low_sample_rate_with_max_fc_does_not_explode() {
+        // Global EQ allows up to 20 kHz; at 32 kHz SR that's above Nyquist.
+        let mut f = Biquad::default();
+        f.set_peaking(32_000.0, 20_000.0, 12.0, 1.0);
+        let x = sine(32_000, 1_000.0, 256);
+        let mut y = x.clone();
+        for s in y.iter_mut() {
+            *s = f.process_sample(*s);
+        }
+        assert!(y.iter().all(|s| s.is_finite()), "output must be finite");
+    }
+
+    #[test]
+    fn denormal_states_flush_to_zero() {
+        let mut f = Biquad::default();
+        f.set_lowpass(SR, 100.0, 0.707);
+        // Process a short burst then silence — filter state decays toward
+        // denormal territory. The flush in process_sample should zero it.
+        let burst = sine(SR as u32, 100.0, 64);
+        for s in &burst {
+            f.process_sample(*s);
+        }
+        for _ in 0..10_000 {
+            f.process_sample(0.0);
+        }
+        // After flushing, internal state should be exactly zero.
+        // Process one more zero — if state was denormal (not flushed),
+        // output would be nonzero.
+        let y = f.process_sample(0.0);
+        assert_eq!(y, 0.0, "flushed state produces zero output on silence");
     }
 }

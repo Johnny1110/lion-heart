@@ -32,6 +32,7 @@ use lh_core::{EffectDesc, FamilyDesc, ParamDesc, Range, db_to_lin, drive_law::le
 use crate::Effect;
 use crate::blocks::oversample::{CHUNK, Oversampler4x};
 use crate::blocks::smooth::Smoothed;
+use crate::blocks::waveshaper::{Adaa1, tanh_f1};
 use crate::blocks::{onepole_hz, onepole_ms};
 
 /// A pedal-style position knob `0..=10`.
@@ -199,6 +200,8 @@ pub struct PowerAmp {
     c_depth: f32,
     sag_atk: f32,
     sag_rel: f32,
+    /// ADAA state for the output transformer tanh (base-rate antialiasing).
+    ot_adaa: [Adaa1; 2],
 }
 
 impl Default for PowerAmp {
@@ -231,6 +234,7 @@ impl PowerAmp {
             c_depth: 0.0,
             sag_atk: 0.0,
             sag_rel: 0.0,
+            ot_adaa: [Adaa1::new(), Adaa1::new()],
         }
     }
 }
@@ -274,6 +278,9 @@ impl Effect for PowerAmp {
             f.reset();
         }
         self.env = 0.0;
+        for adaa in &mut self.ot_adaa {
+            adaa.reset();
+        }
     }
 
     fn set_param(&mut self, index: usize, normalized: f32) {
@@ -339,9 +346,24 @@ impl Effect for PowerAmp {
             let depth_traj = &self.depth_traj[..n];
             let master_traj = &self.master_traj[..n];
 
-            for (block, presence_lp, ot_hp, depth_lp, os) in [
-                (&mut *bl, &mut *pres_l, &mut *ot_l, &mut *dep_l, &mut *os_l),
-                (&mut *br, &mut *pres_r, &mut *ot_r, &mut *dep_r, &mut *os_r),
+            let [ot_adaa_l, ot_adaa_r] = &mut self.ot_adaa;
+            for (block, presence_lp, ot_hp, depth_lp, os, ot_adaa) in [
+                (
+                    &mut *bl,
+                    &mut *pres_l,
+                    &mut *ot_l,
+                    &mut *dep_l,
+                    &mut *os_l,
+                    ot_adaa_l,
+                ),
+                (
+                    &mut *br,
+                    &mut *pres_r,
+                    &mut *ot_r,
+                    &mut *dep_r,
+                    &mut *os_r,
+                    ot_adaa_r,
+                ),
             ] {
                 // Presence: high-shelf pre-emphasis into the clipper.
                 let mut gp = Ramp::over(presence_traj, |p| shelf_add(PRESENCE_MAX_DB, p));
@@ -361,12 +383,15 @@ impl Effect for PowerAmp {
                     }
                 });
                 // Output transformer (low-cut + core saturation), depth
-                // resonance, master.
+                // resonance, master. The tanh saturation uses first-order
+                // ADAA to suppress aliasing at the base rate.
                 let mut gd = Ramp::over(depth_traj, |p| shelf_add(DEPTH_MAX_DB, p));
+                let d = OT_DRIVE as f64;
+                let d_sq = d * d;
                 for (s, &m) in block.iter_mut().zip(master_traj) {
                     let x = *s;
                     let hp = x - ot_hp.lp(x, c_ot);
-                    let ot = (hp * OT_DRIVE).tanh() / OT_DRIVE;
+                    let ot = ot_adaa.process(hp, |v| (d * v).tanh() / d, |v| tanh_f1(d * v) / d_sq);
                     let lo = depth_lp.lp(ot, c_depth);
                     *s = (ot + gd.tick() * lo) * level_lin(m);
                 }
