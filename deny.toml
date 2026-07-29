@@ -1,0 +1,36 @@
+[advisories]
+# Keep cargo-deny's default advisory DB location.
+db-path = "$CARGO_HOME/advisory-dbs"
+# Use default severity handling for advisories (vulnerability findings fail the check).
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+# The app crate and most of the workspace are dual-licensed as MIT/Apache.
+# GPL-3.0 is intentionally allowed only for the plugin/VST3 export path,
+# via the vst3-sys dependency used by the VST3 build.
+[[licenses.exceptions]]
+name = "vst3-sys"
+allow = ["GPL-3.0-only", "GPL-3.0-or-later"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "warn"
+allow-registry = [
+    "https://github.com/rust-lang/crates.io-index",
+]
+allow-git = [
+    "https://github.com/robbert-vdh/nih-plug.git",
+]
