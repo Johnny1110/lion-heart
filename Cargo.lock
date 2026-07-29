@@ -2161,6 +2161,7 @@ dependencies = [
  "criterion",
  "lh-core",
  "lh-dsp",
+ "lh-nam",
  "rtrb",
  "thiserror 2.0.18",
 ]
