@@ -1,5 +1,6 @@
 mod cli;
 mod commands;
+#[cfg(feature = "gui")]
 mod gui;
 mod leveling;
 mod recorder;
@@ -19,11 +20,21 @@ use cli::{Cli, Command};
 #[cfg(debug_assertions)]
 #[global_allocator]
 static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        #[cfg(feature = "gui")]
         None => gui::run(cli.gui),
+        #[cfg(not(feature = "gui"))]
+        None => {
+            let args = cli::RunArgs {
+                io: cli.gui.io,
+                gain_db: cli.gui.gain_db,
+                duration: 0,
+                prefill_blocks: cli.gui.prefill_blocks,
+            };
+            commands::run::run(args)
+        }
         Some(Command::Devices) => commands::devices::run(),
         Some(Command::Run(args)) => commands::run::run(args),
         Some(Command::Latency(args)) => commands::latency::run(args),

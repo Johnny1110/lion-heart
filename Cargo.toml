@@ -33,8 +33,9 @@ fft-convolver = "0.4"
 hound = "3.5"
 # song player decode (app crate only — WAV/MP3, pure Rust, permissive)
 symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm", "mp3"] }
-# gui (app crate only — never a dependency of lh-* engine crates)
 iced = { version = "0.14", features = ["canvas"] }
+wgpu = "27"
+ 
 # plugin wrapper (plugin crate only) — pinned rev; VST3 export is GPLv3
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7", features = ["assert_process_allocs"] }
 nih_plug_xtask = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7" }

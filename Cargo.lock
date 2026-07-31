@@ -2290,6 +2290,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "wgpu",
 ]
 
 [[package]]

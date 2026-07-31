@@ -14,13 +14,14 @@
 
 mod browser;
 mod eq;
+#[cfg(feature = "gui")]
+mod gpu;
 mod knob;
 mod meter;
 mod spectrum;
 mod theme;
 mod tuner;
 mod waveform;
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
