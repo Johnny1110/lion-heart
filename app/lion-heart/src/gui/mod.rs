@@ -14,13 +14,14 @@
 
 mod browser;
 mod eq;
+#[cfg(feature = "gui")]
+mod gpu;
 mod knob;
 mod meter;
 mod spectrum;
 mod theme;
 mod tuner;
 mod waveform;
-
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -2019,36 +2020,49 @@ impl Running {
         let telemetry = self.session.chain.telemetry();
         self.ballistics
             .tick(telemetry.peak_in(), telemetry.peak_out());
-        self.meter_cache.clear();
-        self.live_meter_cache.clear();
 
-        // Keep the spectrum window fresh even while the panel is closed
-        // (the tap is drop-on-full either way).
-        if let Some(tap) = &mut self.spectrum_tap {
-            let available = tap.slots();
-            if available > 0
-                && let Ok(chunk) = tap.read_chunk(available)
-            {
-                let (a, b) = chunk.as_slices();
-                self.analyzer.feed(a);
-                self.analyzer.feed(b);
-                chunk.commit_all();
-            }
+        // Only clear meter caches when meters are visible (Board or Live).
+        let meters_visible = matches!(self.view, View::Board | View::Live);
+        if meters_visible {
+            self.meter_cache.clear();
+            self.live_meter_cache.clear();
         }
-        // The EQ canvases (the global view, or a parametric faceplate on
-        // the board) want live spectrum frames; skip the FFT when neither
-        // is showing.
-        let eq_canvas_open = matches!(self.view, View::Eq)
+
+        // Gate spectrum data flow: only read the tap when the EQ canvas
+        // or Live view is showing. This avoids per-frame tap reads when
+        // the user is in the tuner, presets, or settings.
+        let spectrum_visible = matches!(self.view, View::Eq | View::Live)
             || (matches!(self.view, View::Board) && self.selected_is_parametric());
-        if eq_canvas_open && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
-            self.analyzer.update();
-            self.eq_cache.clear();
-            self.pedal_eq_cache.clear();
+        if spectrum_visible {
+            if let Some(tap) = &mut self.spectrum_tap {
+                let available = tap.slots();
+                if available > 0
+                    && let Ok(chunk) = tap.read_chunk(available)
+                {
+                    let (a, b) = chunk.as_slices();
+                    self.analyzer.feed(a);
+                    self.analyzer.feed(b);
+                    chunk.commit_all();
+                }
+            }
+            // The EQ canvases want live spectrum frames; skip the FFT
+            // when the spectrum isn't showing.
+            let eq_canvas_open = matches!(self.view, View::Eq)
+                || (matches!(self.view, View::Board) && self.selected_is_parametric());
+            if eq_canvas_open && self.frame_count.is_multiple_of(SPECTRUM_FRAMES) {
+                self.analyzer.update();
+                self.eq_cache.clear();
+                self.pedal_eq_cache.clear();
+            }
         }
 
         self.drain_tap();
-        if matches!(self.view, View::Tuner | View::Live) {
-            if self.frame_count.is_multiple_of(TUNER_FRAMES) {
+        if matches!(self.view, View::Tuner | View::Live)
+            && self.frame_count.is_multiple_of(TUNER_FRAMES) {
+                let prev_reading = self
+                    .reading
+                    .as_ref()
+                    .map(|(r, _)| (r.note.clone(), r.cents));
                 if let Some(est) = self.tuner.estimate() {
                     self.reading = Some((
                         Reading {
@@ -2065,9 +2079,15 @@ impl Running {
                 {
                     self.reading = None;
                 }
+                // Only clear tuner cache when the reading actually changed.
+                let curr_reading = self
+                    .reading
+                    .as_ref()
+                    .map(|(r, _)| (r.note.clone(), r.cents));
+                if prev_reading != curr_reading {
+                    self.tuner_cache.clear();
+                }
             }
-            self.tuner_cache.clear();
-        }
     }
 
     /// Move tapped input samples into the tuner's sliding window.
@@ -2876,7 +2896,7 @@ impl Running {
             state,
             target: EqTarget::Global,
             selected: self.eq_selected,
-            spectrum: &self.analyzer.bins,
+            spectrum: self.analyzer.bins(),
             spectrum_tag: None,
             sample_rate: self.analyzer.sample_rate(),
             cache: &self.eq_cache,
@@ -2962,7 +2982,7 @@ impl Running {
             state,
             target: EqTarget::Slot(slot.key.clone()),
             selected,
-            spectrum: &self.analyzer.bins,
+            spectrum: self.analyzer.bins(),
             spectrum_tag: Some("OUT"),
             sample_rate: self.analyzer.sample_rate(),
             cache: &self.pedal_eq_cache,
