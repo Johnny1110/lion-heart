@@ -36,6 +36,15 @@ pub const fn dim(color: Color, alpha: f32) -> Color {
     Color { a: alpha, ..color }
 }
 
+/// Spectrum analyzer gradient (professional plugin aesthetic).
+/// Top: saturated purple at 75% alpha, Bottom: deep purple at 15% alpha.
+pub const SPECTRUM_TOP: Color = Color::from_rgba(0.45, 0.28, 0.72, 0.75);
+pub const SPECTRUM_BOTTOM: Color = Color::from_rgba(0.20, 0.12, 0.35, 0.15);
+/// Spectrum outline — brighter than the fill for definition.
+pub const SPECTRUM_LINE: Color = Color::from_rgba(0.58, 0.42, 0.88, 0.80);
+/// EQ curve glow color (soft white-blue halo).
+pub const EQ_GLOW: Color = Color::from_rgba(0.50, 0.70, 0.90, 0.30);
+
 // --- pedal identity colors ---------------------------------------------------
 
 const GATE: Color = Color::from_rgb(0.60, 0.63, 0.66);

@@ -19,7 +19,10 @@ use lh_core::global_eq::{Band, FREQ_MAX, FREQ_MIN, GAIN_DB_MAX, GlobalEqState, Q
 
 use super::Message;
 use super::spectrum::DB_FLOOR;
-use super::theme::{ACCENT, METER_OK, PANEL_HI, TEXT_BRIGHT, TEXT_DIM, TRACK};
+use super::theme::{
+    ACCENT, EQ_GLOW, PANEL_HI, SPECTRUM_BOTTOM, SPECTRUM_LINE, SPECTRUM_TOP, TEXT_BRIGHT, TEXT_DIM,
+    TRACK,
+};
 
 const HIT_RADIUS: f32 = 14.0;
 const HANDLE_RADIUS: f32 = 7.0;
@@ -247,25 +250,41 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 thin(TRACK, 1.0),
             );
 
-            // --- live output spectrum (filled) ---
+            // --- live output spectrum (gradient-filled) ---
             if self.spectrum.len() > 1 {
                 let bins = self.spectrum.len();
-                let path = canvas::Path::new(|b| {
-                    b.move_to(Point::new(0.0, h));
-                    for (i, &db) in self.spectrum.iter().enumerate() {
-                        let x = w * (i as f32 + 0.5) / bins as f32;
-                        b.line_to(Point::new(x, y_of_spectrum(h, db)));
-                    }
-                    b.line_to(Point::new(w, h));
-                    b.close();
-                });
-                frame.fill(
-                    &path,
-                    Color {
-                        a: 0.18,
-                        ..METER_OK
-                    },
-                );
+
+                // Simulated vertical gradient: draw the fill in 4
+                // horizontal bands with increasing alpha from bottom
+                // (transparent) to top (saturated purple). This gives
+                // the spectrum a professional gradient look without
+                // requiring a custom wgpu render pass.
+                let bands = 4;
+                for band in 0..bands {
+                    let t0 = band as f32 / bands as f32;
+                    let t1 = (band + 1) as f32 / bands as f32;
+                    let alpha = SPECTRUM_BOTTOM.a + (SPECTRUM_TOP.a - SPECTRUM_BOTTOM.a) * t1;
+                    let fill_color =
+                        Color::from_rgba(SPECTRUM_TOP.r, SPECTRUM_TOP.g, SPECTRUM_TOP.b, alpha);
+
+                    // Clip each band to its vertical slice
+                    let y_top = h * (1.0 - t1);
+                    let y_bot = h * (1.0 - t0);
+
+                    let path = canvas::Path::new(|b| {
+                        b.move_to(Point::new(0.0, y_bot));
+                        for (i, &db) in self.spectrum.iter().enumerate() {
+                            let x = w * (i as f32 + 0.5) / bins as f32;
+                            let y = y_of_spectrum(h, db).max(y_top).min(y_bot);
+                            b.line_to(Point::new(x, y));
+                        }
+                        b.line_to(Point::new(w, y_bot));
+                        b.close();
+                    });
+                    frame.fill(&path, fill_color);
+                }
+
+                // Spectrum outline — brighter than the fill for definition
                 let line = canvas::Path::new(|b| {
                     for (i, &db) in self.spectrum.iter().enumerate() {
                         let p =
@@ -277,18 +296,17 @@ impl canvas::Program<Message> for EqPanel<'_> {
                         }
                     }
                 });
-                frame.stroke(&line, thin(Color { a: 0.6, ..METER_OK }, 1.0));
+                frame.stroke(&line, thin(SPECTRUM_LINE, 1.5));
+
                 if let Some(tag) = self.spectrum_tag {
-                    frame.fill_text(label(
-                        tag.to_string(),
-                        Point::new(w - 18.0, 6.0),
-                        Color { a: 0.8, ..METER_OK },
-                    ));
+                    frame.fill_text(label(tag.to_string(), Point::new(w - 28.0, 12.0), TEXT_DIM));
                 }
             }
 
-            // --- EQ response curve (the setting) ---
+            // --- EQ response curve with glow ---
             let curve_color = if self.state.enabled { ACCENT } else { TEXT_DIM };
+
+            // Build the curve path (160 points, log-frequency mapped)
             let curve = canvas::Path::new(|b| {
                 for i in 0..CURVE_POINTS {
                     let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
@@ -302,9 +320,54 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     }
                 }
             });
-            frame.stroke(&curve, thin(curve_color, 2.0));
 
-            // --- band handles ---
+            // Glow underlay: wide, low-alpha stroke for a soft halo
+            if self.state.enabled {
+                frame.stroke(
+                    &curve,
+                    canvas::Stroke {
+                        style: canvas::Style::Solid(EQ_GLOW),
+                        width: 6.0,
+                        ..canvas::Stroke::default()
+                    },
+                );
+            }
+
+            // Area fill under the curve (semi-transparent accent)
+            if self.state.enabled {
+                let zero_y = y_of_gain(h, 0.0);
+                let fill_path = canvas::Path::new(|b| {
+                    for i in 0..CURVE_POINTS {
+                        let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
+                        let freq = freq_of_x(w, x);
+                        let db =
+                            lh_dsp::eq::global::response_db(&self.state, self.sample_rate, freq);
+                        let p = Point::new(x, y_of_gain(h, db.clamp(-GAIN_DB_MAX, GAIN_DB_MAX)));
+                        if i == 0 {
+                            b.move_to(p);
+                        } else {
+                            b.line_to(p);
+                        }
+                    }
+                    // Close back along the zero line
+                    b.line_to(Point::new(w, zero_y));
+                    b.line_to(Point::new(0.0, zero_y));
+                    b.close();
+                });
+                frame.fill(&fill_path, Color { a: 0.08, ..ACCENT });
+            }
+
+            // Main curve (bright, thin, on top of glow)
+            frame.stroke(
+                &curve,
+                canvas::Stroke {
+                    style: canvas::Style::Solid(curve_color),
+                    width: 2.0,
+                    ..canvas::Stroke::default()
+                },
+            );
+
+            // --- band handles with glow ---
             for (i, band) in self.state.bands.iter().enumerate() {
                 let at = self.handle_position(frame.size(), i);
                 let selected = i == self.selected;
@@ -316,6 +379,13 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 } else {
                     TEXT_DIM
                 };
+
+                // Glow halo for enabled/selected bands
+                if band.enabled || selected {
+                    let glow_color = Color { a: 0.25, ..color };
+                    frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS + 4.0), glow_color);
+                }
+
                 if band.enabled {
                     frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS), color);
                     frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS - 2.5), PANEL_HI);
@@ -333,6 +403,7 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 ));
             }
         });
+
         let _ = cursor;
         vec![geometry]
     }
