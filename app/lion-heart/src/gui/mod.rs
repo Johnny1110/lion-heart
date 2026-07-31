@@ -2057,8 +2057,8 @@ impl Running {
         }
 
         self.drain_tap();
-        if matches!(self.view, View::Tuner | View::Live) {
-            if self.frame_count.is_multiple_of(TUNER_FRAMES) {
+        if matches!(self.view, View::Tuner | View::Live)
+            && self.frame_count.is_multiple_of(TUNER_FRAMES) {
                 let prev_reading = self
                     .reading
                     .as_ref()
@@ -2088,7 +2088,6 @@ impl Running {
                     self.tuner_cache.clear();
                 }
             }
-        }
     }
 
     /// Move tapped input samples into the tuner's sliding window.
@@ -2897,7 +2896,7 @@ impl Running {
             state,
             target: EqTarget::Global,
             selected: self.eq_selected,
-            spectrum: &self.analyzer.bins(),
+            spectrum: self.analyzer.bins(),
             spectrum_tag: None,
             sample_rate: self.analyzer.sample_rate(),
             cache: &self.eq_cache,
@@ -2983,7 +2982,7 @@ impl Running {
             state,
             target: EqTarget::Slot(slot.key.clone()),
             selected,
-            spectrum: &self.analyzer.bins(),
+            spectrum: self.analyzer.bins(),
             spectrum_tag: Some("OUT"),
             sample_rate: self.analyzer.sample_rate(),
             cache: &self.pedal_eq_cache,

@@ -6,10 +6,14 @@ use super::gpu::fft::{self, GpuFft};
 
 /// Analysis window (~85 ms at 48 kHz — enough low-end resolution to place
 /// a 30 Hz rumble while still tracking playing).
+#[allow(dead_code)]
 pub const FFT_LEN: usize = fft::FFT_LEN;
 /// Log-spaced display bins across 20 Hz – 20 kHz.
+#[allow(dead_code)]
 pub const DISPLAY_BINS: usize = fft::DISPLAY_BINS;
+#[allow(dead_code)]
 pub const FREQ_MIN: f32 = fft::FREQ_MIN;
+#[allow(dead_code)]
 pub const FREQ_MAX: f32 = fft::FREQ_MAX;
 /// Display floor; bins rest here when silent.
 pub const DB_FLOOR: f32 = fft::DB_FLOOR;

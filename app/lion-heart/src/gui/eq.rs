@@ -20,8 +20,8 @@ use lh_core::global_eq::{Band, FREQ_MAX, FREQ_MIN, GAIN_DB_MAX, GlobalEqState, Q
 use super::Message;
 use super::spectrum::DB_FLOOR;
 use super::theme::{
-    ACCENT, EQ_GLOW, METER_OK, PANEL_HI, SPECTRUM_BOTTOM, SPECTRUM_LINE, SPECTRUM_TOP, TEXT_BRIGHT,
-    TEXT_DIM, TRACK,
+    ACCENT, EQ_GLOW, PANEL_HI, SPECTRUM_BOTTOM, SPECTRUM_LINE, SPECTRUM_TOP, TEXT_BRIGHT, TEXT_DIM,
+    TRACK,
 };
 
 const HIT_RADIUS: f32 = 14.0;

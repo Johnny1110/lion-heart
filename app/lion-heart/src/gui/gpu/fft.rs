@@ -75,6 +75,7 @@ impl GpuFft {
 
     /// Create a GPU-preferred analyzer from an external wgpu context. If the
     /// provided context is unusable, this also falls back to CPU-only mode.
+    #[allow(dead_code)]
     pub fn new_with_context(ctx: &GpuContext, sample_rate: u32) -> Self {
         let sample_rate = sample_rate as f32;
         let mut analyzer = Self::new_cpu(sample_rate);
@@ -291,7 +292,7 @@ impl GpuFft {
         }
 
         if let Some(gpu) = self.gpu.as_ref() {
-            let _ = gpu
+            gpu
                 .queue
                 .write_buffer(&gpu.input_buffer, 0, &self.gpu_input_bytes);
         }
@@ -315,7 +316,7 @@ impl GpuFft {
             });
             pass.set_pipeline(&gpu.compute_pipeline);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
-            let workgroups = (COMPLEX_BINS as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+            let workgroups = (COMPLEX_BINS as u32).div_ceil(WORKGROUP_SIZE);
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
