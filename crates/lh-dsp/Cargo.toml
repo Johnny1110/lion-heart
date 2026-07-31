@@ -13,6 +13,7 @@ fft-convolver.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+proptest.workspace = true
 realfft.workspace = true
 # Only for tests/alloc.rs, which installs it as that binary's global allocator.
 assert_no_alloc.workspace = true
