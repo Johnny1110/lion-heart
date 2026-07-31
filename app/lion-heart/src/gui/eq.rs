@@ -303,8 +303,10 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 }
             }
 
-            // --- EQ response curve (the setting) ---
+            // --- EQ response curve with glow ---
             let curve_color = if self.state.enabled { ACCENT } else { TEXT_DIM };
+
+            // Build the curve path (160 points, log-frequency mapped)
             let curve = canvas::Path::new(|b| {
                 for i in 0..CURVE_POINTS {
                     let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
@@ -318,9 +320,54 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     }
                 }
             });
-            frame.stroke(&curve, thin(curve_color, 2.0));
 
-            // --- band handles ---
+            // Glow underlay: wide, low-alpha stroke for a soft halo
+            if self.state.enabled {
+                frame.stroke(
+                    &curve,
+                    canvas::Stroke {
+                        style: canvas::Style::Solid(EQ_GLOW),
+                        width: 6.0,
+                        ..canvas::Stroke::default()
+                    },
+                );
+            }
+
+            // Area fill under the curve (semi-transparent accent)
+            if self.state.enabled {
+                let zero_y = y_of_gain(h, 0.0);
+                let fill_path = canvas::Path::new(|b| {
+                    for i in 0..CURVE_POINTS {
+                        let x = w * i as f32 / (CURVE_POINTS - 1) as f32;
+                        let freq = freq_of_x(w, x);
+                        let db =
+                            lh_dsp::eq::global::response_db(&self.state, self.sample_rate, freq);
+                        let p = Point::new(x, y_of_gain(h, db.clamp(-GAIN_DB_MAX, GAIN_DB_MAX)));
+                        if i == 0 {
+                            b.move_to(p);
+                        } else {
+                            b.line_to(p);
+                        }
+                    }
+                    // Close back along the zero line
+                    b.line_to(Point::new(w, zero_y));
+                    b.line_to(Point::new(0.0, zero_y));
+                    b.close();
+                });
+                frame.fill(&fill_path, Color { a: 0.08, ..ACCENT });
+            }
+
+            // Main curve (bright, thin, on top of glow)
+            frame.stroke(
+                &curve,
+                canvas::Stroke {
+                    style: canvas::Style::Solid(curve_color),
+                    width: 2.0,
+                    ..canvas::Stroke::default()
+                },
+            );
+
+            // --- band handles with glow ---
             for (i, band) in self.state.bands.iter().enumerate() {
                 let at = self.handle_position(frame.size(), i);
                 let selected = i == self.selected;
@@ -332,6 +379,13 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 } else {
                     TEXT_DIM
                 };
+
+                // Glow halo for enabled/selected bands
+                if band.enabled || selected {
+                    let glow_color = Color { a: 0.25, ..color };
+                    frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS + 4.0), glow_color);
+                }
+
                 if band.enabled {
                     frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS), color);
                     frame.fill(&canvas::Path::circle(at, HANDLE_RADIUS - 2.5), PANEL_HI);
@@ -349,6 +403,7 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 ));
             }
         });
+
         let _ = cursor;
         vec![geometry]
     }
