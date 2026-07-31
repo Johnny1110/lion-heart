@@ -19,7 +19,10 @@ use lh_core::global_eq::{Band, FREQ_MAX, FREQ_MIN, GAIN_DB_MAX, GlobalEqState, Q
 
 use super::Message;
 use super::spectrum::DB_FLOOR;
-use super::theme::{ACCENT, METER_OK, PANEL_HI, TEXT_BRIGHT, TEXT_DIM, TRACK};
+use super::theme::{
+    ACCENT, EQ_GLOW, METER_OK, PANEL_HI, SPECTRUM_BOTTOM, SPECTRUM_LINE, SPECTRUM_TOP, TEXT_BRIGHT,
+    TEXT_DIM, TRACK,
+};
 
 const HIT_RADIUS: f32 = 14.0;
 const HANDLE_RADIUS: f32 = 7.0;
@@ -247,25 +250,41 @@ impl canvas::Program<Message> for EqPanel<'_> {
                 thin(TRACK, 1.0),
             );
 
-            // --- live output spectrum (filled) ---
+            // --- live output spectrum (gradient-filled) ---
             if self.spectrum.len() > 1 {
                 let bins = self.spectrum.len();
-                let path = canvas::Path::new(|b| {
-                    b.move_to(Point::new(0.0, h));
-                    for (i, &db) in self.spectrum.iter().enumerate() {
-                        let x = w * (i as f32 + 0.5) / bins as f32;
-                        b.line_to(Point::new(x, y_of_spectrum(h, db)));
-                    }
-                    b.line_to(Point::new(w, h));
-                    b.close();
-                });
-                frame.fill(
-                    &path,
-                    Color {
-                        a: 0.18,
-                        ..METER_OK
-                    },
-                );
+
+                // Simulated vertical gradient: draw the fill in 4
+                // horizontal bands with increasing alpha from bottom
+                // (transparent) to top (saturated purple). This gives
+                // the spectrum a professional gradient look without
+                // requiring a custom wgpu render pass.
+                let bands = 4;
+                for band in 0..bands {
+                    let t0 = band as f32 / bands as f32;
+                    let t1 = (band + 1) as f32 / bands as f32;
+                    let alpha = SPECTRUM_BOTTOM.a + (SPECTRUM_TOP.a - SPECTRUM_BOTTOM.a) * t1;
+                    let fill_color =
+                        Color::from_rgba(SPECTRUM_TOP.r, SPECTRUM_TOP.g, SPECTRUM_TOP.b, alpha);
+
+                    // Clip each band to its vertical slice
+                    let y_top = h * (1.0 - t1);
+                    let y_bot = h * (1.0 - t0);
+
+                    let path = canvas::Path::new(|b| {
+                        b.move_to(Point::new(0.0, y_bot));
+                        for (i, &db) in self.spectrum.iter().enumerate() {
+                            let x = w * (i as f32 + 0.5) / bins as f32;
+                            let y = y_of_spectrum(h, db).max(y_top).min(y_bot);
+                            b.line_to(Point::new(x, y));
+                        }
+                        b.line_to(Point::new(w, y_bot));
+                        b.close();
+                    });
+                    frame.fill(&path, fill_color);
+                }
+
+                // Spectrum outline — brighter than the fill for definition
                 let line = canvas::Path::new(|b| {
                     for (i, &db) in self.spectrum.iter().enumerate() {
                         let p =
@@ -277,13 +296,10 @@ impl canvas::Program<Message> for EqPanel<'_> {
                         }
                     }
                 });
-                frame.stroke(&line, thin(Color { a: 0.6, ..METER_OK }, 1.0));
+                frame.stroke(&line, thin(SPECTRUM_LINE, 1.5));
+
                 if let Some(tag) = self.spectrum_tag {
-                    frame.fill_text(label(
-                        tag.to_string(),
-                        Point::new(w - 18.0, 6.0),
-                        Color { a: 0.8, ..METER_OK },
-                    ));
+                    frame.fill_text(label(tag.to_string(), Point::new(w - 28.0, 12.0), TEXT_DIM));
                 }
             }
 

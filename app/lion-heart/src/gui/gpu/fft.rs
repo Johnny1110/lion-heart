@@ -1,12 +1,12 @@
-//! GPU FFT compute pipeline: replaces realfft's CPU-based spectrum analyzer.
-//! Feeds audio tap samples into a wgpu storage buffer, dispatches a
-//! compute shader for magnitude computation, and reads back display bins.
-//! The FFT itself is currently performed on the GUI thread using realfft,
-//! while the compute pass performs magnitude extraction.
+//! GPU FFT compute pipeline: replaces realfft's CPU-only spectrum analyzer path with a
+//! wgpu compute stage for magnitude extraction. The GUI thread still owns all
+//! analysis work and no audio-thread code is touched.
 
 use std::mem::size_of;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, mpsc};
 
+use pollster::block_on;
 use realfft::num_complex::Complex;
 use realfft::{RealFftPlanner, RealToComplex};
 
@@ -26,9 +26,19 @@ pub const DB_FLOOR: f32 = -90.0;
 const RELEASE_DB: f32 = 0.6;
 
 const COMPLEX_BINS: usize = FFT_LEN / 2 + 1;
-const COMPLEX_BYTES: u64 = (COMPLEX_BINS * size_of::<f32>() * 2) as u64;
+const SAMPLE_BYTES: u64 = (FFT_LEN * size_of::<f32>()) as u64;
 const MAG_BYTES: u64 = (COMPLEX_BINS * size_of::<f32>()) as u64;
 const WORKGROUP_SIZE: u32 = 64;
+
+struct GpuState {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    input_buffer: wgpu::Buffer,
+    output_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    compute_pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+}
 
 pub struct GpuFft {
     sample_rate: f32,
@@ -43,63 +53,119 @@ pub struct GpuFft {
     /// FFT-bin range per display bin.
     ranges: Vec<(usize, usize)>,
     /// Display values in dBFS with ballistics applied.
-    pub bins: Vec<f32>,
+    bins: Vec<f32>,
 
-    // WGPU resources.
-    device: Arc<wgpu::Device>,
-    queue: Arc<wgpu::Queue>,
-    input_buffer: wgpu::Buffer,
-    output_buffer: wgpu::Buffer,
-    readback_buffer: wgpu::Buffer,
-    compute_pipeline: wgpu::ComputePipeline,
-    bind_group: wgpu::BindGroup,
-    fft_bytes: Vec<u8>,
+    gpu: Option<GpuState>,
+    gpu_input_bytes: Vec<u8>,
     fft_magnitudes: Vec<f32>,
 }
 
 impl GpuFft {
-    pub fn new(ctx: &GpuContext, sample_rate: u32) -> Self {
+    /// Create a GPU-preferred analyzer. If no compatible GPU adapter/device can be
+    /// acquired, construction still succeeds and the analyzer falls back to CPU
+    /// magnitude computation.
+    pub fn new(sample_rate: u32) -> Self {
         let sample_rate = sample_rate as f32;
-        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_LEN);
+        let mut analyzer = Self::new_cpu(sample_rate);
+        if let Some((device, queue)) = Self::default_wgpu_device() {
+            analyzer.gpu = Self::init_gpu_state(&device, &queue);
+        }
+        analyzer
+    }
+
+    /// Create a GPU-preferred analyzer from an external wgpu context. If the
+    /// provided context is unusable, this also falls back to CPU-only mode.
+    pub fn new_with_context(ctx: &GpuContext, sample_rate: u32) -> Self {
+        let sample_rate = sample_rate as f32;
+        let mut analyzer = Self::new_cpu(sample_rate);
+        analyzer.gpu = Self::init_gpu_state(&ctx.device, &ctx.queue);
+        analyzer
+    }
+
+    fn new_cpu(sample_rate: f32) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(FFT_LEN);
         let hann: Vec<f32> = (0..FFT_LEN)
             .map(|i| {
                 let phase = std::f32::consts::TAU * i as f32 / FFT_LEN as f32;
                 0.5 * (1.0 - phase.cos())
             })
             .collect();
-        let ranges = compute_ranges(sample_rate);
 
-        let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spectrum_fft_input"),
-            size: COMPLEX_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spectrum_fft_output"),
-            size: MAG_BYTES,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        // WGPU can only create a readback buffer once the compute shader has
-        // written into a storage buffer.
-        let readback_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spectrum_fft_readback"),
-            size: MAG_BYTES,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let output = fft.make_output_vec();
+        let scratch = fft.make_scratch_vec();
+        Self {
+            sample_rate,
+            window: vec![0.0; FFT_LEN],
+            write: 0,
+            hann,
+            fft,
+            input: vec![0.0f32; FFT_LEN],
+            output,
+            scratch,
+            ranges: compute_ranges(sample_rate),
+            bins: vec![DB_FLOOR; DISPLAY_BINS],
+            gpu: None,
+            gpu_input_bytes: vec![0u8; SAMPLE_BYTES as usize],
+            fft_magnitudes: vec![0.0f32; COMPLEX_BINS],
+        }
+    }
 
-        let shader = ctx
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
+    fn default_wgpu_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        let adapter = instance
+            .enumerate_adapters(wgpu::Backends::all())
+            .into_iter()
+            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)?;
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("lion-heart-spectrum-analyzer"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                trace: wgpu::Trace::Off,
+            }))
+        }))
+        .ok()?;
+
+        match result {
+            Ok((device, queue)) => Some((Arc::new(device), Arc::new(queue))),
+            Err(_) => None,
+        }
+    }
+
+    fn init_gpu_state(device: &Arc<wgpu::Device>, queue: &Arc<wgpu::Queue>) -> Option<GpuState> {
+        let state = catch_unwind(AssertUnwindSafe(|| {
+            let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spectrum_fft_input"),
+                size: SAMPLE_BYTES,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spectrum_fft_output"),
+                size: MAG_BYTES,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            // WGPU can only create a readback buffer once the compute shader has
+            // written into a storage buffer.
+            let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("spectrum_fft_readback"),
+                size: MAG_BYTES,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("spectrum_wgpu_shader"),
                 source: wgpu::ShaderSource::Wgsl(shaders::SPECTRUM_WGSL.into()),
             });
 
-        let bind_group_layout =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("spectrum_bind_group_layout"),
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
@@ -125,33 +191,30 @@ impl GpuFft {
                     ],
                 });
 
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("spectrum_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: input_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: output_buffer.as_entire_binding(),
-                },
-            ],
-        });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("spectrum_bind_group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: input_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                ],
+            });
 
-        let pipeline_layout = ctx
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("spectrum_pipeline_layout"),
                 bind_group_layouts: &[&bind_group_layout],
                 push_constant_ranges: &[],
             });
 
-        let compute_pipeline =
-            ctx.device
-                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("spectrum_magnitude_pipeline"),
+            let compute_pipeline =
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("spectrum_dft_pipeline"),
                     layout: Some(&pipeline_layout),
                     module: &shader,
                     entry_point: Some("main"),
@@ -159,37 +222,27 @@ impl GpuFft {
                     cache: None,
                 });
 
-        let input = vec![0.0f32; FFT_LEN];
-        let output = fft.make_output_vec();
-        let scratch = fft.make_scratch_vec();
-        let fft_bytes = vec![0u8; COMPLEX_BYTES as usize];
-        let fft_magnitudes = vec![0.0f32; COMPLEX_BINS];
+            GpuState {
+                device: Arc::clone(device),
+                queue: Arc::clone(queue),
+                input_buffer,
+                output_buffer,
+                readback_buffer,
+                compute_pipeline,
+                bind_group,
+            }
+        }));
 
-        Self {
-            sample_rate,
-            window: vec![0.0; FFT_LEN],
-            write: 0,
-            hann,
-            fft,
-            input,
-            output,
-            scratch,
-            ranges,
-            bins: vec![DB_FLOOR; DISPLAY_BINS],
-            device: Arc::clone(&ctx.device),
-            queue: Arc::clone(&ctx.queue),
-            input_buffer,
-            output_buffer,
-            readback_buffer,
-            compute_pipeline,
-            bind_group,
-            fft_bytes,
-            fft_magnitudes,
-        }
+        state.ok()
     }
 
     pub fn sample_rate(&self) -> f32 {
         self.sample_rate
+    }
+
+    /// Display values in dBFS with ballistics applied.
+    pub fn bins(&self) -> &[f32] {
+        &self.bins
     }
 
     /// Append tapped samples into the sliding window.
@@ -207,35 +260,49 @@ impl GpuFft {
             *x = self.window[(self.write + i) % n] * self.hann[i];
         }
 
-        if self
-            .fft
-            .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch)
-            .is_err()
-        {
-            return;
-        }
+        let used_gpu = if self.gpu.is_some() {
+            self.pack_window();
+            self.dispatch_gpu_magnitude()
+        } else {
+            false
+        };
 
-        self.pack_complex_input();
-        if !self.dispatch_gpu_magnitude() {
+        if !used_gpu {
+            if self
+                .fft
+                .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch)
+                .is_err()
+            {
+                return;
+            }
             self.compute_magnitudes_cpu();
         }
+
         self.aggregate_to_display_bins();
     }
 
-    fn pack_complex_input(&mut self) {
-        let mut chunks = self.fft_bytes.chunks_exact_mut(8);
-        for (slot, sample) in chunks.by_ref().zip(self.output.iter()) {
-            slot[0..4].copy_from_slice(&sample.re.to_ne_bytes());
-            slot[4..8].copy_from_slice(&sample.im.to_ne_bytes());
+    fn pack_window(&mut self) {
+        for (slot, sample) in self
+            .gpu_input_bytes
+            .chunks_exact_mut(size_of::<f32>())
+            .zip(self.input.iter())
+        {
+            slot.copy_from_slice(&sample.to_ne_bytes());
         }
 
-        let _ = self
-            .queue
-            .write_buffer(&self.input_buffer, 0, &self.fft_bytes);
+        if let Some(gpu) = self.gpu.as_ref() {
+            let _ = gpu
+                .queue
+                .write_buffer(&gpu.input_buffer, 0, &self.gpu_input_bytes);
+        }
     }
 
     fn dispatch_gpu_magnitude(&mut self) -> bool {
-        let mut encoder = self
+        let Some(gpu) = self.gpu.as_ref() else {
+            return false;
+        };
+
+        let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("spectrum_magnitude_encoder"),
@@ -246,22 +313,22 @@ impl GpuFft {
                 label: Some("spectrum_magnitude_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.compute_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_pipeline(&gpu.compute_pipeline);
+            pass.set_bind_group(0, &gpu.bind_group, &[]);
             let workgroups = (COMPLEX_BINS as u32 + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&self.output_buffer, 0, &self.readback_buffer, 0, MAG_BYTES);
+        encoder.copy_buffer_to_buffer(&gpu.output_buffer, 0, &gpu.readback_buffer, 0, MAG_BYTES);
 
-        self.queue.submit(Some(encoder.finish()));
+        gpu.queue.submit(Some(encoder.finish()));
 
-        let slice = self.readback_buffer.slice(..);
+        let slice = gpu.readback_buffer.slice(..);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
 
         let ok = match rx.recv() {
             Ok(Ok(())) => {
@@ -271,8 +338,7 @@ impl GpuFft {
                     .iter_mut()
                     .zip(data.chunks_exact(size_of::<f32>()).take(COMPLEX_BINS))
                 {
-                    let bytes = [chunk[0], chunk[1], chunk[2], chunk[3]];
-                    *dst = f32::from_ne_bytes(bytes);
+                    *dst = f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
                 drop(data);
                 true
@@ -281,7 +347,7 @@ impl GpuFft {
         };
 
         if ok {
-            self.readback_buffer.unmap();
+            gpu.readback_buffer.unmap();
         }
         ok
     }
@@ -337,29 +403,18 @@ mod tests {
         assert_eq!(FREQ_MAX, 20_000.0);
         assert_eq!(DB_FLOOR, -90.0);
     }
-
     #[test]
-    fn bin_ranges_are_log_spaced() {
+    fn bin_ranges_cover_expected_band() {
         let sample_rate = 48_000.0f32;
         let ranges = compute_ranges(sample_rate);
+        let bin_hz = sample_rate / FFT_LEN as f32;
+        let freq_max_bin = ((FREQ_MAX / bin_hz).ceil() as usize).clamp(1, FFT_LEN / 2);
+
         assert_eq!(ranges.len(), DISPLAY_BINS);
-        // First bin should cover the lowest frequencies.
         assert!(ranges[0].0 <= 1 || ranges[0].1 >= 1);
-        // Last bin should cover near Nyquist.
-        assert!(ranges.last().unwrap().1 >= FFT_LEN / 2 - 10);
-    }
-
-    #[test]
-    fn ranges_are_monotonic_and_in_bounds() {
-        let sample_rate = 48_000.0f32;
-        let ranges = compute_ranges(sample_rate);
-        let mut prev_hi = 0usize;
-        for &(lo, hi) in &ranges {
-            assert!(lo < hi);
-            assert!(lo <= FFT_LEN / 2);
-            assert!(hi <= FFT_LEN / 2 + 1);
-            assert!(hi > prev_hi);
-            prev_hi = hi;
-        }
+        assert!(ranges.iter().all(|&(_lo, hi)| _lo < hi));
+        assert!(ranges.iter().all(|&(_lo, _hi)| _lo <= FFT_LEN / 2));
+        assert!(ranges.iter().all(|&(_lo, hi)| hi <= FFT_LEN / 2 + 1));
+        assert!(ranges.last().unwrap().1 >= freq_max_bin);
     }
 }
