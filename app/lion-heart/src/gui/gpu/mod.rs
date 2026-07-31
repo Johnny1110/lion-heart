@@ -1,5 +1,11 @@
-//! wgpu pipeline manager: device/queue access, shader loading,
-//! render pass orchestration. Lives alongside iced's wgpu renderer.
+//! wgpu pipeline manager module for GUI-side compute paths.
+//! Keeps GPU resource wrappers available from the renderer entrypoint.
+pub mod fft;
+pub mod shaders;
+
+// Module doc comments previously appeared after `mod` declarations; keep
+// GPU context definitions grouped with a single top-level module preface.
+// The GPU context is consumed by analyzer/effect widgets when needed.
 
 use std::sync::Arc;
 
