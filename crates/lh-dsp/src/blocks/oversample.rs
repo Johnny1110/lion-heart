@@ -34,6 +34,73 @@ fn design_halfband() -> Vec<f32> {
         .collect()
 }
 
+// --- SIMD dot product helper --------------------------------------------------
+
+/// Compute the dot product Σ taps[j] · w[TAPS-1-j] using AVX2 FMA when
+/// available, falling back to scalar. The window `w` is already aligned to
+/// the filter's reverse order (see callers). Runtime-detected once.
+#[inline]
+fn dot_reverse(taps: &[f32], w: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { dot_reverse_avx2(taps, w) };
+        }
+    }
+    dot_reverse_scalar(taps, w)
+}
+
+/// Scalar fallback for `dot_reverse`. Used when AVX2 is unavailable.
+#[inline]
+fn dot_reverse_scalar(taps: &[f32], w: &[f32]) -> f32 {
+    taps.iter()
+        .enumerate()
+        .map(|(j, &c)| c * w[w.len() - 1 - j])
+        .sum()
+}
+
+/// AVX2 + FMA dot product. Processes 8 f32 lanes at a time with
+/// `_mm256_fmadd_ps`, then horizontal-sums. Falls back to scalar for the tail.
+///
+/// # Safety
+/// Caller must ensure AVX2 is supported on the CPU (checked by caller).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn dot_reverse_avx2(taps: &[f32], w: &[f32]) -> f32 { unsafe {
+    use core::arch::x86_64::*;
+
+    let n = taps.len().min(w.len());
+    let n_simd = n & !7; // round down to multiple of 8
+    let mut acc = _mm256_setzero_ps();
+
+    // The scalar code accesses w[w.len() - 1 - j] for tap j.
+    // w_rev[j] = w[w.len() - 1 - j], which is the same thing.
+    let mut w_rev = [0.0f32; 64]; // max 33 taps + padding
+    for i in 0..n {
+        w_rev[i] = w[w.len() - 1 - i];
+    }
+
+    for j in (0..n_simd).step_by(8) {
+        let t = _mm256_loadu_ps(taps.as_ptr().add(j));
+        let x = _mm256_loadu_ps(w_rev.as_ptr().add(j));
+        acc = _mm256_fmadd_ps(t, x, acc);
+    }
+
+    // Horizontal sum of acc (8 f32 lanes)
+    let mut low = [0.0f32; 4];
+    let mut high = [0.0f32; 4];
+    _mm_storeu_ps(low.as_mut_ptr(), _mm256_extractf128_ps(acc, 0));
+    _mm_storeu_ps(high.as_mut_ptr(), _mm256_extractf128_ps(acc, 1));
+    let mut total = low[0] + low[1] + low[2] + low[3];
+    total += high[0] + high[1] + high[2] + high[3];
+
+    // Tail: remaining elements beyond SIMD width
+    for j in n_simd..n {
+        total += taps[j] * w_rev[j];
+    }
+    total
+}}
+
 /// 1 → 2 samples. Polyphase: the zero-stuffed convolution splits into an
 /// even phase (h[0], h[2], …) and an odd phase (h[1], h[3], …), each running
 /// at the input rate. Taps are scaled ×2 to preserve amplitude.
@@ -76,16 +143,8 @@ impl Upsampler2x {
             // Each polyphase branch is a plain FIR over x: y[2i] = Σ even[j]·x[i-j],
             // y[2i+1] = Σ odd[j]·x[i-j].
             let w = &self.ext[i..i + HALF + 1];
-            let mut even_acc = 0.0f32;
-            for (j, c) in self.even.iter().enumerate() {
-                even_acc += c * w[HALF - j];
-            }
-            let mut odd_acc = 0.0f32;
-            for (j, c) in self.odd.iter().enumerate() {
-                odd_acc += c * w[HALF - j];
-            }
-            out[2 * i] = even_acc;
-            out[2 * i + 1] = odd_acc;
+            out[2 * i] = dot_reverse(&self.even, w);
+            out[2 * i + 1] = dot_reverse(&self.odd, w);
         }
         let n = self.ext.len();
         self.hist.copy_from_slice(&self.ext[n - HALF..]);
@@ -126,11 +185,7 @@ impl Downsampler2x {
         for (i, o) in out.iter_mut().enumerate() {
             // Window covering v[2i-32] ..= v[2i]; w[TAPS-1-j] == v[2i - j].
             let w = &self.ext[2 * i..2 * i + TAPS];
-            let mut acc = 0.0f32;
-            for (j, c) in self.taps.iter().enumerate() {
-                acc += c * w[TAPS - 1 - j];
-            }
-            *o = acc;
+            *o = dot_reverse(&self.taps, w);
         }
         let n = self.ext.len();
         self.hist.copy_from_slice(&self.ext[n - (TAPS - 1)..]);
