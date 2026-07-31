@@ -25,12 +25,13 @@ serde_json.workspace = true
 # Spectrum analyzer FFT (GUI thread only — never on the audio path).
 realfft = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
 # Song-player decode (loader thread only — never on the audio path).
 symphonia.workspace = true
 
 [features]
 default = ["gui"]
-gui = ["dep:iced", "dep:realfft", "dep:wgpu"]
+gui = ["dep:iced", "dep:realfft", "dep:wgpu", "dep:pollster"]
 
 [dev-dependencies]
 # Write WAV fixtures for the song-loader round-trip test.
