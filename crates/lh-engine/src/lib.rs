@@ -962,6 +962,56 @@ impl ChainHandle {
         rows
     }
 
+    /// The `profile` table as display lines, mirroring [`meter_line`] —
+    /// formatting lives beside the data so it can be tested against a real
+    /// chain rather than hand-built numbers. Callers add their own indent.
+    ///
+    /// [`meter_line`]: Self::meter_line
+    pub fn profile_lines(&self) -> Vec<String> {
+        let snap = self.telemetry.profile().snapshot();
+        if snap.blocks == 0 {
+            return vec![if snap.enabled {
+                "no blocks measured yet — play a little, then `profile`".to_string()
+            } else {
+                "profiling is off — `profile on`, play a little, then `profile`".to_string()
+            }];
+        }
+
+        let us = |ns: u64| ns as f64 / 1e3;
+        let mut lines = vec![
+            format!(
+                "{} — {:.1}% of budget ({:.0} µs of {:.0} µs), {} blocks, {} deadline misses",
+                snap.load().label(),
+                snap.load_percent,
+                us(snap.block_last_nanos),
+                us(snap.budget_nanos),
+                snap.blocks,
+                snap.deadline_misses,
+            ),
+            format!("worst block so far {:.0} µs", us(snap.block_peak_nanos)),
+            format!(
+                "{:<12} {:>9} {:>9} {:>9}  {:>6}",
+                "pedal", "last µs", "avg µs", "peak µs", "budget"
+            ),
+        ];
+        for (handle, t) in self.profile_report() {
+            lines.push(format!(
+                "{:<12} {:>9.1} {:>9.1} {:>9.1}  {:>5.1}%{}",
+                handle,
+                us(t.last_nanos),
+                us(t.avg_nanos),
+                us(t.peak_nanos),
+                t.budget_percent,
+                if t.is_overloaded() {
+                    "  OVERLOADED"
+                } else {
+                    ""
+                },
+            ));
+        }
+        lines
+    }
+
     /// The stream sample rate, used to prepare effects installed later.
     pub fn set_sample_rate(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate;

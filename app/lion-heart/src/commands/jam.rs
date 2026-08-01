@@ -175,45 +175,8 @@ fn print_state(session: &Session) {
 
 /// Render the per-pedal DSP timing table (`profile` with no argument).
 fn print_profile(session: &Session) {
-    let snap = session.chain.telemetry().profile().snapshot();
-    if !snap.enabled && snap.blocks == 0 {
-        println!("  profiling is off — `profile on`, play a little, then `profile`");
-        return;
-    }
-    if snap.blocks == 0 {
-        println!("  no blocks measured yet — play a little, then `profile`");
-        return;
-    }
-
-    let us = |ns: u64| ns as f64 / 1e3;
-    println!(
-        "  {} — {:.1}% of budget ({:.0} µs of {:.0} µs), {} blocks, {} deadline misses",
-        snap.load().label(),
-        snap.load_percent,
-        us(snap.block_last_nanos),
-        us(snap.budget_nanos),
-        snap.blocks,
-        snap.deadline_misses,
-    );
-    println!("  worst block so far {:.0} µs", us(snap.block_peak_nanos));
-    println!(
-        "  {:<12} {:>9} {:>9} {:>9}  {:>6}",
-        "pedal", "last µs", "avg µs", "peak µs", "budget"
-    );
-    for (handle, t) in session.chain.profile_report() {
-        println!(
-            "  {:<12} {:>9.1} {:>9.1} {:>9.1}  {:>5.1}%{}",
-            handle,
-            us(t.last_nanos),
-            us(t.avg_nanos),
-            us(t.peak_nanos),
-            t.budget_percent,
-            if t.is_overloaded() {
-                "  OVERLOADED"
-            } else {
-                ""
-            },
-        );
+    for line in session.chain.profile_lines() {
+        println!("  {line}");
     }
 }
 

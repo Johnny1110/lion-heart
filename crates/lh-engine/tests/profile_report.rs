@@ -170,3 +170,48 @@ fn enabling_through_the_handle_reaches_the_audio_thread() {
         "switching off must stop recording again"
     );
 }
+
+#[test]
+fn lines_explain_themselves_before_any_measurement() {
+    let (_chain, handle) = build_chain(pedalboard());
+    let lines = handle.profile_lines();
+    assert_eq!(lines.len(), 1);
+    assert!(
+        lines[0].contains("profiling is off"),
+        "an unprofiled chain should say how to start, got {:?}",
+        lines[0]
+    );
+
+    handle.telemetry().profile().set_enabled(true);
+    let lines = handle.profile_lines();
+    assert!(
+        lines[0].contains("no blocks measured yet"),
+        "enabled but silent should say so, got {:?}",
+        lines[0]
+    );
+}
+
+#[test]
+fn lines_render_a_table_for_every_pedal() {
+    let (mut chain, handle) = build_chain(pedalboard());
+    chain.prepare(SR);
+    handle.telemetry().profile().set_enabled(true);
+    run_blocks(&mut chain, 64);
+
+    let lines = handle.profile_lines();
+    // header line + "worst block" + column head + one row per pedal
+    assert_eq!(lines.len(), 3 + 3, "got {lines:#?}");
+    assert!(
+        lines[0].starts_with("OK"),
+        "a light chain is not overloaded: {:?}",
+        lines[0]
+    );
+    assert!(lines[0].contains("64 blocks"));
+    assert!(lines[2].contains("pedal") && lines[2].contains("peak µs"));
+    for name in ["gate", "drive", "delay"] {
+        assert!(
+            lines[3..].iter().any(|l| l.starts_with(name)),
+            "{name} missing from the table: {lines:#?}"
+        );
+    }
+}
