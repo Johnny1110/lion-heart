@@ -66,6 +66,8 @@ commands:
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
   stats                        stream health (xruns, callback time)
+  profile on|off|reset         per-pedal DSP timing (off by default)
+  profile                      show which pedal is eating the block
   quit                         stop and exit";
 
 pub fn run(args: JamArgs) -> Result<()> {
@@ -171,6 +173,13 @@ fn print_state(session: &Session) {
     println!("  assets  nam: {nam}   ir: {ir}");
 }
 
+/// Render the per-pedal DSP timing table (`profile` with no argument).
+fn print_profile(session: &Session) {
+    for line in session.chain.profile_lines() {
+        println!("  {line}");
+    }
+}
+
 fn load_preset(session: &mut Session, name: &str) {
     match session.load_preset(name) {
         Ok(lines) => {
@@ -225,6 +234,25 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 s.max_callback_millis(),
                 s.stream_errors,
             );
+        }
+        Some("profile") => {
+            let profiler = session.chain.telemetry().profile();
+            match parts.next() {
+                Some("on") => {
+                    profiler.set_enabled(true);
+                    println!("  profiling on — play a little, then `profile`");
+                }
+                Some("off") => {
+                    profiler.set_enabled(false);
+                    println!("  profiling off");
+                }
+                Some("reset") => {
+                    profiler.reset();
+                    println!("  counters cleared");
+                }
+                None => print_profile(session),
+                _ => println!("  usage: profile [on|off|reset]"),
+            }
         }
         Some("save") => match parts.next() {
             Some(name) if parts.next().is_none() => match session.save_preset(name) {
