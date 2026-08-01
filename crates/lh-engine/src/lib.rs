@@ -15,6 +15,8 @@
 //! removals and the new order apply together at the bottom of the fade —
 //! untouched slots keep their state, so delay/reverb tails survive edits.
 
+pub mod profile;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -128,11 +130,12 @@ pub fn is_pedal_selector(param_key: &str) -> bool {
     matches!(param_key, "pedal" | "model" | "type")
 }
 
-/// Block peaks published by the audio thread (f32 bits in atomics).
+/// Block peaks and DSP timing published by the audio thread.
 #[derive(Debug, Default)]
 pub struct Telemetry {
     peak_in_bits: AtomicU32,
     peak_out_bits: AtomicU32,
+    profile: profile::SlotProfiler,
 }
 
 impl Telemetry {
@@ -142,6 +145,12 @@ impl Telemetry {
 
     pub fn peak_out(&self) -> f32 {
         f32::from_bits(self.peak_out_bits.load(Ordering::Relaxed))
+    }
+
+    /// Per-slot DSP timing. Off by default — switch it on to find which
+    /// pedal is eating the block, then switch it back off.
+    pub fn profile(&self) -> &profile::SlotProfiler {
+        &self.profile
     }
 }
 
@@ -758,13 +767,17 @@ impl Chain {
             tap.write(left, right);
         }
 
+        // Per-slot timing (off by default). The flag is read once per block,
+        // and costs are accumulated on the stack so a chunked block reports
+        // one total per slot rather than one per chunk.
+        let profiling = self.telemetry.profile().is_enabled();
+        let mut slot_nanos = [0u64; MAX_SLOTS];
+        let block_start = profiling.then(std::time::Instant::now);
+
         for (chunk_l, chunk_r) in left.chunks_mut(MAX_BLOCK).zip(right.chunks_mut(MAX_BLOCK)) {
             for i in 0..self.order.len() {
-                let Some(slot) = self
-                    .slots
-                    .get_mut(self.order[i] as usize)
-                    .and_then(Option::as_mut)
-                else {
+                let slot_index = self.order[i] as usize;
+                let Some(slot) = self.slots.get_mut(slot_index).and_then(Option::as_mut) else {
                     continue;
                 };
                 // A fade-out below -60 dB is inaudible: snap it so the
@@ -775,22 +788,35 @@ impl Chain {
                 if slot.wet.is_settled() && slot.wet.target() == 0.0 {
                     continue; // fully bypassed: skip the work entirely
                 }
+                let started = profiling.then(std::time::Instant::now);
                 if slot.wet.is_settled() && slot.wet.target() == 1.0 {
                     slot.effect.process(chunk_l, chunk_r);
-                    continue;
+                } else {
+                    // Mid-crossfade: blend processed against the dry copies.
+                    let dry_l = &mut self.dry_l[..chunk_l.len()];
+                    let dry_r = &mut self.dry_r[..chunk_r.len()];
+                    dry_l.copy_from_slice(chunk_l);
+                    dry_r.copy_from_slice(chunk_r);
+                    slot.effect.process(chunk_l, chunk_r);
+                    for (i, (l, r)) in chunk_l.iter_mut().zip(chunk_r.iter_mut()).enumerate() {
+                        let w = slot.wet.tick();
+                        *l = dry_l[i] + (*l - dry_l[i]) * w;
+                        *r = dry_r[i] + (*r - dry_r[i]) * w;
+                    }
                 }
-                // Mid-crossfade: blend processed against the dry copies.
-                let dry_l = &mut self.dry_l[..chunk_l.len()];
-                let dry_r = &mut self.dry_r[..chunk_r.len()];
-                dry_l.copy_from_slice(chunk_l);
-                dry_r.copy_from_slice(chunk_r);
-                slot.effect.process(chunk_l, chunk_r);
-                for (i, (l, r)) in chunk_l.iter_mut().zip(chunk_r.iter_mut()).enumerate() {
-                    let w = slot.wet.tick();
-                    *l = dry_l[i] + (*l - dry_l[i]) * w;
-                    *r = dry_r[i] + (*r - dry_r[i]) * w;
+                if let Some(started) = started {
+                    slot_nanos[slot_index] += started.elapsed().as_nanos() as u64;
                 }
             }
+        }
+
+        if let Some(block_start) = block_start {
+            self.telemetry.profile().record_block(
+                &slot_nanos,
+                block_start.elapsed().as_nanos() as u64,
+                left.len(),
+                self.sample_rate,
+            );
         }
 
         if !(self.fade.is_settled() && self.fade.target() == 1.0) {
@@ -920,6 +946,20 @@ impl ChainHandle {
 
     pub fn telemetry(&self) -> &Telemetry {
         &self.telemetry
+    }
+
+    /// Per-slot DSP timing joined to the chain order, worst first.
+    ///
+    /// The profiler indexes the raw slot table; this pairs each entry with the
+    /// pedal handle a user actually types (`drive`, `delay2`, …) and drops
+    /// slots that are not in the chain. Control-thread only — it allocates.
+    pub fn profile_report(&self) -> Vec<(String, profile::SlotTiming)> {
+        let snap = self.telemetry.profile().snapshot();
+        let mut rows: Vec<(String, profile::SlotTiming)> = (0..self.order.len())
+            .map(|p| (self.handle_at(p), snap.slots[self.order[p] as usize]))
+            .collect();
+        rows.sort_by_key(|(_, t)| std::cmp::Reverse(t.last_nanos));
+        rows
     }
 
     /// The stream sample rate, used to prepare effects installed later.

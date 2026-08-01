@@ -66,6 +66,8 @@ commands:
   list                         pedals, values, and loaded assets
   meter                        input/output peak levels
   stats                        stream health (xruns, callback time)
+  profile on|off|reset         per-pedal DSP timing (off by default)
+  profile                      show which pedal is eating the block
   quit                         stop and exit";
 
 pub fn run(args: JamArgs) -> Result<()> {
@@ -171,6 +173,50 @@ fn print_state(session: &Session) {
     println!("  assets  nam: {nam}   ir: {ir}");
 }
 
+/// Render the per-pedal DSP timing table (`profile` with no argument).
+fn print_profile(session: &Session) {
+    let snap = session.chain.telemetry().profile().snapshot();
+    if !snap.enabled && snap.blocks == 0 {
+        println!("  profiling is off — `profile on`, play a little, then `profile`");
+        return;
+    }
+    if snap.blocks == 0 {
+        println!("  no blocks measured yet — play a little, then `profile`");
+        return;
+    }
+
+    let us = |ns: u64| ns as f64 / 1e3;
+    println!(
+        "  {} — {:.1}% of budget ({:.0} µs of {:.0} µs), {} blocks, {} deadline misses",
+        snap.load().label(),
+        snap.load_percent,
+        us(snap.block_last_nanos),
+        us(snap.budget_nanos),
+        snap.blocks,
+        snap.deadline_misses,
+    );
+    println!("  worst block so far {:.0} µs", us(snap.block_peak_nanos));
+    println!(
+        "  {:<12} {:>9} {:>9} {:>9}  {:>6}",
+        "pedal", "last µs", "avg µs", "peak µs", "budget"
+    );
+    for (handle, t) in session.chain.profile_report() {
+        println!(
+            "  {:<12} {:>9.1} {:>9.1} {:>9.1}  {:>5.1}%{}",
+            handle,
+            us(t.last_nanos),
+            us(t.avg_nanos),
+            us(t.peak_nanos),
+            t.budget_percent,
+            if t.is_overloaded() {
+                "  OVERLOADED"
+            } else {
+                ""
+            },
+        );
+    }
+}
+
 fn load_preset(session: &mut Session, name: &str) {
     match session.load_preset(name) {
         Ok(lines) => {
@@ -225,6 +271,25 @@ fn handle_line(line: &str, session: &mut Session) -> bool {
                 s.max_callback_millis(),
                 s.stream_errors,
             );
+        }
+        Some("profile") => {
+            let profiler = session.chain.telemetry().profile();
+            match parts.next() {
+                Some("on") => {
+                    profiler.set_enabled(true);
+                    println!("  profiling on — play a little, then `profile`");
+                }
+                Some("off") => {
+                    profiler.set_enabled(false);
+                    println!("  profiling off");
+                }
+                Some("reset") => {
+                    profiler.reset();
+                    println!("  counters cleared");
+                }
+                None => print_profile(session),
+                _ => println!("  usage: profile [on|off|reset]"),
+            }
         }
         Some("save") => match parts.next() {
             Some(name) if parts.next().is_none() => match session.save_preset(name) {
