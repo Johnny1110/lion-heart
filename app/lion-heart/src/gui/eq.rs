@@ -51,9 +51,25 @@ pub struct EqPanel<'a> {
     pub cache: &'a canvas::Cache,
 }
 
+/// Pointer travel below this (px) is a click, not a drag.
+const DRAG_SLOP: f32 = 3.0;
+/// Shift-drag travel multiplier.
+const FINE_DRAG: f32 = 0.25;
+
 #[derive(Default)]
 pub struct State {
     drag: Option<usize>,
+    /// Press position, for the [`DRAG_SLOP`] test.
+    press_at: Option<Point>,
+    /// Dragged band's position in panel coordinates, accumulated from pointer travel
+    /// and clamped to the panel.
+    anchor: Option<Point>,
+    /// Previous pointer position, for the travel delta.
+    last: Option<Point>,
+    /// Set once this press has cleared [`DRAG_SLOP`].
+    moved: bool,
+    /// Latched from keyboard events: mouse events carry no modifier state.
+    modifiers: iced::keyboard::Modifiers,
     last_click: Option<(Instant, usize)>,
 }
 
@@ -149,20 +165,62 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     );
                 }
                 state.drag = Some(hit);
+                state.press_at = Some(at);
+                state.anchor = Some(self.handle_position(bounds.size(), hit));
+                state.last = Some(at);
+                state.moved = false;
                 Some(canvas::Action::publish(self.select_msg(hit)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let band_index = *state.drag.as_ref()?;
-                let at = cursor.position_in(bounds)?;
+                // Relative to the panel, and valid outside it: the drag follows the
+                // pointer past the border and the anchor clamps below.
+                let raw = cursor.position_from(bounds.position())?;
+
+                // Still a selection until the pointer clears the slop radius.
+                if !state.moved && state.press_at.is_some_and(|p| p.distance(raw) < DRAG_SLOP) {
+                    return None;
+                }
+                state.moved = true;
+
                 let mut band = self.state.bands[band_index];
-                band.freq = freq_of_x(bounds.width, at.x);
+                // The band moves by pointer travel, which preserves the grab point.
+                let mut shift = raw - state.last.unwrap_or(raw);
+                if state.modifiers.shift() {
+                    shift *= FINE_DRAG;
+                }
+                if state.modifiers.control() {
+                    // Lock to gain: frequency holds.
+                    shift.x = 0.0;
+                }
+                if !band.kind.has_gain() {
+                    shift.y = 0.0;
+                }
+
+                // Clamped each step, so the anchor stays inside the panel.
+                let anchor = state.anchor.unwrap_or(raw) + shift;
+                let anchor = Point::new(
+                    anchor.x.clamp(0.0, bounds.width),
+                    anchor.y.clamp(0.0, bounds.height),
+                );
+                state.anchor = Some(anchor);
+                state.last = Some(raw);
+
+                band.freq = freq_of_x(bounds.width, anchor.x);
                 if band.kind.has_gain() {
-                    band.gain_db = gain_of_y(bounds.height, at.y);
+                    band.gain_db = gain_of_y(bounds.height, anchor.y);
                 }
                 Some(canvas::Action::publish(self.band_msg(band_index, band, false)).and_capture())
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.drag.take()?;
+                state.press_at = None;
+                state.anchor = None;
+                state.last = None;
+                // Only a real drag is persisted; a bare click has nothing to write.
+                if !std::mem::take(&mut state.moved) {
+                    return None;
+                }
                 match self.target {
                     // Drag release persists the global EQ; slot values are
                     // already live in the chain shadow.
@@ -171,6 +229,12 @@ impl canvas::Program<Message> for EqPanel<'_> {
                     }
                     EqTarget::Slot(_) => None,
                 }
+            }
+            canvas::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                // Mouse events carry no modifier state, so latch it here. Not captured:
+                // Shift and Ctrl belong to the rest of the app too.
+                state.modifiers = *m;
+                None
             }
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
                 let at = cursor.position_in(bounds)?;
@@ -352,5 +416,324 @@ impl canvas::Program<Message> for EqPanel<'_> {
             return mouse::Interaction::Grab;
         }
         mouse::Interaction::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::widget::canvas::Program;
+
+    /// Drag is pure logic reachable without a window, and it shipped with no coverage.
+    /// If these pass while the GUI stays inert, the fault is event delivery or mounting
+    /// rather than the handler.
+    /// Drag one band by an explicit delta and report what the published edit carried.
+    /// The delta is a parameter because the outermost handles sit near the panel edges,
+    /// and a drag that leaves the canvas is correctly ignored — the test has to aim
+    /// inward, not off the side.
+    fn drag_band(index: usize, dx: f32, dy: f32) -> Band {
+        let cache = canvas::Cache::new();
+        let spectrum: Vec<f32> = Vec::new();
+        let panel = EqPanel {
+            state: GlobalEqState::default(),
+            target: EqTarget::Global,
+            selected: index,
+            spectrum: &spectrum,
+            spectrum_tag: None,
+            sample_rate: 48_000.0,
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+        let mut state = State::default();
+
+        let handle = panel.handle_position(bounds.size(), index);
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let action = panel.update(&mut state, &press, bounds, mouse::Cursor::Available(handle));
+        assert!(action.is_some(), "pressing a handle must be handled");
+        assert_eq!(state.drag, Some(index), "press must arm the drag");
+
+        let to = Point::new(handle.x + dx, handle.y + dy);
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved { position: to });
+        let action = panel
+            .update(&mut state, &moved, bounds, mouse::Cursor::Available(to))
+            .expect("a move while dragging must publish an edit");
+
+        let (published, _, _) = action.into_inner();
+        let Some(Message::EqBand {
+            index: got, band, ..
+        }) = published
+        else {
+            panic!("expected a published Message::EqBand");
+        };
+        assert_eq!(got, index);
+        band
+    }
+
+    /// A bell band moves in both axes. This is the interaction the panel advertises,
+    /// and it had no coverage before.
+    #[test]
+    fn dragging_a_bell_changes_frequency_and_gain() {
+        let before = GlobalEqState::default().bands[3];
+        let after = drag_band(3, 120.0, -60.0);
+        assert!(
+            after.freq > before.freq,
+            "drag right must raise frequency: {} -> {}",
+            before.freq,
+            after.freq
+        );
+        assert!(
+            after.gain_db > before.gain_db,
+            "drag up must raise gain: {} -> {}",
+            before.gain_db,
+            after.gain_db
+        );
+    }
+
+    /// The outermost two handles are cut filters, which have no gain to drag. Vertical
+    /// motion on them is *correctly* inert — worth pinning, because those two sit at the
+    /// far left and far right of the panel where they are the most obvious things to
+    /// grab first, and an inert drag there reads as "the EQ is broken".
+    #[test]
+    fn dragging_a_cut_band_moves_frequency_only() {
+        // Aim inward from each edge: band 0 sits at 30 Hz on the left, band 7 at
+        // 12 kHz on the right.
+        for (index, dx) in [(0usize, 120.0f32), (7usize, -120.0f32)] {
+            let before = GlobalEqState::default().bands[index];
+            assert!(
+                !before.kind.has_gain(),
+                "band {index} should be a cut filter"
+            );
+            let after = drag_band(index, dx, -60.0);
+            if dx > 0.0 {
+                assert!(
+                    after.freq > before.freq,
+                    "band {index}: dragging right must still raise frequency"
+                );
+            } else {
+                assert!(
+                    after.freq < before.freq,
+                    "band {index}: dragging left must still lower frequency"
+                );
+            }
+            assert_eq!(
+                after.gain_db, before.gain_db,
+                "band {index}: a cut filter has no gain to move"
+            );
+        }
+    }
+
+    /// Every band ships disabled, so a fresh EQ is transparent. Pinned because it is
+    /// the premise the auto-enable below exists to rescue: without it, a drag on an
+    /// untouched panel edits a bypassed band and changes no sound.
+    #[test]
+    fn every_band_starts_disabled() {
+        let state = GlobalEqState::default();
+        assert!(state.enabled, "the EQ section itself is on");
+        assert!(
+            state.bands.iter().all(|b| !b.enabled),
+            "a default EQ is transparent: every band starts disabled"
+        );
+    }
+
+    /// Dragging edits a band but never switches it on: enabling stays an explicit
+    /// double-click, so the panel loads flat unless it was deliberately set.
+    #[test]
+    fn dragging_does_not_enable_a_band() {
+        for index in [0usize, 3, 7] {
+            assert!(
+                !GlobalEqState::default().bands[index].enabled,
+                "precondition: band {index} starts disabled"
+            );
+            let dx = if index == 7 { -120.0 } else { 120.0 };
+            let after = drag_band(index, dx, -60.0);
+            assert!(!after.enabled, "band {index}: a drag must not switch it on");
+        }
+    }
+
+    /// A click — even a shaky one — selects without editing. The EQ must load flat
+    /// unless it was deliberately set, and auto-enable would otherwise let a pixel of
+    /// hand-shake switch a band on and persist it.
+    #[test]
+    fn a_click_with_hand_shake_neither_edits_nor_commits() {
+        let cache = canvas::Cache::new();
+        let spectrum: Vec<f32> = Vec::new();
+        let panel = EqPanel {
+            state: GlobalEqState::default(),
+            target: EqTarget::Global,
+            selected: 3,
+            spectrum: &spectrum,
+            spectrum_tag: None,
+            sample_rate: 48_000.0,
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+        let mut state = State::default();
+        let handle = panel.handle_position(bounds.size(), 3);
+
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        panel.update(&mut state, &press, bounds, mouse::Cursor::Available(handle));
+
+        // Two pixels of shake, inside DRAG_SLOP.
+        let jitter = Point::new(handle.x + 1.5, handle.y + 1.0);
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved { position: jitter });
+        assert!(
+            panel
+                .update(&mut state, &moved, bounds, mouse::Cursor::Available(jitter))
+                .is_none(),
+            "a click within the slop radius must not publish an edit"
+        );
+        assert!(!state.moved, "slop-sized motion is not a drag");
+
+        // Release must not commit either: nothing changed, so nothing to persist.
+        let release = canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+        assert!(
+            panel
+                .update(
+                    &mut state,
+                    &release,
+                    bounds,
+                    mouse::Cursor::Available(jitter)
+                )
+                .is_none(),
+            "releasing a click must not commit the EQ to disk"
+        );
+    }
+
+    /// Grabbing a handle off-centre must not teleport it onto the pointer. The hit
+    /// radius is twice the drawn handle, so a legitimate grab can start 14 px away —
+    /// without the offset the band jumped that far the moment the drag began, which
+    /// is most of what made the panel feel unpredictable.
+    #[test]
+    fn grabbing_off_centre_moves_by_travel_not_to_the_pointer() {
+        let cache = canvas::Cache::new();
+        let spectrum: Vec<f32> = Vec::new();
+        let panel = EqPanel {
+            state: GlobalEqState::default(),
+            target: EqTarget::Global,
+            selected: 3,
+            spectrum: &spectrum,
+            spectrum_tag: None,
+            sample_rate: 48_000.0,
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+        let mut state = State::default();
+        let handle = panel.handle_position(bounds.size(), 3);
+
+        // Grab 10 px right of centre — inside HIT_RADIUS, so a real grab.
+        let grab = Point::new(handle.x + 10.0, handle.y);
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        panel.update(&mut state, &press, bounds, mouse::Cursor::Available(grab));
+
+        // Travel 50 px further right.
+        let to = Point::new(grab.x + 50.0, grab.y);
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved { position: to });
+        let (published, _, _) = panel
+            .update(&mut state, &moved, bounds, mouse::Cursor::Available(to))
+            .expect("a real drag publishes")
+            .into_inner();
+        let Some(Message::EqBand { band, .. }) = published else {
+            panic!("expected Message::EqBand");
+        };
+
+        // The band should sit 50 px from where it started, not 60 px at the pointer.
+        let want = freq_of_x(bounds.width, handle.x + 50.0);
+        let pointer = freq_of_x(bounds.width, to.x);
+        assert!(
+            (band.freq - want).abs() < 1.0,
+            "band should track travel: expected ~{want:.1} Hz, got {:.1} Hz",
+            band.freq
+        );
+        assert!(
+            (band.freq - pointer).abs() > 1.0,
+            "band must not snap onto the pointer ({pointer:.1} Hz)"
+        );
+    }
+
+    /// A drag that leaves the canvas clamps at the edge and keeps tracking.
+    #[test]
+    fn dragging_past_the_edge_clamps_instead_of_freezing() {
+        let cache = canvas::Cache::new();
+        let mut state = State::default();
+        let panel = EqPanel {
+            state: GlobalEqState::default(),
+            target: EqTarget::Global,
+            selected: 3,
+            spectrum: &[],
+            spectrum_tag: None,
+            sample_rate: 48_000.0,
+            cache: &cache,
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+        let handle = panel.handle_position(bounds.size(), 3);
+
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        panel.update(&mut state, &press, bounds, mouse::Cursor::Available(handle));
+
+        // Way past the right edge and below the bottom.
+        let far = Point::new(bounds.width + 500.0, bounds.height + 500.0);
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved { position: far });
+        let (published, _, _) = panel
+            .update(&mut state, &moved, bounds, mouse::Cursor::Available(far))
+            .expect("a drag outside the canvas must still track")
+            .into_inner();
+        let Some(Message::EqBand { band, .. }) = published else {
+            panic!("expected Message::EqBand");
+        };
+        assert!(
+            (band.freq - FREQ_MAX).abs() < 1.0,
+            "frequency should clamp to the top of the axis, got {:.1} Hz",
+            band.freq
+        );
+        assert!(
+            band.gain_db <= -GAIN_DB_MAX + 0.01,
+            "gain should clamp to the bottom of the axis, got {:+.2} dB",
+            band.gain_db
+        );
+    }
+
+    /// Shift scales travel, for setting a value precisely.
+    #[test]
+    fn shift_makes_the_drag_finer() {
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+
+        let coarse = drag_band(3, 100.0, 0.0).freq;
+
+        let cache = canvas::Cache::new();
+        let panel = EqPanel {
+            state: GlobalEqState::default(),
+            target: EqTarget::Global,
+            selected: 3,
+            spectrum: &[],
+            spectrum_tag: None,
+            sample_rate: 48_000.0,
+            cache: &cache,
+        };
+        let mut state = State::default();
+        let mods = canvas::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(
+            iced::keyboard::Modifiers::SHIFT,
+        ));
+        panel.update(&mut state, &mods, bounds, mouse::Cursor::Unavailable);
+
+        let handle = panel.handle_position(bounds.size(), 3);
+        let press = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        panel.update(&mut state, &press, bounds, mouse::Cursor::Available(handle));
+        let to = Point::new(handle.x + 100.0, handle.y);
+        let moved = canvas::Event::Mouse(mouse::Event::CursorMoved { position: to });
+        let (published, _, _) = panel
+            .update(&mut state, &moved, bounds, mouse::Cursor::Available(to))
+            .expect("shift-drag still publishes")
+            .into_inner();
+        let Some(Message::EqBand { band, .. }) = published else {
+            panic!("expected Message::EqBand");
+        };
+
+        let base = GlobalEqState::default().bands[3].freq;
+        assert!(
+            band.freq > base && band.freq < coarse,
+            "shift-drag should move less than the same travel unshifted: \
+             base {base:.0} Hz, shift {:.0} Hz, coarse {coarse:.0} Hz",
+            band.freq
+        );
     }
 }
